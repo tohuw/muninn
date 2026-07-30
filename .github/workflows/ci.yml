@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} (py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The indexer targets all three platforms on a best-effort basis, so it
+        # is tested on all three rather than only where it was written.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        run: pip install uv==0.11.30
+
+      - name: Sync
+        run: uv sync --locked
+
+      - name: Lint
+        run: uv run ruff check muninn tests tools
+
+      - name: Test
+        run: uv run python -m unittest discover tests -v
+
+      - name: Survey self-test (asserts no transcript prose can leak)
+        run: uv run python tools/corpus-survey.py --self-test
+
+      - name: CLI smoke
+        run: |
+          uv run muninn --version
+          uv run muninn --help
+
+      - name: Build
+        run: uv build
