@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+.ruff_cache/
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+
+# local agent settings, but keep the shared skill
+.claude/*
+!.claude/skills

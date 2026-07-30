@@ -1,0 +1,55 @@
+[project]
+name = "muninn-console"
+version = "2026.07.30"
+description = "A local-only console for AI agent history: search, correlate and resume past sessions"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [{ name = "Ron Scott-Adams" }]
+keywords = ["claude", "codex", "transcripts", "search", "agents", "history"]
+
+# Deliberately small, mirroring Huginn. The archive is stdlib sqlite3/FTS5;
+# semantic search is optional and lives in the [semantic] extra so the default
+# install has no ML surface at all.
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "watchfiles>=0.24",
+]
+
+[project.optional-dependencies]
+# Local, offline embeddings. Not installed by default: it pulls model weights,
+# which is a governance problem for some distributions.
+# See .valholl/articles/model-policy-chokepoint.md
+semantic = [
+    "numpy>=2.0",
+    "mlx-embeddings>=0.0.3; platform_system == 'Darwin' and platform_machine == 'arm64'",
+]
+
+[project.scripts]
+muninn = "muninn.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/tohuw/muninn"
+Issues = "https://github.com/tohuw/muninn/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.15.22",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["muninn"]
+
+[tool.ruff]
+line-length = 130
+
+[tool.ruff.lint]
+# Intentionally small: correctness rules, not style opinions.
+select = ["E", "F", "W"]
+ignore = ["E702"]
