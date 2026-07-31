@@ -1,8 +1,8 @@
 ---
 okf_version: "0.1"
 title: "Muninn knowledge base"
-description: "Architecture, durability, calibration, and governance knowledge for Muninn."
-updated: "2026-07-30"
+description: "Architecture, durability, ingest, calibration, and governance knowledge for Muninn."
+updated: "2026-07-31"
 ---
 
 # Muninn knowledge base
@@ -21,6 +21,10 @@ the code does.
 - [The index is an archive of record](articles/archive-of-record.md) — transcripts are deleted after 30 days
 - [Continuous ingest, not periodic](articles/continuous-ingest-not-periodic.md) — why a cron indexer loses data
 - [The transcript JSONL format is not a stable API](articles/unstable-jsonl-format.md) — accepted risk, and how it degrades
+
+## Ingest
+
+- [Deterministic imports: receipts, not counters](articles/deterministic-imports.md) — the claudex "0 written" incident, and the import contract that prevents it
 
 ## Data model
 
