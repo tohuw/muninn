@@ -28,6 +28,11 @@ from pathlib import Path
 
 from ..queue import enqueue
 
+# How long to wait for a payload before giving up. SessionEnd hooks share a
+# 1.5-second budget, so this must stay well inside it: a hook that hangs is
+# worse than a hook that does nothing, because it delays the user's shell.
+STDIN_TIMEOUT_S = 0.5
+
 
 def _now_iso() -> str:
     # time.strftime rather than datetime: one fewer stdlib module pulled into
@@ -56,6 +61,24 @@ def _build_job(payload: dict) -> dict:
 
 
 def _read_stdin_payload() -> dict:
+    """Read the SessionEnd payload from stdin.
+
+    A blocking ``sys.stdin.read()`` is a hazard here, not a convenience: if the
+    caller holds stdin open, this hook waits forever inside a 1.5-second shared
+    budget (see .valholl/articles/session-lifecycle-facts.md). Windows CI caught
+    exactly that — an empty-but-open stdin hung until the test's timeout, where
+    POSIX had happened to deliver EOF immediately.
+
+    So the read is bounded. On POSIX a select() with a short timeout tells us
+    whether anything is there at all; on Windows, where select() does not accept
+    pipes, fall back to the plain read and rely on the caller closing stdin as
+    Claude Code actually does.
+    """
+    if sys.platform != "win32":
+        import select
+        ready, _, _ = select.select([sys.stdin], [], [], STDIN_TIMEOUT_S)
+        if not ready:
+            raise ValueError("no SessionEnd payload arrived on stdin")
     raw = sys.stdin.read()
     payload = json.loads(raw)
     if not isinstance(payload, dict):
