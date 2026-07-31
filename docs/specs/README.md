@@ -12,6 +12,16 @@ wiki wins and the contradiction is a bug worth reporting.
 | [001 — Import ledger](001-import-ledger.md) | ready | — |
 | [002 — Export importers](002-export-importers.md) | ready | 001 |
 | [003 — Background indexer](003-background-indexer.md) | ready | 001 |
+| [004 — Structured filters](004-structured-filters.md) | ready | — |
+| [005 — Enrichment](005-enrichment.md) | ready | 001, 004 |
+| [006 — Hybrid retrieval](006-hybrid-retrieval.md) | ready | 004, 005 |
+
+Specs 002 and 003 both modify `muninn/cli.py`, as do 004 and 005. Run
+overlapping specs sequentially, or in separate git worktrees, so they cannot
+collide.
+
+Later phases not yet spec'd: tiered retention, the console and shared menubar,
+the agent skill, and the Cisco distribution's plugins.
 
 ## How to work one of these
 
