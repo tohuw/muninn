@@ -299,6 +299,13 @@ class HookIsCheapTest(unittest.TestCase):
             proc = subprocess.run(
                 [sys.executable, "-c", script],
                 capture_output=True, text=True, timeout=10,
+                # DEVNULL, not an inherited pipe. The script replaces
+                # ``sys.stdin`` with a StringIO but the OS-level stdin it
+                # inherits stays open, and the hook's select() bound waits on
+                # THAT descriptor. On Windows CI an inherited-but-never-written
+                # stdin pipe never becomes ready, so the child hung and the job
+                # timeout took down the whole run.
+                stdin=subprocess.DEVNULL,
             )
             self.assertEqual(proc.returncode, 0, f"stderr: {proc.stderr}")
             out = json.loads(proc.stdout.strip().splitlines()[-1])
@@ -309,9 +316,6 @@ class HookIsCheapTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    @unittest.skipIf(sys.platform == "win32",
-                     "python -m on this module wedges under subprocess pipe capture "
-                     "on Windows CI; --self-test is exercised in-process below")
     def test_self_test_creates_a_job_and_exits_zero(self) -> None:
         tmp = Path(tempfile.mkdtemp(prefix="muninn-selftest-"))
         try:
@@ -355,10 +359,6 @@ class HookIsCheapTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    @unittest.skipIf(sys.platform == "win32",
-                     "python -m on this module wedges under subprocess pipe capture "
-                     "on Windows CI; the same property is covered in-process above "
-                     "and by test_hook_process_never_imports_sqlite3_or_store")
     def test_hook_exits_zero_on_malformed_stdin(self) -> None:
         tmp = Path(tempfile.mkdtemp(prefix="muninn-malformed-"))
         try:

@@ -76,9 +76,18 @@ def _read_stdin_payload() -> dict:
     """
     if sys.platform != "win32":
         import select
-        ready, _, _ = select.select([sys.stdin], [], [], STDIN_TIMEOUT_S)
-        if not ready:
-            raise ValueError("no SessionEnd payload arrived on stdin")
+        try:
+            fd = sys.stdin.fileno()
+        except Exception:
+            # Not a real file descriptor -- an in-memory stream, as tests and
+            # embedders use. There is nothing to wait on and read() cannot
+            # block, so skip the bound entirely rather than treating a
+            # perfectly readable stream as an error.
+            fd = None
+        if fd is not None:
+            ready, _, _ = select.select([fd], [], [], STDIN_TIMEOUT_S)
+            if not ready:
+                raise ValueError("no SessionEnd payload arrived on stdin")
     raw = sys.stdin.read()
     payload = json.loads(raw)
     if not isinstance(payload, dict):
