@@ -76,19 +76,36 @@ used," because anything one plugin restricts, another can re-add.
 **Fix:** a fail-closed policy chokepoint where contributed policies *intersect*
 rather than union. See [[model-policy-chokepoint]].
 
-## 7. Provenance blindness
+## 7. Provenance blindness — FIXED UPSTREAM, lesson retained
 
-Huginn generates blurbs via `claude -p`, and those invocations land in
+**Status: resolved by the same `v2026.07.30` change as #8.**
+
+Huginn generated blurbs via `claude -p`, and those invocations landed in
 `~/.claude/projects` looking like sessions. On the development machine this
-produced **3,534 phantom sessions — 92% of the corpus**. Huginn already filters
-`entrypoint: sdk-cli` for *live* session display, but its own writes are
-indistinguishable from user work to any downstream consumer.
+produced **3,534 phantom sessions — 92% of the corpus**, which skewed every
+statistic derived from that corpus by roughly 40×.
 
-**Fix:** have Huginn mark its own invocations distinctly (a dedicated cwd is
-already a de facto marker; an explicit one would be better), so downstream tools
-can exclude them reliably. See [[provenance-classification]].
+Huginn already filtered `entrypoint: sdk-cli` for *live* session display, so it
+knew its own writes were not user work — but nothing marked them for a
+*downstream* consumer, and the transcripts were written regardless.
 
-## 8. Ask/blurb calls litter `~/.claude/projects` with orphaned transcripts
+**Why this stays in the wiki even though it is fixed:** the general hazard is
+unchanged. Any tool that shells out to an agent CLI writes into the directory a
+history tool reads, and by default those writes are indistinguishable from user
+work. Muninn cannot assume this was the last such tool, which is why structural
+provenance classification remains load-bearing rather than a workaround for one
+upstream bug. See [[provenance-classification]].
+
+## 8. Ask/blurb calls litter `~/.claude/projects` with orphaned transcripts — FIXED UPSTREAM
+
+**Status: resolved in Huginn `v2026.07.30` (commit `a9e1169`), after this article
+was written.** `huginn/llm/providers.py` now passes `--no-session-persistence` on
+both the `run_text` and `stream` paths, so these invocations write no transcript
+at all. The doomed `cwd` in `chat.py` is consequently harmless. Retained below as
+a record of the failure mode, because the *class* of bug — a tool polluting the
+data another tool reads — is worth recognizing again.
+
+
 
 `huginn/llm/chat.py` runs `claude -p` with `cwd=<CACHE_DIR>/chat` and then
 `shutil.rmtree`s that directory in a `finally` block (lines 277 and 335). Claude
@@ -112,10 +129,15 @@ Two distinct problems:
    so the entries are unattributable after the fact and can only be cleaned up
    by recognizing the cwd pattern.
 
-**Fixes, in order of preference:** set `CLAUDE_CODE_SKIP_PROMPT_HISTORY=1` (or
-`--no-session-persistence`) for internal invocations so they never persist at
-all; failing that, use a stable dedicated cwd rather than one that is created and
-destroyed per call, so the entries are at least attributable and prunable.
+**The fix that was applied:** `--no-session-persistence` on internal
+invocations, so they never persist. (The alternative — a stable dedicated cwd —
+would only have made the entries attributable, not absent.)
+
+**The transferable lesson:** any tool that calls an agent CLI internally is
+writing into the same directory a history tool reads, and by default those writes
+are indistinguishable from user work. Muninn must therefore keep provenance
+classification even now that this specific source is fixed: the next tool to do
+this will not announce itself. See [[provenance-classification]].
 
 ## 9. Documented reusable internals
 
