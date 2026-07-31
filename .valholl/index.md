@@ -25,6 +25,8 @@ the code does.
 ## Ingest
 
 - [Deterministic imports: receipts, not counters](articles/deterministic-imports.md) — the claudex "0 written" incident, and the import contract that prevents it
+- [The import ledger: schema and invariants](articles/import-ledger-schema.md) — the concrete schema, digest scheme and testable invariants
+- [Session lifecycle facts, documented vs. observed](articles/session-lifecycle-facts.md) — the 1.5s hook budget, and what the vendor does not guarantee
 
 ## Data model
 
