@@ -191,6 +191,24 @@ uv run muninn --db /tmp/muninn-008.db index    # real-corpus regression
 
 Commit; do not push.
 
+## Known limitation (found by the first real implementation)
+
+`HistorySource.fetch()` is synchronous and receives only a `SourceContext`, so a
+source has **no route to record that a session it previously contributed has
+vanished upstream**. Contributing is expressible; absence is not.
+
+That matters because the correct response to a vanished remote session is not
+deletion — the archived prose may be the only surviving copy — but
+`source_present = 0`, exactly as the local sweep does. See
+`.valholl/articles/archive-of-record.md`.
+
+The first real implementation had to put eviction in a non-protocol
+`poll(store, context)` method, which works and is tested but which nothing in
+core calls. Tracked as [#1](https://github.com/tohuw/muninn/issues/1); the
+likely fix is a `reconcile()` method returning the keys a source still vouches
+for, so core decides what absence means rather than trusting each plugin author
+to know the rule.
+
 ## Guardrails
 
 - **Do not ship a concrete provider.** No boto3, no MLX, no Neo-Cortex.
