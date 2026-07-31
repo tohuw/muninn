@@ -13,12 +13,19 @@ related: ["shared-menubar", "continuous-ingest-not-periodic", "model-policy-chok
 
 # Lessons for Huginn
 
+**Status: all findings here are filed upstream** as tohuw/huginn issues
+[#37](https://github.com/tohuw/huginn/issues/37)–[#42](https://github.com/tohuw/huginn/issues/42).
+Two (#7, #8 below) were already fixed upstream before filing and are retained
+only for the transferable hazard they describe.
+
 Designing Muninn as a genuine companion (rather than a fork) exposed several
 things worth fixing in [Huginn](https://github.com/tohuw/huginn) itself. Each is
 listed with the evidence that motivated it. Note Huginn's default branch is
 `master`, not `main`.
 
 ## 1. Exact-match `API_VERSION` is a footgun
+
+_Filed as [#38](https://github.com/tohuw/huginn/issues/38)._
 
 `huginn/plugins.py` requires `api_version == API_VERSION` exactly, with no
 compatibility range. Huginn's own `.valholl` notes the consequence: a routine
@@ -31,6 +38,8 @@ ranges from the start.
 
 ## 2. The menubar has no extension seam, and is imperative
 
+_Filed as [#40](https://github.com/tohuw/huginn/issues/40)._
+
 `macos/HuginnMenuBar.swift` rebuilds its entire menu via `removeAllItems()` on a
 3-second timer. There is no way for another app to contribute items. Huginn's
 only documented extension point is the `huginn.plugins` entry-point group, which
@@ -42,6 +51,8 @@ This also retires the teardown-and-rebuild cycle. See [[shared-menubar]].
 
 ## 3. Stale hardcoded path
 
+_Filed as [#37](https://github.com/tohuw/huginn/issues/37)._
+
 `repoPath` in `HuginnMenuBar.swift` is hardcoded to `/Users/hljod/Projects/huginn`
 — a path that does not exist on the current machine. It works only because the
 daemon is usually already running.
@@ -49,6 +60,8 @@ daemon is usually already running.
 **Fix:** derive the repo path from the bundle location or a state file.
 
 ## 4. No lag reporting for derived data
+
+_Filed as [#39](https://github.com/tohuw/huginn/issues/39)._
 
 Huginn watches `~/.claude` and `~/.codex` and derives state from them, but has no
 notion of *how stale* its derived view is. The failure this predicts was observed
@@ -68,6 +81,8 @@ Windows tray app and `WINDOWS.md` documents platform gaps candidly.
 (Windows). Muninn needs all three anyway; the implementation should be shared.
 
 ## 6. No model-policy chokepoint
+
+_Filed as [#41](https://github.com/tohuw/huginn/issues/41)._
 
 Huginn's plugin registry is purely **additive** — plugins contribute providers and
 nothing can veto one. An organization cannot express "only these models may be
@@ -140,6 +155,8 @@ classification even now that this specific source is fixed: the next tool to do
 this will not announce itself. See [[provenance-classification]].
 
 ## 9. Documented reusable internals
+
+_Filed as [#42](https://github.com/tohuw/huginn/issues/42)._
 
 Muninn wants `sources/transcript.py` (`Tail`, the dialect analyzers),
 `llm/context.py` (`redact_secrets`), and `model.py`. These are genuinely good and
