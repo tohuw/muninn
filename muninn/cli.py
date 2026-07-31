@@ -7,11 +7,13 @@ to change. (Huginn's skill takes the same stance, and it is a good one.)
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
 
 from . import __version__, ingest, store
+from .receipt import Outcome
 
 # Muninn's own state. Config/state split follows platform convention.
 if sys.platform == "win32":
@@ -32,28 +34,72 @@ def default_roots() -> dict[str, Path]:
 
 
 def cmd_index(args: argparse.Namespace) -> int:
+    """Ingest transcripts and report both the source facts and this run's delta.
+
+    ``--json`` prints only the receipt(s) — nothing else on stdout — so an
+    agent can parse and relay a claim the ledger can prove, rather than
+    summarizing prose (see .valholl/articles/deterministic-imports.md). The
+    human-readable form keeps "what the source contains" and "what this run
+    changed" as two labelled sections that are never blended into one line
+    (invariant 4) — that blending is exactly what let claudex's "0 written, 61
+    cached" read as "nothing new" when it meant "already imported".
+    """
     roots = default_roots()
     if args.source:
         roots = {k: v for k, v in roots.items() if k == args.source}
     st = store.open_store(args.db)
-    total_new = 0
+    receipts = []
     for source, root in roots.items():
         if not root.is_dir():
-            print(f"{source:7} no transcripts at {root}")
+            if not args.json:
+                print(f"{source:7} no transcripts at {root}")
             continue
         result = ingest.ingest_path(st, root, source)
-        total_new += result.ingested
-        line = (f"{source:7} scanned {result.scanned:,} · new {result.ingested:,} · "
-                f"updated {result.updated:,} · unchanged {result.skipped_unchanged:,}")
-        if result.parse_failures:
-            line += f" · parse failures {result.parse_failures:,}"
-        if result.marked_missing:
-            line += f" · source gone {result.marked_missing:,}"
-        print(line)
-    print(f"\narchive: {st.count_sessions():,} sessions · {st.count_chunks():,} chunks "
-          f"· {_size(args.db)}")
+        if result.receipt is not None:
+            receipts.append(result.receipt)
+        if not args.json:
+            _print_index_result(source, result)
+    if args.json:
+        print(json.dumps([r.to_dict() for r in receipts]))
+    else:
+        print(f"\narchive: {st.count_sessions():,} sessions · {st.count_chunks():,} chunks "
+              f"· {_size(args.db)}")
     st.close()
     return 0
+
+
+def _print_index_result(source: str, result: ingest.IngestResult) -> None:
+    receipt = result.receipt
+    if receipt is None:
+        # Should not happen once ingest_path always populates a receipt; fall
+        # back to the legacy line rather than crashing the CLI on a defect
+        # elsewhere.
+        print(f"{source:7} scanned {result.scanned:,} · new {result.ingested:,} · "
+              f"updated {result.updated:,} · unchanged {result.skipped_unchanged:,}")
+        return
+
+    src = receipt.source
+    span = ""
+    if src.span_earliest and src.span_latest:
+        span = f" · {src.span_earliest[:10]} .. {src.span_latest[:10]}"
+    print(f"source   {src.kind} · {src.item_count:,} items{span}")
+
+    d = receipt.delta
+    line = (f"this run added {d.added:,} · updated {d.updated:,} · "
+            f"unchanged {d.unchanged:,} · skipped {d.skipped:,}")
+    if result.marked_missing:
+        line += f" · source gone {result.marked_missing:,}"
+    print(line)
+
+    if receipt.outcome is Outcome.DUPLICATE and receipt.attribution is not None:
+        a = receipt.attribution
+        print(f"duplicate of import #{a.ledger_id} (actor {a.actor}, "
+              f"finished {a.finished_at})")
+    elif receipt.outcome is Outcome.REJECTED and receipt.attribution is not None:
+        a = receipt.attribution
+        print(f"rejected: import in progress by actor {a.actor} since {a.finished_at}")
+    elif receipt.outcome is Outcome.REJECTED:
+        print("rejected: no items could be imported")
 
 
 def cmd_search(args: argparse.Namespace) -> int:
@@ -149,6 +195,35 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print("\nparse failures (a rising rate suggests an upstream format change)")
         for row in failures:
             print(f"  {row['source']:7} {row['category']:24} {row['count']:,}")
+
+    print("\nimport ledger (last 5)")
+    tail = st.ledger_tail(5)
+    if not tail:
+        print("  (no imports yet)")
+    for row in tail:
+        status = row["outcome"] if row["finished_at"] else "IN PROGRESS"
+        print(f"  #{row['ledger_id']:<4} {row['started_at']}  {row['actor']:10} "
+              f"{row['source_kind']:18} {status}")
+
+    # Invariant 9: a crashed import must be visible, never silently reaped.
+    incomplete = st.incomplete_imports()
+    if incomplete:
+        ids = ", ".join(f"#{row['ledger_id']}" for row in incomplete)
+        print(f"\nWARNING: {len(incomplete)} incomplete import(s) never finished: {ids}")
+        print("         (started_at set, finished_at NULL — the process likely crashed)")
+
+    # A lock held by a dead pid is stale evidence someone should know about,
+    # even though the next importer is free to take it over.
+    lock = st.conn.execute("SELECT * FROM import_lock WHERE id = 1").fetchone()
+    if lock is not None:
+        alive = store.pid_alive(lock["pid"])
+        if not alive:
+            print(f"\nWARNING: import lock held by actor {lock['actor']} (pid {lock['pid']}) "
+                  f"since {lock['acquired_at']} — process is not running; lock is stale")
+        else:
+            print(f"\nimport lock held by actor {lock['actor']} (pid {lock['pid']}) "
+                  f"since {lock['acquired_at']}")
+
     st.close()
     return 0
 
@@ -174,6 +249,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_index = sub.add_parser("index", help="ingest transcripts into the archive")
     p_index.add_argument("--source", choices=("claude", "codex"))
+    p_index.add_argument("--json", action="store_true",
+                         help="print only the machine-readable import receipt(s)")
     p_index.set_defaults(func=cmd_index)
 
     p_search = sub.add_parser("search", help="search the archive")

@@ -17,13 +17,16 @@ See .valholl/articles/archive-of-record.md.
 """
 from __future__ import annotations
 
+import datetime as dt
 import os
 import re
 import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 1
+from .receipt import Delta, Outcome, SourceFacts
+
+SCHEMA_VERSION = 2
 
 # Chunking defaults. Real values come from calibration; these are fallbacks so
 # the store works before a survey has ever run.
@@ -115,6 +118,60 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
     ordinal    UNINDEXED,
     body,
     tokenize = 'porter unicode61'
+);
+"""
+
+# The import ledger: append-only, keyed by content digest. See
+# .valholl/articles/import-ledger-schema.md, which is the normative design —
+# this schema is that article's SQL verbatim, plus one extra column
+# (``file_digest``) named by docs/specs/001-import-ledger.md. Nothing may
+# UPDATE or DELETE a row here except finish_import() closing out the very row
+# begin_import() created; a second import of the same digest always appends.
+_LEDGER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS import_ledger (
+    ledger_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at    TEXT NOT NULL,          -- ISO8601 UTC
+    finished_at   TEXT,                   -- NULL while in flight or if crashed
+    actor         TEXT NOT NULL,          -- "cli", "hook", "watcher", "agent:<name>"
+    source_kind   TEXT NOT NULL,          -- claude-transcripts | codex-rollouts
+                                          -- claude-export | chatgpt-export | prose-index
+    source_ref    TEXT,                   -- path or export name, display only
+    source_digest TEXT NOT NULL,          -- see digest.py
+    file_digest   TEXT,                   -- file-sha256 of the source file, when it is a file
+    item_count    INTEGER NOT NULL DEFAULT 0,   -- items the SOURCE contains
+    span_earliest TEXT,                   -- earliest item timestamp in source
+    span_latest   TEXT,                   -- latest item timestamp in source
+    windowed      INTEGER NOT NULL DEFAULT 0,   -- 1 if source may be a partial window
+    outcome       TEXT NOT NULL,          -- imported | duplicate | partial | rejected
+    duplicate_of  INTEGER,                -- ledger_id of the original import
+    added         INTEGER NOT NULL DEFAULT 0,
+    updated       INTEGER NOT NULL DEFAULT 0,
+    unchanged     INTEGER NOT NULL DEFAULT 0,
+    skipped       INTEGER NOT NULL DEFAULT 0,
+    error         TEXT,                   -- exception CLASS name only, never a message
+    FOREIGN KEY (duplicate_of) REFERENCES import_ledger(ledger_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_digest  ON import_ledger(source_digest);
+CREATE INDEX IF NOT EXISTS idx_ledger_started ON import_ledger(started_at);
+
+-- Per-item receipts: what actually happened to each item, and why.
+CREATE TABLE IF NOT EXISTS import_items (
+    ledger_id   INTEGER NOT NULL,
+    item_id     TEXT NOT NULL,            -- session id / conversation uuid
+    disposition TEXT NOT NULL,            -- added | updated | unchanged | skipped
+    reason      TEXT,                     -- required when disposition = 'skipped'
+    PRIMARY KEY (ledger_id, item_id),
+    FOREIGN KEY (ledger_id) REFERENCES import_ledger(ledger_id)
+);
+CREATE INDEX IF NOT EXISTS idx_import_items_item ON import_items(item_id);
+
+-- Advisory lock. One row, or none.
+CREATE TABLE IF NOT EXISTS import_lock (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    ledger_id  INTEGER NOT NULL,
+    actor      TEXT NOT NULL,
+    acquired_at TEXT NOT NULL,
+    pid        INTEGER
 );
 """
 
@@ -267,6 +324,143 @@ class Store:
     def commit(self) -> None:
         self.conn.commit()
 
+    # -- import ledger -------------------------------------------------------
+    #
+    # See .valholl/articles/import-ledger-schema.md. The one rule that matters
+    # more than any single method: nothing here UPDATEs or DELETEs a completed
+    # import_ledger row. begin_import() appends; finish_import() closes out
+    # only the specific in-flight row its own ledger_id names.
+
+    def begin_import(self, *, actor: str, source_kind: str, source_ref: str | None,
+                     source_digest: str, facts: SourceFacts) -> int:
+        """INSERT an in-flight row and return its ``ledger_id``.
+
+        The row is pre-inserted with ``finished_at`` NULL and
+        ``outcome='rejected'``. That default matters: if the process crashes
+        before finish_import() runs, the row already reads as "did not
+        succeed" rather than as a success nobody confirmed. See invariant 9
+        (a crashed import must be visible, never silently reaped).
+        """
+        started_at = _now()
+        cur = self.conn.execute(
+            "INSERT INTO import_ledger "
+            "(started_at, finished_at, actor, source_kind, source_ref, source_digest, "
+            " file_digest, item_count, span_earliest, span_latest, windowed, outcome) "
+            "VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (started_at, actor, source_kind, source_ref, source_digest,
+             facts.file_digest, facts.item_count, facts.span_earliest,
+             facts.span_latest, 1 if facts.windowed else 0, Outcome.REJECTED.value),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def finish_import(self, ledger_id: int, *, outcome: Outcome, delta: Delta,
+                      duplicate_of: int | None = None, error: str | None = None) -> None:
+        """Set ``finished_at`` + outcome + counts on THIS row only.
+
+        This is the sole UPDATE the ledger permits, and it targets exactly the
+        row ``ledger_id`` names — never a row from a different import, and
+        never by matching on digest (which would let a later run silently
+        overwrite an earlier one's evidence, exactly as claudex's
+        ``ON CONFLICT(source_path) DO UPDATE`` did to ``ingest_state``).
+        """
+        self.conn.execute(
+            "UPDATE import_ledger SET finished_at = ?, outcome = ?, duplicate_of = ?, "
+            "added = ?, updated = ?, unchanged = ?, skipped = ?, error = ? "
+            "WHERE ledger_id = ?",
+            (_now(), outcome.value, duplicate_of, delta.added, delta.updated,
+             delta.unchanged, delta.skipped, error, ledger_id),
+        )
+        self.conn.commit()
+
+    def record_items(self, ledger_id: int,
+                     items: Iterable[tuple[str, str, str | None]]) -> None:
+        """Insert ``(item_id, disposition, reason)`` per-item receipts.
+
+        A count cannot be audited; this table is what makes "which four items,
+        and why?" a query instead of forensics.
+        """
+        rows = [(ledger_id, item_id, disposition, reason)
+                for item_id, disposition, reason in items]
+        if not rows:
+            return
+        self.conn.executemany(
+            "INSERT INTO import_items (ledger_id, item_id, disposition, reason) "
+            "VALUES (?, ?, ?, ?)", rows,
+        )
+        self.conn.commit()
+
+    def find_import_by_digest(self, source_digest: str) -> dict[str, Any] | None:
+        """Earliest COMPLETED row for this digest, or None.
+
+        "Completed" means ``finished_at IS NOT NULL``: an in-flight or crashed
+        row must never be offered up as the prior import to attribute a
+        duplicate to, or a crash could masquerade as a successful import.
+        """
+        cur = self.conn.execute(
+            "SELECT * FROM import_ledger "
+            "WHERE source_digest = ? AND finished_at IS NOT NULL "
+            "ORDER BY ledger_id ASC LIMIT 1",
+            (source_digest,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def acquire_import_lock(self, ledger_id: int, actor: str, pid: int) -> dict[str, Any] | None:
+        """Take the advisory import lock, or report who already holds it.
+
+        Returns None on success. If the lock is already held by a live pid,
+        returns that holder's row unchanged — the caller must report
+        "import in progress by actor A since T", never race for it.
+
+        A holder whose pid is no longer alive is stale: the caller may take
+        the lock over, but the *ledger row that abandoned it* is left exactly
+        as-is for doctor to report as an incomplete import. Nothing here
+        deletes that evidence.
+        """
+        cur = self.conn.execute("SELECT * FROM import_lock WHERE id = 1")
+        holder = cur.fetchone()
+        if holder is not None and pid_alive(holder["pid"]):
+            return dict(holder)
+        self.conn.execute(
+            "INSERT INTO import_lock (id, ledger_id, actor, acquired_at, pid) "
+            "VALUES (1, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "  ledger_id = excluded.ledger_id, actor = excluded.actor, "
+            "  acquired_at = excluded.acquired_at, pid = excluded.pid",
+            (ledger_id, actor, _now(), pid),
+        )
+        self.conn.commit()
+        return None
+
+    def release_import_lock(self, ledger_id: int) -> None:
+        """Release the lock, but only if this import still holds it.
+
+        Guards against a stale-lock takeover releasing the *new* holder's lock
+        out from under it: if actor B took the lock over from a dead actor A
+        and then A's (already-crashed) process somehow reached this line, it
+        must not release B's live lock.
+        """
+        self.conn.execute(
+            "DELETE FROM import_lock WHERE id = 1 AND ledger_id = ?", (ledger_id,))
+        self.conn.commit()
+
+    def incomplete_imports(self) -> list[dict[str, Any]]:
+        """Rows with ``finished_at IS NULL`` — crashed or still-running imports.
+
+        Invariant 9: a crashed import must be visible, never silently reaped.
+        """
+        cur = self.conn.execute(
+            "SELECT * FROM import_ledger WHERE finished_at IS NULL "
+            "ORDER BY ledger_id ASC")
+        return [dict(r) for r in cur.fetchall()]
+
+    def ledger_tail(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Most recent ``limit`` ledger rows, newest first."""
+        cur = self.conn.execute(
+            "SELECT * FROM import_ledger ORDER BY ledger_id DESC LIMIT ?", (limit,))
+        return [dict(r) for r in cur.fetchall()]
+
     # -- reads -------------------------------------------------------------
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
@@ -313,6 +507,29 @@ class Store:
 
 def _is_blank(v: Any) -> bool:
     return v is None or v == "" or v == 0
+
+
+def _now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def pid_alive(pid: int | None) -> bool:
+    """Is a process with this pid still running?
+
+    ``os.kill(pid, 0)`` sends no signal; it only asks the kernel whether the
+    process exists and is ours to signal. A stale lock (holder pid dead) may
+    be taken over; a live one must serialize the caller out.
+    """
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists, but owned by someone else. Still alive from our perspective.
+        return True
+    return True
 
 
 def chunk_text(text: str, chunk_words: int = DEFAULT_CHUNK_WORDS,
@@ -378,9 +595,25 @@ def open_store(path: str | Path) -> Store:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(_SCHEMA)
-    conn.execute(
-        "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
-        "ON CONFLICT(key) DO NOTHING", (str(SCHEMA_VERSION),))
+
+    # Migration from v1 (no ledger) to v2: a v1 archive has every table in
+    # _SCHEMA already, just none of the ledger tables. Every statement in
+    # _LEDGER_SCHEMA is CREATE-IF-NOT-EXISTS, so running it unconditionally on
+    # any existing archive is safe and adds only what is missing — no rebuild,
+    # no data touched. Existing sessions, chunks, and ingest_state are
+    # untouched by this call.
+    conn.executescript(_LEDGER_SCHEMA)
+
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
+            (str(SCHEMA_VERSION),))
+    elif int(row["value"]) < SCHEMA_VERSION:
+        conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+            (str(SCHEMA_VERSION),))
     conn.commit()
     if fresh:
         try:
