@@ -42,6 +42,20 @@ the Cisco distribution's plugins.
 5. If an invariant seems to be blocking a test from passing, that is a finding,
    not an obstacle to route around. Report it.
 
+## Verify against the real corpus, not just fixtures
+
+Every spec's definition of done includes a command that runs against the real
+archive. That is deliberate and it is not optional.
+
+Spec 001 shipped with 31 passing tests and a clean lint, and crashed on the very
+first real run: 11 of 388 transcripts in the real corpus share a session id with
+another file under a different encoded `cwd` (a renamed or symlinked repo is
+reachable by two paths). Every fixture had unique ids, so no test could have
+caught it.
+
+**Fixtures encode what you expect; only real data encodes what is true.** Run the
+real-corpus command before reporting done.
+
 ## Why the guardrails are worded so strictly
 
 Muninn is an archive of record. Claude Code deletes transcripts after
