@@ -21,6 +21,7 @@ import datetime as dt
 import os
 import re
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -325,6 +326,29 @@ class Store:
     def commit(self) -> None:
         self.conn.commit()
 
+    # -- indexer bookkeeping -------------------------------------------------
+
+    def record_sweep(self, when: str) -> None:
+        """Record the completion time of the most recent reconciling sweep.
+
+        `doctor` reports "time since last sweep" from this — the sweep is the
+        layer that *closes* the continuous-ingest guarantee (see
+        .valholl/articles/continuous-ingest-not-periodic.md), so a caller
+        needs to be able to tell "the watcher has been up the whole time" from
+        "the watcher died three days ago and nothing has swept since."
+        """
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('last_sweep_at', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (when,),
+        )
+        self.conn.commit()
+
+    def last_sweep_at(self) -> str | None:
+        row = self.conn.execute(
+            "SELECT value FROM meta WHERE key = 'last_sweep_at'").fetchone()
+        return row["value"] if row else None
+
     # -- import ledger -------------------------------------------------------
     #
     # See .valholl/articles/import-ledger-schema.md. The one rule that matters
@@ -418,21 +442,39 @@ class Store:
         the lock over, but the *ledger row that abandoned it* is left exactly
         as-is for doctor to report as an incomplete import. Nothing here
         deletes that evidence.
+
+        The read-then-write here is wrapped in ``BEGIN IMMEDIATE`` on purpose:
+        a plain SELECT followed by a separate INSERT/UPDATE is a
+        check-then-act race between connections, and a 6-thread concurrent
+        stress test caught it directly -- multiple threads each read "no live
+        holder" before any of them had written the lock row, so all of them
+        proceeded to import, and the ledger recorded several `imported` rows
+        for one identical scan instead of one `imported` and the rest
+        `duplicate`/`rejected`. ``BEGIN IMMEDIATE`` takes SQLite's writer lock
+        for the whole check-and-set, so with the ``busy_timeout`` pragma set
+        in ``open_store`` a second connection waits for the first to finish
+        this method rather than racing it.
         """
-        cur = self.conn.execute("SELECT * FROM import_lock WHERE id = 1")
-        holder = cur.fetchone()
-        if holder is not None and pid_alive(holder["pid"]):
-            return dict(holder)
-        self.conn.execute(
-            "INSERT INTO import_lock (id, ledger_id, actor, acquired_at, pid) "
-            "VALUES (1, ?, ?, ?, ?) "
-            "ON CONFLICT(id) DO UPDATE SET "
-            "  ledger_id = excluded.ledger_id, actor = excluded.actor, "
-            "  acquired_at = excluded.acquired_at, pid = excluded.pid",
-            (ledger_id, actor, _now(), pid),
-        )
-        self.conn.commit()
-        return None
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self.conn.execute("SELECT * FROM import_lock WHERE id = 1")
+            holder = cur.fetchone()
+            if holder is not None and pid_alive(holder["pid"]):
+                self.conn.commit()  # nothing changed; release the writer lock
+                return dict(holder)
+            self.conn.execute(
+                "INSERT INTO import_lock (id, ledger_id, actor, acquired_at, pid) "
+                "VALUES (1, ?, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "  ledger_id = excluded.ledger_id, actor = excluded.actor, "
+                "  acquired_at = excluded.acquired_at, pid = excluded.pid",
+                (ledger_id, actor, _now(), pid),
+            )
+            self.conn.commit()
+            return None
+        except BaseException:
+            self.conn.rollback()
+            raise
 
     def release_import_lock(self, ledger_id: int) -> None:
         """Release the lock, but only if this import still holds it.
@@ -613,13 +655,35 @@ def fts_query(raw: str) -> str:
     return " ".join(parts)
 
 
-def open_store(path: str | Path) -> Store:
-    """Open (creating if needed) the archive at ``path``."""
-    path = Path(path).expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fresh = not path.exists()
-    conn = sqlite3.connect(str(path))
+_OPEN_RETRY_ATTEMPTS = 8
+
+
+def _connect_and_prepare(path: Path) -> sqlite3.Connection:
+    """One attempt: connect, set pragmas, and ensure schema/ledger tables exist.
+
+    timeout=30 (Python-level retry inside sqlite3 itself) and
+    ``PRAGMA busy_timeout=30000`` (SQLite's own internal retry, in
+    milliseconds) are set BEFORE any other pragma, because with spec 003's
+    watcher + hook-drain + sweep all opening the store concurrently, "a sweep
+    and a drain overlapped" is the normal case here, not a rare race a human
+    could trigger only by racing themselves.
+
+    Even with both timeouts set, a brand-new database file being switched
+    into WAL mode by several connections at once can still raise "database is
+    locked" on the ``PRAGMA journal_mode=WAL`` statement itself — measured
+    directly under a 4-way concurrent ``ingest_path()`` stress test, this
+    happened on roughly 1 in 6 runs even with the timeouts in place, because
+    the very first WAL-mode switch on a fresh file takes an exclusive lock
+    that ``busy_timeout`` does not smooth over the same way it does ordinary
+    write contention. ``open_store`` wraps this function in a retry loop with
+    backoff so that specific race gets to actually wait, rather than
+    surfacing as a crash that kills the whole process — a background indexer
+    dying because a sweep and a hook-drain happened to open the store in the
+    same millisecond is not acceptable.
+    """
+    conn = sqlite3.connect(str(path), timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -638,6 +702,31 @@ def open_store(path: str | Path) -> Store:
     # no data touched. Existing sessions, chunks, and ingest_state are
     # untouched by this call.
     conn.executescript(_LEDGER_SCHEMA)
+    return conn
+
+
+def open_store(path: str | Path) -> Store:
+    """Open (creating if needed) the archive at ``path``."""
+    path = Path(path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fresh = not path.exists()
+
+    conn: sqlite3.Connection | None = None
+    last_exc: sqlite3.OperationalError | None = None
+    for attempt in range(_OPEN_RETRY_ATTEMPTS):
+        try:
+            conn = _connect_and_prepare(path)
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) and "busy" not in str(exc):
+                raise
+            last_exc = exc
+            if conn is not None:
+                conn.close()
+                conn = None
+            time.sleep(0.01 * (2 ** min(attempt, 6)))
+    if conn is None:
+        raise last_exc  # every attempt hit contention; surface it rather than hang forever
 
     row = conn.execute(
         "SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
