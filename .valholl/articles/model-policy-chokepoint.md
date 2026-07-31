@@ -79,6 +79,35 @@ implications:
   permissive and restricted paths work — which it needs anyway for the optional
   local-embedding split.
 
+## A failed policy load must refuse, not disappear
+
+Discovered during implementation, and it corrects an omission in the design above.
+
+If a policy entry point raises while loading, the tempting behaviour is to skip it
+— that is what a plugin registry does for a broken *capability* plugin, and it is
+right there, because a missing provider only removes an option.
+
+A policy is the opposite. Dropping a broken **restrictive** policy *widens* the
+effective permission set, which is the one thing this module exists to prevent. A
+deployment that installed a Bedrock-only policy and then shipped a version where
+that policy fails to import would silently become unrestricted.
+
+So a failed policy load becomes a synthetic policy that refuses everything, whose
+`reason` names the entry point and the exception class:
+
+```python
+ModelPolicy(name=..., allow=(), reason="policy entry point 'x' failed to load: ValueError")
+```
+
+The failure mode is then loud and safe rather than quiet and permissive. This
+deserves its own test, because it is exactly the behaviour a later refactor would
+"simplify" away — the code looks like a special case for an error path, and only
+the reasoning above explains why it is load-bearing.
+
+Note the asymmetry with the plugin registry, which *does* isolate and skip a
+broken plugin (see `plugins.py`). Same word, opposite correct answer, because one
+adds capability and the other removes permission.
+
 ## Honest scope
 
 This is a **strong contract, not a sandbox**. It governs Muninn's own calls. It
