@@ -42,6 +42,10 @@ the code does.
 - [The shared menubar (menu-as-data)](articles/shared-menubar.md) — one raven, two minds
 - [Lessons for Huginn](articles/lessons-for-huginn.md) — improvements to contribute upstream
 
+## Process
+
+- [Delegating implementation to subagents](articles/delegating-implementation.md) — what worked, and the two process failures that cost work
+
 ## Governance
 
 - [Model policy chokepoint](articles/model-policy-chokepoint.md) — fail-closed, intersecting policies
