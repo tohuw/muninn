@@ -15,13 +15,17 @@ wiki wins and the contradiction is a bug worth reporting.
 | [004 — Structured filters](004-structured-filters.md) | ready | — |
 | [005 — Enrichment](005-enrichment.md) | ready | 001, 004 |
 | [006 — Hybrid retrieval](006-hybrid-retrieval.md) | ready | 004, 005 |
+| [007 — Tiered retention](007-tiered-retention.md) | ready | 001, 005 |
 
 Specs 002 and 003 both modify `muninn/cli.py`, as do 004 and 005. Run
 overlapping specs sequentially, or in separate git worktrees, so they cannot
 collide.
 
-Later phases not yet spec'd: tiered retention, the console and shared menubar,
-the agent skill, and the Cisco distribution's plugins.
+Spec 007 deletes data on purpose and is the most dangerous of the set. Its one
+inviolable rule: never drop prose for a session whose raw source is already gone.
+
+Later phases not yet spec'd: the console and shared menubar, the agent skill, and
+the Cisco distribution's plugins.
 
 ## How to work one of these
 
