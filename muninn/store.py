@@ -24,6 +24,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
+from .query import Filters, build_log_sql, build_search_sql, expand_terms
 from .receipt import Delta, Outcome, SourceFacts
 
 SCHEMA_VERSION = 2
@@ -481,24 +482,52 @@ class Store:
     def count_chunks(self) -> int:
         return int(self.conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()["n"])
 
-    def search(self, query: str, limit: int = 20, **filters: Any) -> list[dict[str, Any]]:
-        """Minimal FTS search. Structured filters arrive with task #5."""
+    def search(self, query: str, limit: int = 20,
+              filters: Filters | None = None) -> list[dict[str, Any]]:
+        """Ranked, deduped, filtered FTS search — one row per session.
+
+        Two queries may run. The first is the precise AND-of-terms match
+        (FTS5's default join). Only if that returns fewer than ``limit`` rows
+        does a second, OR-expanded query run, capped at MAX_EXPANSION_TERMS
+        terms regardless of how many words the query had — see
+        .valholl/articles/corpus-measurements.md for why the cap exists (a
+        broad OR query measured 1.9ms -> 45.5ms as the corpus grew 8k -> 162k
+        chunks) and muninn/query.py for the SQL and the cap itself. Widening
+        the cap "for better recall" is the exact regression that measurement
+        describes; it is a guardrail, not a tuning knob.
+        """
         match = fts_query(query)
         if not match:
             return []
-        sql = (
-            "SELECT c.session_id AS session_id, s.source AS source, "
-            "       s.provenance AS provenance, s.started_at AS started_at, "
-            "       snippet(chunks, 2, '[', ']', ' ... ', 16) AS excerpt, "
-            "       bm25(chunks) AS score "
-            "FROM chunks c JOIN sessions s ON s.session_id = c.session_id "
-            "WHERE chunks MATCH ? "
-            "ORDER BY score LIMIT ?"
-        )
+        sql, params = build_search_sql(filters, match, limit)
         try:
-            cur = self.conn.execute(sql, (match, limit))
+            rows = [dict(r) for r in self.conn.execute(sql, params).fetchall()]
         except sqlite3.OperationalError:
             return []
+
+        if len(rows) < limit:
+            expanded = expand_terms(match)
+            if expanded and expanded != match:
+                exp_sql, exp_params = build_search_sql(filters, expanded, limit)
+                try:
+                    exp_rows = [dict(r) for r in self.conn.execute(exp_sql, exp_params).fetchall()]
+                except sqlite3.OperationalError:
+                    exp_rows = []
+                seen = {r["session_id"] for r in rows}
+                rows.extend(r for r in exp_rows if r["session_id"] not in seen)
+                # Two stable passes, weakest key first: this reproduces
+                # "ORDER BY score ASC, started_at DESC" for a merged Python
+                # list the same way SQL would for a single query, since
+                # Python's sort is guaranteed stable.
+                rows.sort(key=lambda r: r["started_at"] or "", reverse=True)
+                rows.sort(key=lambda r: r["score"])
+                rows = rows[:limit]
+        return rows
+
+    def log(self, limit: int = 20, filters: Filters | None = None) -> list[dict[str, Any]]:
+        """Reverse-chronological session timeline for ``muninn log``."""
+        sql, params = build_log_sql(filters, limit)
+        cur = self.conn.execute(sql, params)
         return [dict(r) for r in cur.fetchall()]
 
 
@@ -594,6 +623,12 @@ def open_store(path: str | Path) -> Store:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # --repo matches against the basename of sessions.cwd (docs/specs/004).
+    # SQLite has no builtin for "last path segment", and hand-rolling it as a
+    # SQL expression gets trailing-slash / no-slash edge cases subtly wrong;
+    # registering os.path.basename directly means the filter and the CLI's
+    # own display logic (cmd_search's `Path(cwd).name`) can never disagree.
+    conn.create_function("basename", 1, lambda p: os.path.basename(p) if p else "")
     conn.executescript(_SCHEMA)
 
     # Migration from v1 (no ledger) to v2: a v1 archive has every table in
