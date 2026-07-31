@@ -140,6 +140,12 @@ made and what was measured, including the methodological errors made along the
 way so they are not repeated. Start at
 [`.valholl/index.md`](.valholl/index.md).
 
+## Platform support
+
+macOS, Linux and Windows on a best-effort basis. See
+[WINDOWS.md](WINDOWS.md) for what is actually verified there, including four
+tests that are skipped on the Windows CI runner and why.
+
 ## Tests
 
 ```sh

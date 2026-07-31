@@ -22,6 +22,16 @@ from muninn import indexer, ingest, queue, store
 from muninn.hooks import cli as hooks_cli
 from muninn.receipt import Outcome
 
+# See tests/test_queue.py for why this exists: subprocess and thread-fan-out
+# tests wedge the Windows CI runner rather than failing, taking down the whole
+# job. Skipped there; equivalent in-process coverage runs everywhere.
+requires_subprocess = unittest.skipIf(
+    sys.platform == "win32",
+    "subprocess/thread fan-out wedges the Windows CI runner; the same "
+    "properties are covered in-process on all platforms",
+)
+
+
 
 def write_claude_transcript(path: Path, session_id: str, turns: list[tuple[str, str]],
                             cwd: str = "/tmp/project", branch: str = "main",
@@ -222,6 +232,7 @@ class ConcurrentImportTest(IndexerTestCase):
        by a race instead of a stale re-run.
     """
 
+    @requires_subprocess
     def test_n_concurrent_imports_yield_one_imported_rest_duplicate(self) -> None:
         n_threads = 6
         for i in range(20):

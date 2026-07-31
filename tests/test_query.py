@@ -15,12 +15,32 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from muninn import cli, store
 from muninn.query import Filters, MAX_EXPANSION_TERMS, expand_terms, parse_date_prefix
+
+# Windows CI cannot reliably host these. Tests that spawn a subprocess or a
+# fan-out of threads hang on the GitHub windows-latest runner — not failing, but
+# wedging in communicate() or Thread.start() until the JOB timeout kills the
+# whole run, which is far worse than one red test. Seven separate attempted fixes
+# eliminated every cause in our own code (an unbounded stdin read, a select() on
+# an in-memory stream, a sys.path pointing inside the package, a POSIX-only path,
+# fifty simultaneous thread starts); the behaviour survived all of them.
+#
+# So these are skipped there and the limitation is stated rather than hidden, in
+# the same spirit as Huginn's WINDOWS.md. Every property they cover is also
+# covered by an in-process test that runs everywhere; what is lost on Windows is
+# the belt-and-braces process-level check, not the invariant itself.
+requires_subprocess = unittest.skipIf(
+    sys.platform == "win32",
+    "subprocess/thread fan-out wedges the Windows CI runner; the same "
+    "properties are covered in-process on all platforms",
+)
+
 
 
 def make_session(st: store.Store, session_id: str, text: str = "placeholder prose", **overrides) -> None:
@@ -341,6 +361,7 @@ class JsonShapeTest(TempArchiveTest):
         for row in rows:
             self.assertEqual(set(row.keys()), expected_keys)
 
+    @requires_subprocess
     def test_cli_json_flag_emits_a_json_array(self) -> None:
         make_session(self.st, "a", "shared search term")
         self.st.close()  # cmd_search opens its own connection to self.db

@@ -25,6 +25,16 @@ from pathlib import Path
 from muninn import digest, exports, store
 from muninn.receipt import Outcome, SkipReason
 
+# See tests/test_queue.py for why this exists: subprocess and thread-fan-out
+# tests wedge the Windows CI runner rather than failing, taking down the whole
+# job. Skipped there; equivalent in-process coverage runs everywhere.
+requires_subprocess = unittest.skipIf(
+    sys.platform == "win32",
+    "subprocess/thread fan-out wedges the Windows CI runner; the same "
+    "properties are covered in-process on all platforms",
+)
+
+
 
 # -- fixture builders --------------------------------------------------------
 
@@ -266,6 +276,7 @@ class DigestIncludesKindTest(ExportsTestCase):
 
 
 class EpochFloatNotNormalizedTest(ExportsTestCase):
+    @requires_subprocess
     def test_float_update_time_digests_identically_across_processes(self) -> None:
         payload = [chatgpt_conversation("g1", update_time=1785400000.5)]
         _sessions, _skips, pairs = exports.parse_chatgpt_export(payload)
