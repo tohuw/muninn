@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from . import __version__, ingest, store
+from .query import Filters
 from .receipt import Outcome
 
 # Muninn's own state. Config/state split follows platform convention.
@@ -102,19 +103,57 @@ def _print_index_result(source: str, result: ingest.IngestResult) -> None:
         print("rejected: no items could be imported")
 
 
+def _filters_from_args(args: argparse.Namespace) -> Filters:
+    return Filters(
+        repo=args.repo,
+        branch=args.branch,
+        file=args.file,
+        tool=args.tool,
+        model=args.model,
+        provenance=args.provenance,
+        source=args.source,
+        since=args.since,
+        until=args.until,
+        outcome=args.outcome,
+    )
+
+
 def cmd_search(args: argparse.Namespace) -> int:
     st = store.open_store(args.db)
-    hits = st.search(args.query, limit=args.limit)
-    if not hits:
-        print("no matches")
+    try:
+        hits = st.search(args.query, limit=args.limit, filters=_filters_from_args(args))
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         st.close()
-        return 1
-    seen: set[str] = set()
+        return 2
+    if not hits:
+        if args.json:
+            print(json.dumps([]))
+        else:
+            print("no matches")
+        st.close()
+        return 0 if args.json else 1
+
+    if args.json:
+        # Stable keys, one object per session (spec 004 acceptance #12) — an
+        # agent parses this instead of scraping the human-readable form.
+        out = [{
+            "session_id": hit["session_id"],
+            "source": hit.get("source"),
+            "provenance": hit.get("provenance"),
+            "started_at": hit.get("started_at"),
+            "cwd": hit.get("cwd"),
+            "words": hit.get("words"),
+            "excerpt": " ".join((hit.get("excerpt") or "").split()),
+            "score": hit.get("score"),
+            "chunk_hits": hit.get("chunk_hits"),
+        } for hit in hits]
+        print(json.dumps(out))
+        st.close()
+        return 0
+
     for hit in hits:
         sid = hit["session_id"]
-        if sid in seen:
-            continue
-        seen.add(sid)
         rec = st.get_session(sid) or {}
         when = (rec.get("started_at") or "")[:10]
         # A subagent inherits its parent's working directory for display; Codex
@@ -125,11 +164,47 @@ def cmd_search(args: argparse.Namespace) -> int:
             cwd = parent.get("cwd")
         where = Path(cwd).name if cwd else "-"
         tag = " (subagent)" if rec.get("provenance") == "subagent" else ""
+        hits_note = f"  [{hit['chunk_hits']} hits]" if hit.get("chunk_hits", 1) > 1 else ""
         print(f"\n{sid[:8]}  {rec.get('source','?'):6} {when}  {where}{tag}"
-              f"  ({rec.get('words',0):,}w)")
+              f"  ({rec.get('words',0):,}w){hits_note}")
         excerpt = " ".join((hit.get("excerpt") or "").split())
         if excerpt:
             print(f"    {excerpt}")
+    st.close()
+    return 0
+
+
+def cmd_log(args: argparse.Namespace) -> int:
+    """Reverse-chronological "what did I do last week" view.
+
+    Deliberately a separate command from search rather than `search ""`: it
+    answers a different question (what happened, in order) and the spec asks
+    for its own flag surface (--repo, --since, --limit) rather than every
+    search flag. See docs/specs/004-structured-filters.md, "muninn log".
+    """
+    st = store.open_store(args.db)
+    filters = Filters(repo=args.repo, since=args.since)
+    try:
+        rows = st.log(limit=args.limit, filters=filters)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        st.close()
+        return 2
+    if args.json:
+        print(json.dumps(rows))
+        st.close()
+        return 0
+    if not rows:
+        print("no sessions")
+        st.close()
+        return 0
+    for row in rows:
+        when = (row.get("started_at") or "")[:10] or "?"
+        where = Path(row["cwd"]).name if row.get("cwd") else "-"
+        tag = " (subagent)" if row.get("provenance") == "subagent" else ""
+        topic = f"  {row['topic']}" if row.get("topic") else ""
+        print(f"{when}  {row['session_id'][:8]}  {row.get('source','?'):6} "
+              f"{where}{tag}  ({row.get('words',0):,}w){topic}")
     st.close()
     return 0
 
@@ -253,9 +328,19 @@ def build_parser() -> argparse.ArgumentParser:
                          help="print only the machine-readable import receipt(s)")
     p_index.set_defaults(func=cmd_index)
 
-    p_search = sub.add_parser("search", help="search the archive")
+    p_search = sub.add_parser(
+        "search", help="search the archive",
+        description="Search the archive. By default, every session is searched "
+                    "EXCEPT tool-invoked ones (reproducible/bug-residue "
+                    "sessions from other tools calling `claude -p`, not "
+                    "conversations) — pass --provenance tool-invoked to "
+                    "include them explicitly. Subagent transcripts ARE "
+                    "searched by default; they hold real work.")
     p_search.add_argument("query")
     p_search.add_argument("--limit", type=int, default=20)
+    p_search.add_argument("--json", action="store_true",
+                          help="print a JSON array of result objects instead of text")
+    _add_filter_args(p_search)
     p_search.set_defaults(func=cmd_search)
 
     p_show = sub.add_parser("show", help="print one session (id prefixes are fine)")
@@ -264,7 +349,31 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_doctor = sub.add_parser("doctor", help="report archive health and index lag")
     p_doctor.set_defaults(func=cmd_doctor)
+
+    p_log = sub.add_parser(
+        "log", help='reverse-chronological "what did I do last week" view')
+    p_log.add_argument("--repo")
+    p_log.add_argument("--since", help="ISO date/prefix: 2026, 2026-07, or 2026-07-31")
+    p_log.add_argument("--limit", type=int, default=20)
+    p_log.add_argument("--json", action="store_true")
+    p_log.set_defaults(func=cmd_log)
     return parser
+
+
+def _add_filter_args(p: argparse.ArgumentParser) -> None:
+    """Filters shared across search-shaped subcommands. See docs/specs/004."""
+    p.add_argument("--repo", help="substring match on the basename of the session's cwd")
+    p.add_argument("--branch", help="exact match on git branch")
+    p.add_argument("--file", help="a file touched in the session (basename or path suffix)")
+    p.add_argument("--tool", help="a tool the session used (e.g. Read, Edit, exec)")
+    p.add_argument("--model", help="substring match on model name")
+    p.add_argument("--provenance", choices=("human", "tool-invoked", "subagent"),
+                   help="default: everything except tool-invoked")
+    p.add_argument("--source", help="claude, codex, claude-cloud, ...")
+    p.add_argument("--since", help="ISO date/prefix: 2026, 2026-07, or 2026-07-31")
+    p.add_argument("--until", help="ISO date/prefix, inclusive")
+    p.add_argument("--outcome", choices=("fixed", "abandoned", "ongoing"),
+                   help="wired for spec 005 enrichment; matches nothing until it lands")
 
 
 def main(argv: list[str] | None = None) -> int:
