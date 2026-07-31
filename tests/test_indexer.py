@@ -314,7 +314,8 @@ class HookIsCheapTest(unittest.TestCase):
             proc = subprocess.run(
                 [sys.executable, "-m", "muninn.hooks.cli", "session-end",
                  "--self-test", "--queue-dir", str(qdir)],
-                capture_output=True, text=True, timeout=10, input="",
+                capture_output=True, text=True, timeout=10,
+                stdin=subprocess.DEVNULL,
             )
             self.assertEqual(proc.returncode, 0, f"stderr: {proc.stderr}")
             jobs = list(qdir.glob("*.json"))
@@ -337,13 +338,22 @@ class HookIsCheapTest(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_hook_exits_zero_on_empty_stdin(self) -> None:
+        """No payload at all must still exit 0, promptly, on every platform.
+
+        Uses DEVNULL rather than ``input=""``: an empty string does not reliably
+        deliver EOF on Windows, where it left the child blocked in
+        ``sys.stdin.read()`` until CI's job timeout killed the whole run. DEVNULL
+        is closed-on-arrival everywhere, and it is also the more honest model of
+        "the hook was invoked with nothing to read".
+        """
         tmp = Path(tempfile.mkdtemp(prefix="muninn-empty-"))
         try:
             qdir = tmp / "queue"
             proc = subprocess.run(
                 [sys.executable, "-m", "muninn.hooks.cli", "session-end",
                  "--queue-dir", str(qdir)],
-                capture_output=True, text=True, timeout=10, input="",
+                capture_output=True, text=True, timeout=10,
+                stdin=subprocess.DEVNULL,
             )
             self.assertEqual(proc.returncode, 0)
         finally:
