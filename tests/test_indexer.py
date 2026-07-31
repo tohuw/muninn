@@ -8,10 +8,10 @@ never fired at all, and a rewritten transcript (/compact, /clear, rotation).
 """
 from __future__ import annotations
 
+import ast
 import io
 import json
 import shutil
-import subprocess
 import sys
 import tempfile
 import threading
@@ -280,34 +280,60 @@ class HookIsCheapTest(unittest.TestCase):
     than silently degrading everyone's SessionEnd hooks.
     """
 
-    def test_hook_process_never_imports_sqlite3_or_store(self) -> None:
+    def test_hook_module_graph_never_reaches_sqlite3_or_store(self) -> None:
         """Acceptance 10, and the test that guards the 1.5s SessionEnd budget.
 
-        Measured in a fresh interpreter because that is the only place module
-        imports can be observed honestly. Deliberately imports the module and
-        nothing else: every earlier version that also drove ``main()`` here —
-        replacing ``sys.stdin``, passing a payload — hung Windows CI. Exit codes
-        and payload handling are covered in-process elsewhere; this asserts one
-        thing.
+        Checked by walking the module's *static* import graph with ast, not by
+        spawning an interpreter. A subprocess form of this test hung Windows CI
+        across six attempts — even reduced to a bare ``python -c`` that only
+        imported the module, it wedged in ``communicate()`` and the job timeout
+        took down the whole run. Static analysis is stricter anyway: it catches a
+        heavy import that a runtime check would miss whenever the module happens
+        to be imported after something else already loaded it.
         """
-        script = (
-            "import sys, json\n"
-            "from muninn.hooks import cli as hookcli\n"
-            "bad = [m for m in ('sqlite3', 'muninn.store', 'muninn.ingest', 'muninn.indexer') "
-            "if m in sys.modules]\n"
-            "print(json.dumps({'bad_modules': bad}))\n"
-        )
-        proc = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True, text=True, timeout=30,
-            stdin=subprocess.DEVNULL,
-            cwd=Path(__file__).resolve().parent.parent,
-        )
-        self.assertEqual(proc.returncode, 0, f"stderr: {proc.stderr}")
-        out = json.loads(proc.stdout.strip().splitlines()[-1])
-        self.assertEqual(out["bad_modules"], [],
-                         "muninn.hooks.cli pulled in a heavy module the SessionEnd "
-                         "1.5s budget cannot afford")
+        root = Path(__file__).resolve().parent.parent
+        forbidden = {"sqlite3", "muninn.store", "muninn.ingest", "muninn.indexer",
+                     "muninn.exports", "muninn.query"}
+        seen: set[str] = set()
+
+        def module_path(name: str) -> Path | None:
+            rel = Path(*name.split("."))
+            for cand in (root / rel.with_suffix(".py"), root / rel / "__init__.py"):
+                if cand.is_file():
+                    return cand
+            return None
+
+        def walk(name: str) -> None:
+            if name in seen:
+                return
+            seen.add(name)
+            path = module_path(name)
+            if path is None:      # stdlib or third-party: record, do not descend
+                return
+            tree = ast.parse(path.read_text())
+            pkg = name.rsplit(".", 1)[0] if "." in name else name
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        walk(alias.name)
+                elif isinstance(node, ast.ImportFrom):
+                    if node.level:                      # relative import
+                        base = pkg
+                        for _ in range(node.level - 1):
+                            base = base.rsplit(".", 1)[0]
+                        target = f"{base}.{node.module}" if node.module else base
+                    else:
+                        target = node.module or ""
+                    if target:
+                        walk(target)
+                        for alias in node.names:        # may itself be a module
+                            walk(f"{target}.{alias.name}")
+
+        walk("muninn.hooks.cli")
+        hits = sorted(forbidden & seen)
+        self.assertEqual(hits, [],
+                         f"muninn.hooks.cli statically reaches {hits}, which the "
+                         "SessionEnd 1.5s budget cannot afford")
 
     def test_self_test_creates_a_job_in_process(self) -> None:
         """``--self-test`` writes a job and exits 0, on every platform."""
