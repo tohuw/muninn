@@ -4,6 +4,18 @@ Muninn targets macOS, Linux and Windows on a **best-effort** basis. This file
 records what is actually known rather than what is intended, in the same spirit
 as [Huginn's WINDOWS.md](https://github.com/tohuw/huginn).
 
+## The failure that was not a failure
+
+Before the limitations below, one correction worth stating first: for several
+rounds this project's Windows CI reported failure while every test passed.
+PowerShell is the default shell on `windows-latest` and treats *any* stderr
+output as a command failure; `python -m unittest` writes its progress and summary
+to stderr by design, so the step exited 1 while printing `OK (skipped=6)`.
+
+The workflow now pins `shell: bash` for the job. **If Windows CI ever goes red
+again, read the test summary before the traceback** — `OK` followed by exit 1
+means the harness is misreporting, not that the code is broken.
+
 ## Never tested on a real Windows machine
 
 Everything below comes from the GitHub Actions `windows-latest` runner. No part
