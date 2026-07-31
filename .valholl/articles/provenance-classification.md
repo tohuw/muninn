@@ -67,6 +67,39 @@ Claude Code's own `entrypoint: sdk-cli` marker is a stronger signal than any
 heuristic and should be preferred where present; Huginn's parser already filters
 on it.
 
+## One session id can appear under two project directories
+
+Measured 2026-07-31: **11 of 388 transcripts in the real corpus shared a session
+id with another file** under a different encoded `cwd`. For example the same
+session id under both:
+
+```
+~/.claude/projects/-Users-tohuw-Projects-docsdex/7b01c7f0-….jsonl
+~/.claude/projects/-Users-tohuw-Projects-ftd-docsdex/7b01c7f0-….jsonl
+```
+
+The cause is a renamed or symlinked repository: Claude Code encodes the working
+directory into the project directory name, so one session reachable by two paths
+is written under both. Subagent transcripts collide identically.
+
+**This was silent data loss before the ledger existed.** The pre-ledger ingest
+had no per-item tracking, so the second file simply upserted over the first and
+one of the two sessions vanished with no error and no counter. The ledger's
+`UNIQUE(ledger_id, item_id)` constraint is what surfaced it — as a crash, which
+is the correct behavior for an archive of record: refusing to proceed is better
+than quietly keeping one of two.
+
+The resolution is a `duplicate-item-in-source` skip: first occurrence wins (paths
+are iterated in sorted order, so it is deterministic), and the duplicate is
+*recorded* rather than dropped. Note that the skip vocabulary already contained
+this reason before the condition was observed — enumerating failure modes in
+advance turned an incident into a lookup.
+
+**Lesson for tests:** every fixture had unique session ids, so 31 tests passed
+while the real corpus crashed on the first run. Fixtures encode what you expect;
+only real data encodes what is true. Run new ingest code against the real corpus
+before believing it.
+
 ## Rules
 
 - Every statistic, gate, rate estimate, and spend projection is **scoped to a
