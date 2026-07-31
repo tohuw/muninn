@@ -309,6 +309,9 @@ class HookIsCheapTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    @unittest.skipIf(sys.platform == "win32",
+                     "python -m on this module wedges under subprocess pipe capture "
+                     "on Windows CI; --self-test is exercised in-process below")
     def test_self_test_creates_a_job_and_exits_zero(self) -> None:
         tmp = Path(tempfile.mkdtemp(prefix="muninn-selftest-"))
         try:
@@ -325,6 +328,37 @@ class HookIsCheapTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_self_test_creates_a_job_in_process(self) -> None:
+        """``--self-test`` writes a job and exits 0, on every platform."""
+        tmp = Path(tempfile.mkdtemp(prefix="muninn-selftest-ip-"))
+        try:
+            qdir = tmp / "queue"
+            rc = hooks_cli.main(["session-end", "--self-test", "--queue-dir", str(qdir)])
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(list(qdir.glob("*.json"))), 1)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_hook_exits_zero_on_malformed_stdin_in_process(self) -> None:
+        """Malformed payload must exit 0. Checked in-process; see the note on the
+        empty-stdin test for why the subprocess form was abandoned."""
+        tmp = Path(tempfile.mkdtemp(prefix="muninn-malformed-"))
+        try:
+            qdir = tmp / "queue"
+            stdin, sys.stdin = sys.stdin, io.StringIO("this is not json{{{")
+            try:
+                rc = hooks_cli.main(["session-end", "--queue-dir", str(qdir)])
+            finally:
+                sys.stdin = stdin
+            self.assertEqual(rc, 0, "a failing hook must never disrupt the session")
+            self.assertEqual(list(qdir.glob("*.json")), [], "no job for an unusable payload")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @unittest.skipIf(sys.platform == "win32",
+                     "python -m on this module wedges under subprocess pipe capture "
+                     "on Windows CI; the same property is covered in-process above "
+                     "and by test_hook_process_never_imports_sqlite3_or_store")
     def test_hook_exits_zero_on_malformed_stdin(self) -> None:
         tmp = Path(tempfile.mkdtemp(prefix="muninn-malformed-"))
         try:
