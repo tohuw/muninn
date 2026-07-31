@@ -12,7 +12,7 @@ import os
 import sys
 from pathlib import Path
 
-from . import __version__, ingest, store
+from . import __version__, exports, ingest, store
 from .query import Filters
 from .receipt import Outcome
 
@@ -116,6 +116,79 @@ def _filters_from_args(args: argparse.Namespace) -> Filters:
         until=args.until,
         outcome=args.outcome,
     )
+def cmd_import(args: argparse.Namespace) -> int:
+    """Import a claude.ai or ChatGPT vendor export.
+
+    ``--verify-safe-to-delete`` answers only from the ledger (never by the
+    agent's own judgement, per .valholl/articles/deterministic-imports.md
+    "Deletion receipts") and never emits a bare "yes": the reason is always
+    printed alongside the verdict.
+    """
+    if args.path:
+        path = Path(args.path)
+    else:
+        candidates = exports.find_exports(exports.default_downloads_dir())
+        if not candidates:
+            print("no export found under ~/Downloads")
+            return 1
+        path = candidates[0].path
+
+    if args.verify_safe_to_delete:
+        st = store.open_store(args.db)
+        safe, reason = exports.verify_safe_to_delete(st, path)
+        st.close()
+        if args.json:
+            print(json.dumps({"safe_to_delete": safe, "reason": reason}))
+        else:
+            verdict = "safe to delete" if safe else "NOT safe to delete"
+            print(f"{verdict}: {reason}")
+        return 0 if safe else 1
+
+    st = store.open_store(args.db)
+    receipt = exports.import_export(st, path, actor=args.actor)
+    st.close()
+
+    if args.json:
+        print(receipt.to_json())
+        return 0
+
+    _print_export_result(receipt)
+    return 0
+
+
+def _print_export_result(receipt) -> None:
+    src = receipt.source
+    span = ""
+    if src.span_earliest and src.span_latest:
+        span = f" · {src.span_earliest[:10]} .. {src.span_latest[:10]}"
+    windowed = " · windowed (~30d)" if src.windowed else ""
+    print(f"source   {src.kind} · {src.item_count:,} items{span}{windowed}")
+
+    d = receipt.delta
+    print(f"this run added {d.added:,} · updated {d.updated:,} · "
+          f"unchanged {d.unchanged:,} · skipped {d.skipped:,}")
+
+    if receipt.outcome is Outcome.DUPLICATE and receipt.attribution is not None:
+        a = receipt.attribution
+        print(f"         duplicate of import #{a.ledger_id} "
+              f"(actor {a.actor}, finished {a.finished_at})")
+    elif receipt.outcome is Outcome.REJECTED and receipt.attribution is not None:
+        a = receipt.attribution
+        print(f"         rejected: import in progress by actor {a.actor} "
+              f"since {a.finished_at}")
+    elif receipt.outcome is Outcome.REJECTED:
+        err = f" ({receipt.error})" if receipt.error else ""
+        print(f"         rejected: source could not be imported{err}")
+
+    if receipt.skips:
+        by_reason: dict[str, int] = {}
+        for skip in receipt.skips:
+            by_reason[skip.reason.value] = by_reason.get(skip.reason.value, 0) + 1
+        parts = ", ".join(f"{reason} ×{n}" for reason, n in sorted(by_reason.items()))
+        print(f"skips    {len(receipt.skips)} items: {parts}")
+
+    if src.windowed:
+        print("note: absence from a windowed export does not indicate upstream deletion.")
 
 
 def cmd_search(args: argparse.Namespace) -> int:
@@ -336,6 +409,18 @@ def build_parser() -> argparse.ArgumentParser:
                     "conversations) — pass --provenance tool-invoked to "
                     "include them explicitly. Subagent transcripts ARE "
                     "searched by default; they hold real work.")
+    p_import = sub.add_parser("import", help="import a claude.ai or ChatGPT export")
+    p_import.add_argument("path", nargs="?",
+                          help="export directory, conversations.json, or .zip "
+                               "(default: newest under ~/Downloads)")
+    p_import.add_argument("--json", action="store_true",
+                          help="print only the machine-readable import receipt")
+    p_import.add_argument("--actor", default="cli")
+    p_import.add_argument("--verify-safe-to-delete", action="store_true",
+                          help="answer, from the ledger only, whether this source "
+                               "is fully recorded and safe to delete")
+    p_import.set_defaults(func=cmd_import)
+
     p_search.add_argument("query")
     p_search.add_argument("--limit", type=int, default=20)
     p_search.add_argument("--json", action="store_true",
