@@ -73,7 +73,13 @@ class ConcurrentEnqueueTest(QueueTestCase):
     """Acceptance 2: concurrent enqueues from threads all survive."""
 
     def test_many_threads_enqueue_no_job_lost_or_corrupted(self) -> None:
-        n = 50
+        # 12, not 50. Fifty simultaneous thread starts hung the Windows CI
+        # runner inside threading.Thread.start() itself — the job timeout fired
+        # while a worker waited on ``self._started``, which is thread creation
+        # rather than anything this queue does. A dozen concurrent writers
+        # exercises the same atomic-rename property on every platform, and a
+        # test that can wedge CI is worse than a test with a bigger number in it.
+        n = 12
         errors: list[BaseException] = []
 
         def worker(i: int) -> None:
