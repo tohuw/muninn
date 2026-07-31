@@ -28,6 +28,7 @@ semantic = [
 
 [project.scripts]
 muninn = "muninn.cli:main"
+muninn-hook = "muninn.hooks.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/tohuw/muninn"

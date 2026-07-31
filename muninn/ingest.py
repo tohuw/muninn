@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import sources
-from .digest import digest_tree
+from .digest import digest_file, digest_tree
 from .receipt import Attribution, Delta, ImportReceipt, Outcome, Skip, SkipReason, SourceFacts
 from .store import Store
 
@@ -91,6 +91,62 @@ def _now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
+def _upsert_parsed(st: Store, parsed: sources.ParsedSession, path: Path, source: str,
+                   stat: os.stat_result, offset: int, now: str,
+                   chunk_words: int | None, chunk_stride: int | None) -> bool:
+    """Write one parsed transcript's session row, chunks, files, and tools.
+
+    Shared by ``ingest_path`` (the directory sweep) and ``ingest_file`` (the
+    single-transcript path the hook drain and watcher use) so the two entry
+    points can never drift on what "a session was ingested" means — see
+    .valholl/articles/session-lifecycle-facts.md, "A hook may only enqueue,
+    never index": once the indexer decides to import a job's transcript, it
+    must apply exactly the same upsert the sweep would have applied to the
+    same file, or the two code paths would produce archives with different
+    shapes depending on which layer happened to catch a given session first.
+
+    Returns whether the session already existed (for added-vs-updated tallying).
+    """
+    existed = st.get_session(parsed.session_id) is not None
+    st.upsert_session({
+        "session_id": parsed.session_id,
+        "source": parsed.source,
+        "provenance": parsed.provenance,
+        "parent_id": parsed.parent_id,
+        "cwd": parsed.cwd,
+        "branch": parsed.branch,
+        "model": parsed.model,
+        "title": parsed.title,
+        "started_at": parsed.started_at,
+        "ended_at": parsed.ended_at,
+        "duration_s": parsed.duration_s,
+        "user_turns": parsed.user_turns,
+        "assistant_turns": parsed.assistant_turns,
+        "tool_uses": parsed.tool_uses,
+        "tool_results": parsed.tool_results,
+        "words": parsed.words,
+        "tokens": parsed.tokens,
+        "text": parsed.text,
+        "source_path": str(path),
+        "source_present": 1,
+        "origin": "raw",
+        "ingested_at": now if not existed else None,
+        "updated_at": now,
+    })
+    st.replace_chunks(
+        parsed.session_id, parsed.text,
+        chunk_words or 400, chunk_stride or 320)
+    st.set_files(parsed.session_id, parsed.files)
+    st.set_tools(parsed.session_id, parsed.tools)
+
+    for category, count in parsed.failures.items():
+        st.record_parse_failure(source, category, count)
+
+    st.save_ingest_state(str(path), parsed.session_id, stat.st_size,
+                         stat.st_mtime, offset, now)
+    return existed
+
+
 def ingest_path(st: Store, root: Path, source: str,
                 chunk_words: int | None = None,
                 chunk_stride: int | None = None,
@@ -121,14 +177,6 @@ def ingest_path(st: Store, root: Path, source: str,
     source_digest = digest_tree(root, paths)
     item_count = len(paths)
 
-    # Live transcript trees are append-only, so there is no (item_id ->
-    # updated_at) identity to detect a duplicate *export* by — see digest.py.
-    # What the digest CAN do is recognize "this exact directory snapshot was
-    # already fully imported", which is exactly the actor-A/actor-B scenario
-    # this ledger exists to fix. Look this up before creating our own row, so
-    # we never match against ourselves.
-    prior_completed = st.find_import_by_digest(source_digest)
-
     ledger_id = st.begin_import(
         actor=actor, source_kind=source_kind, source_ref=str(root),
         source_digest=source_digest,
@@ -151,6 +199,23 @@ def ingest_path(st: Store, root: Path, source: str,
                                     finished_at=holder["acquired_at"]),
         )
         return result
+
+    # Live transcript trees are append-only, so there is no (item_id ->
+    # updated_at) identity to detect a duplicate *export* by — see digest.py.
+    # What the digest CAN do is recognize "this exact directory snapshot was
+    # already fully imported", which is exactly the actor-A/actor-B scenario
+    # this ledger exists to fix. This lookup MUST happen after the lock is
+    # acquired, not before: a 4-way concurrent-import stress test showed that
+    # checking it earlier lets two racing imports both observe "no prior
+    # completed row" (because neither had finished yet), serialize on the
+    # lock in turn, and then the SECOND one to actually run reports
+    # `imported` with added=0/updated=0/unchanged=30 -- the exact "0 written,
+    # 61 cached" ambiguity deterministic-imports.md exists to eliminate, just
+    # produced by a race instead of a re-run. Once this import holds the
+    # lock, no other import can complete underneath it (every caller
+    # releases the lock only after finish_import()), so the read here is
+    # guaranteed current for the entire body below.
+    prior_completed = st.find_import_by_digest(source_digest)
 
     added = updated = unchanged = 0
     skips: list[Skip] = []
@@ -257,44 +322,9 @@ def ingest_path(st: Store, root: Path, source: str,
             continue
 
         seen_session_ids.add(parsed.session_id)
-        existed = st.get_session(parsed.session_id) is not None
-        st.upsert_session({
-            "session_id": parsed.session_id,
-            "source": parsed.source,
-            "provenance": parsed.provenance,
-            "parent_id": parsed.parent_id,
-            "cwd": parsed.cwd,
-            "branch": parsed.branch,
-            "model": parsed.model,
-            "title": parsed.title,
-            "started_at": parsed.started_at,
-            "ended_at": parsed.ended_at,
-            "duration_s": parsed.duration_s,
-            "user_turns": parsed.user_turns,
-            "assistant_turns": parsed.assistant_turns,
-            "tool_uses": parsed.tool_uses,
-            "tool_results": parsed.tool_results,
-            "words": parsed.words,
-            "tokens": parsed.tokens,
-            "text": parsed.text,
-            "source_path": str(path),
-            "source_present": 1,
-            "origin": "raw",
-            "ingested_at": now if not existed else None,
-            "updated_at": now,
-        })
-        st.replace_chunks(
-            parsed.session_id, parsed.text,
-            chunk_words or 400, chunk_stride or 320)
-        st.set_files(parsed.session_id, parsed.files)
-        st.set_tools(parsed.session_id, parsed.tools)
-
-        for category, count in parsed.failures.items():
-            st.record_parse_failure(source, category, count)
+        existed = _upsert_parsed(st, parsed, path, source, stat, offset, now,
+                                 chunk_words, chunk_stride)
         result.merge_failures(parsed.failures)
-
-        st.save_ingest_state(str(path), parsed.session_id, stat.st_size,
-                             stat.st_mtime, offset, now)
 
         if parsed.started_at:
             span_earliest = (min(span_earliest, parsed.started_at)
@@ -369,6 +399,188 @@ def ingest_path(st: Store, root: Path, source: str,
     )
 
     result.marked_missing = _reconcile_missing(st, source, now, windowed=False)
+    st.commit()
+    return result
+
+
+def ingest_file(st: Store, path: Path, source: str,
+                chunk_words: int | None = None,
+                chunk_stride: int | None = None,
+                *, actor: str = "hook") -> IngestResult:
+    """Ingest exactly one transcript file. The hook-drain and watcher entry point.
+
+    ``ingest_path`` digests a whole directory snapshot because a live
+    transcript tree has no stable per-item identity to digest by (see
+    digest.py). A single file does not have that problem — ``digest_file``'s
+    content hash IS a stable identity — so a job for one already-fully-parsed
+    file (the common case: the hook fires once per session, the watcher
+    reacts once per write) is reported as ``duplicate of import #N`` rather
+    than a second, redundant ``imported`` row, exactly the invariant 3
+    guarantee ``ingest_path`` gives the sweep. This is also what makes
+    acceptance test 9 (drain_once run twice against the same unchanged job)
+    resolve to ``Outcome.DUPLICATE`` instead of two identical ``imported``
+    rows that would misreport "nothing new" the way the claudex incident did.
+
+    Every upsert goes through ``_upsert_parsed`` — the exact function
+    ``ingest_path`` uses — so a session picked up by the hook path and one
+    picked up by the sweep can never diverge in what fields get written.
+
+    This function never reconciles missing sources (that is a whole-tree
+    operation, not a single-file one) and never marks anything missing; the
+    sweep is what closes that guarantee, per
+    .valholl/articles/continuous-ingest-not-periodic.md.
+    """
+    path = Path(path)
+    result = IngestResult()
+    now = _now()
+    source_kind = _SOURCE_KIND.get(source, source)
+    item_id = str(path)
+
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        # The transcript named by the job is gone by the time we got to it —
+        # a real race, not a hypothetical: SessionEnd enqueues, and before
+        # the drain runs, /clear or a rename could replace the file, or (per
+        # session-lifecycle-facts.md) the vendor's own startup sweep could
+        # beat us to it. Record the attempt so it is visible to `doctor`
+        # rather than silently vanishing, but there is nothing to import.
+        source_digest = f"file-missing:{item_id}"
+        ledger_id = st.begin_import(
+            actor=actor, source_kind=source_kind, source_ref=item_id,
+            source_digest=source_digest,
+            facts=SourceFacts(kind=source_kind, digest=source_digest, item_count=0, windowed=False),
+        )
+        skip = Skip(item_id=item_id, reason=SkipReason.READ_ERROR)
+        st.record_items(ledger_id, [(item_id, "skipped", SkipReason.READ_ERROR.value)])
+        st.finish_import(ledger_id, outcome=Outcome.REJECTED, delta=Delta(skipped=1),
+                         error=type(exc).__name__)
+        result.merge_failures({"stat_failed": 1})
+        result.receipt = ImportReceipt(
+            ledger_id=ledger_id, outcome=Outcome.REJECTED,
+            source=SourceFacts(kind=source_kind, digest=source_digest, item_count=0, windowed=False),
+            delta=Delta(skipped=1), skips=[skip], error=type(exc).__name__,
+        )
+        st.commit()
+        return result
+
+    source_digest = digest_file(path)
+    item_count = 1
+
+    ledger_id = st.begin_import(
+        actor=actor, source_kind=source_kind, source_ref=item_id,
+        source_digest=source_digest,
+        facts=SourceFacts(kind=source_kind, digest=source_digest, item_count=item_count, windowed=False),
+    )
+
+    holder = st.acquire_import_lock(ledger_id, actor, os.getpid())
+    if holder is not None:
+        st.finish_import(ledger_id, outcome=Outcome.REJECTED, delta=Delta())
+        result.receipt = ImportReceipt(
+            ledger_id=ledger_id, outcome=Outcome.REJECTED,
+            source=SourceFacts(kind=source_kind, digest=source_digest, item_count=item_count,
+                               windowed=False),
+            delta=Delta(),
+            attribution=Attribution(ledger_id=holder["ledger_id"], actor=holder["actor"],
+                                    finished_at=holder["acquired_at"]),
+        )
+        return result
+
+    # Same actor-A/actor-B identity check ingest_path performs, scoped to one
+    # file, and for the same reason moved to AFTER lock acquisition: read
+    # while serialized, or two racing hook-drain/watcher calls for the same
+    # unchanged transcript can both see "no prior completed import" and both
+    # report `imported` — see the matching comment in ingest_path for the
+    # concurrent-import stress test that caught this.
+    prior_completed = st.find_import_by_digest(source_digest)
+
+    added = updated = unchanged = 0
+    skips: list[Skip] = []
+    item_receipts: list[tuple[str, str, str | None]] = []
+    error_class: str | None = None
+    span_earliest: str | None = None
+    span_latest: str | None = None
+
+    prior = st.get_ingest_state(str(path))
+    if prior and prior["size_bytes"] == stat.st_size and prior["mtime"] == stat.st_mtime:
+        result.skipped_unchanged += 1
+        unchanged += 1
+        item_receipts.append((item_id, "unchanged", None))
+    else:
+        parser = sources.PARSERS[source]
+        try:
+            parsed, offset = parser(path, 0)
+        except OSError as exc:
+            result.merge_failures({"read_failed": 1})
+            skips.append(Skip(item_id=item_id, reason=SkipReason.READ_ERROR))
+            item_receipts.append((item_id, "skipped", SkipReason.READ_ERROR.value))
+            error_class = type(exc).__name__
+        except Exception as exc:
+            # A parser bug must not raise out of the drain loop and abort
+            # every other queued job in the same batch — same discipline as
+            # ingest_path, see unstable-jsonl-format.md.
+            result.merge_failures({"parser_exception": 1})
+            skips.append(Skip(item_id=item_id, reason=SkipReason.UNKNOWN_SCHEMA))
+            item_receipts.append((item_id, "skipped", SkipReason.UNKNOWN_SCHEMA.value))
+            error_class = type(exc).__name__
+        else:
+            if not parsed.session_id:
+                skips.append(Skip(item_id=item_id, reason=SkipReason.MISSING_ITEM_ID))
+                item_receipts.append((item_id, "skipped", SkipReason.MISSING_ITEM_ID.value))
+            else:
+                existed = _upsert_parsed(st, parsed, path, source, stat, offset, now,
+                                         chunk_words, chunk_stride)
+                result.merge_failures(parsed.failures)
+                span_earliest = parsed.started_at
+                span_latest = parsed.ended_at
+                if existed:
+                    result.updated += 1
+                    updated += 1
+                    item_receipts.append((item_id, "updated", None))
+                else:
+                    result.ingested += 1
+                    added += 1
+                    item_receipts.append((item_id, "added", None))
+
+    assert_conservation(added, updated, unchanged, len(skips), item_count)
+    delta = Delta(added=added, updated=updated, unchanged=unchanged, skipped=len(skips))
+
+    duplicate_of: int | None = None
+    if added == 0 and updated == 0:
+        if skips:
+            outcome = Outcome.REJECTED
+        elif prior_completed is not None:
+            outcome = Outcome.DUPLICATE
+            duplicate_of = prior_completed["ledger_id"]
+        else:
+            outcome = Outcome.IMPORTED
+    else:
+        outcome = Outcome.PARTIAL if skips else Outcome.IMPORTED
+
+    st.record_items(ledger_id, item_receipts)
+    st.finish_import(ledger_id, outcome=outcome, delta=delta,
+                     duplicate_of=duplicate_of, error=error_class)
+    st.release_import_lock(ledger_id)
+
+    attribution: Attribution | None = None
+    if outcome is Outcome.DUPLICATE and prior_completed is not None:
+        attribution = Attribution(
+            ledger_id=prior_completed["ledger_id"],
+            actor=prior_completed["actor"],
+            finished_at=prior_completed["finished_at"],
+        )
+
+    result.receipt = ImportReceipt(
+        ledger_id=ledger_id,
+        outcome=outcome,
+        source=SourceFacts(kind=source_kind, digest=source_digest, item_count=item_count,
+                           span_earliest=span_earliest, span_latest=span_latest, windowed=False),
+        delta=delta,
+        skips=skips,
+        duplicate_of=duplicate_of,
+        attribution=attribution,
+        error=error_class,
+    )
     st.commit()
     return result
 

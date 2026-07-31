@@ -72,13 +72,28 @@ def digest_tree(root: Path, paths: Iterable[Path]) -> str:
     float ``st_mtime`` — because float mtimes are not reproducible across
     filesystems (precision varies) and would make the digest flap for a tree
     that has not actually changed.
+
+    A path that vanishes between ``discover()`` and this call — a real race,
+    not a hypothetical one: the hook-drain path (spec 003) can process a job
+    seconds after Claude Code wrote it, and a sweep can race the vendor's own
+    cleanup — gets a ``MISSING`` sentinel line instead of raising. The ledger
+    row this digest feeds into still gets created, and the per-file loop in
+    ``ingest.py`` records the same condition as an enumerated
+    ``SkipReason.READ_ERROR`` a moment later; crashing here would instead lose
+    every OTHER file in the same scan to one file's bad luck.
     """
     root = Path(root)
     lines = []
     for path in paths:
-        st = path.stat()
-        rel = path.relative_to(root).as_posix()
-        lines.append(f"{rel}\t{st.st_size}\t{st.st_mtime_ns}")
+        try:
+            rel = path.relative_to(root).as_posix()
+        except ValueError:
+            rel = str(path)
+        try:
+            st = path.stat()
+            lines.append(f"{rel}\t{st.st_size}\t{st.st_mtime_ns}")
+        except OSError:
+            lines.append(f"{rel}\tMISSING\tMISSING")
     preimage = "\n".join(sorted(lines))
     h = hashlib.sha256(preimage.encode("utf-8"))
     return f"tree-sha256:{h.hexdigest()}"

@@ -7,30 +7,25 @@ to change. (Huginn's skill takes the same stance, and it is a good one.)
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
-import os
 import sys
 from pathlib import Path
 
-from . import __version__, ingest, store
+from . import __version__, indexer, ingest, queue, store
+from .hooks import install as hooks_install
+from .paths import DB_PATH, QUEUE_DIR, STATE_DIR, default_roots
 from .receipt import Outcome
 
-# Muninn's own state. Config/state split follows platform convention.
-if sys.platform == "win32":
-    STATE_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "Muninn"
-else:
-    STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "muninn"
-
-DB_PATH = STATE_DIR / "muninn.db"
+# Re-exported for backward compatibility: STATE_DIR/DB_PATH/default_roots used
+# to live here. They now live in muninn/paths.py so muninn/hooks/cli.py (the
+# SessionEnd hook) can resolve QUEUE_DIR without importing this module, which
+# transitively imports sqlite3 via muninn.store — see paths.py.
+__all__ = ["STATE_DIR", "DB_PATH", "QUEUE_DIR", "default_roots", "main", "build_parser"]
 
 
-def default_roots() -> dict[str, Path]:
-    """Where transcripts live, per source. ``$CODEX_HOME`` is honored."""
-    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-    return {
-        "claude": Path.home() / ".claude" / "projects",
-        "codex": codex_home / "sessions",
-    }
+def _now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
 def cmd_index(args: argparse.Namespace) -> int:
@@ -48,17 +43,45 @@ def cmd_index(args: argparse.Namespace) -> int:
     if args.source:
         roots = {k: v for k, v in roots.items() if k == args.source}
     st = store.open_store(args.db)
+
+    if args.watch:
+        # Continuous mode: sweep, then drain the queue and react to file
+        # events indefinitely. See .valholl/articles/continuous-ingest-not-periodic.md
+        # — this is the long-running "background indexer" layer, not a
+        # one-shot sweep. Import receipts are logged one line per import
+        # rather than collected, since the process never terminates on its
+        # own to print a final summary.
+        def _log(receipts: list) -> None:
+            for r in receipts:
+                print(f"import #{r.ledger_id} {r.outcome.value} "
+                      f"added={r.delta.added} updated={r.delta.updated} "
+                      f"skipped={r.delta.skipped}")
+
+        print(f"muninn indexer watching {', '.join(str(p) for p in roots.values())}")
+        try:
+            indexer.watch(st, roots, on_receipts=_log)
+        finally:
+            st.close()
+        return 0
+
+    # A one-shot `muninn index` walks every configured root exactly like
+    # indexer.sweep() does (that function IS ingest_path over every root) —
+    # so it must also record a sweep timestamp. Without this, doctor would
+    # report "last sweep: never" moments after a full reconciling scan just
+    # ran via the CLI, which is exactly the kind of invisible staleness
+    # continuous-ingest-not-periodic.md warns against.
     receipts = []
     for source, root in roots.items():
         if not root.is_dir():
             if not args.json:
                 print(f"{source:7} no transcripts at {root}")
             continue
-        result = ingest.ingest_path(st, root, source)
+        result = ingest.ingest_path(st, root, source, actor="cli")
         if result.receipt is not None:
             receipts.append(result.receipt)
         if not args.json:
             _print_index_result(source, result)
+    st.record_sweep(_now_iso())
     if args.json:
         print(json.dumps([r.to_dict() for r in receipts]))
     else:
@@ -164,6 +187,37 @@ def cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_install_hooks(args: argparse.Namespace) -> int:
+    """Wire ``muninn-hook session-end`` into ``~/.claude/settings.json``.
+
+    ``--check`` is read-only by construction: it calls ``install()`` with
+    ``check_only=True``, which never reaches the atomic-write path — see
+    hooks/install.py. This guarantee is exercised directly by
+    tests/test_indexer.py rather than trusted by inspection alone.
+    """
+    result = hooks_install.install(check_only=args.check)
+    if args.check:
+        if result.already_installed:
+            print(f"installed: {result.command}")
+            print(f"           in {result.settings_path}")
+        else:
+            print("not installed")
+            print(f"  would add: {result.command}")
+            print(f"  to:        {result.settings_path}")
+        return 0
+
+    if result.already_installed and not result.changed:
+        print(f"already installed: {result.command}")
+    elif result.changed:
+        print(f"installed: {result.command}")
+        print(f"  wrote:   {result.settings_path}")
+        if result.backup_path:
+            print(f"  backup:  {result.backup_path}")
+    else:
+        print(f"no change needed: {result.command}")
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Report archive health. Staleness must be visible, never silent."""
     st = store.open_store(args.db)
@@ -188,6 +242,24 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         pending = info["unindexed_or_grown_files"]
         state = "up to date" if not pending else f"{pending:,} file(s) not yet indexed"
         print(f"  {source:7} {state}")
+
+    # Queue section (spec 003): the hook can only enqueue, so a wedged drain
+    # or a pile of malformed jobs is invisible unless doctor surfaces it —
+    # same "staleness must be visible" principle as index lag above.
+    print("\nqueue")
+    pending_jobs = queue.pending_count()
+    bad_jobs = queue.bad_count()
+    oldest_age = queue.oldest_pending_age_s()
+    print(f"  pending  {pending_jobs:,} job(s)")
+    if oldest_age is not None:
+        print(f"  oldest   {oldest_age:,.0f}s old")
+        if oldest_age > 300:
+            print("  WARNING: oldest pending job exceeds 5 minutes — the drain may be wedged")
+    if bad_jobs:
+        print(f"  WARNING: {bad_jobs:,} malformed job(s) in {QUEUE_DIR / 'bad'}")
+
+    last_sweep = st.last_sweep_at()
+    print(f"  last sweep  {last_sweep or 'never'}")
 
     failures = st.conn.execute(
         "SELECT source, category, count FROM parse_failures ORDER BY count DESC").fetchall()
@@ -251,7 +323,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--source", choices=("claude", "codex"))
     p_index.add_argument("--json", action="store_true",
                          help="print only the machine-readable import receipt(s)")
+    p_index.add_argument("--watch", action="store_true",
+                         help="run the background indexer: sweep, then drain the "
+                              "queue and react to file changes indefinitely")
     p_index.set_defaults(func=cmd_index)
+
+    p_install = sub.add_parser(
+        "install-hooks", help="wire the SessionEnd hook into ~/.claude/settings.json")
+    p_install.add_argument("--check", action="store_true",
+                           help="report status only; never write settings.json")
+    p_install.set_defaults(func=cmd_install_hooks)
 
     p_search = sub.add_parser("search", help="search the archive")
     p_search.add_argument("query")
