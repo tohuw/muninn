@@ -215,6 +215,40 @@ to prevent.
     `missing-item-id` skip. codexdex defaulted it to the literal `"unknown"`,
     so every id-less conversation overwrote the previous one on disk.
 
+## Concurrency: the lock must guard the decision, not just the body
+
+Stress-tested 2026-07-31 with four threads importing the same tree
+simultaneously. Data integrity held — 30 sessions, no duplication, no orphaned
+lock row — but two defects surfaced that no single-threaded test could reach:
+
+1. **`open_store` had no busy timeout**, so one thread died with
+   `sqlite3.OperationalError: database is locked` on the `journal_mode` pragma
+   before any lock logic ran. Fix: a `timeout` on `sqlite3.connect` plus
+   `PRAGMA busy_timeout`, applied before other pragmas.
+2. **Three of four runs reported `imported` where two should have reported
+   `duplicate`.** `find_import_by_digest` correctly requires
+   `finished_at IS NOT NULL`, but the losers called it *before* the winner
+   committed, saw no prior import, and fell through to `imported` with
+   `added=0, unchanged=30`.
+
+The second is the incident's ambiguity wearing a different hat: a run that
+changed nothing reporting the same outcome as a run that imported everything.
+`added=0, updated=0, unchanged=N` with outcome `imported` is `0 written, 61
+cached` again.
+
+**The rule this establishes: the import lock must be acquired before the
+duplicate-detection lookup, not merely around the import body.** Otherwise the
+lock guards the work but not the *claim about* the work, and the claim is the
+part that gets relayed to a human.
+
+Note what must not be "fixed": the `finished_at IS NOT NULL` condition is
+correct. Relaxing it so in-flight rows are visible would let a crashed import
+masquerade as a successful one.
+
+This matters more as the system grows. Concurrent imports are rare today — a
+human racing themselves — but a hook, a watcher, and a periodic sweep make
+overlap the normal case rather than the exception.
+
 ## Deletion receipts
 
 `muninn import --verify-safe-to-delete <source>` answers only from the ledger: it
