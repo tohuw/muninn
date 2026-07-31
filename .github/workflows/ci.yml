@@ -24,6 +24,16 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.12", "3.13"]
 
+    # bash on every platform, including Windows. PowerShell is the default
+    # shell on windows-latest and it treats ANY stderr output from a command as
+    # a failure, so `python -m unittest` reported exit 1 while printing
+    # "OK (skipped=6)" — unittest writes its progress and summary to stderr by
+    # design. Diagnosing that cost several rounds; pinning the shell removes the
+    # whole class of problem rather than special-casing one step.
+    defaults:
+      run:
+        shell: bash
+
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
