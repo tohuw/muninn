@@ -48,6 +48,17 @@ The behaviour survived all seven. Every skipped property has equivalent
 in-process coverage that runs on all three platforms, so what is lost on Windows
 is the belt-and-braces process-level check, not the invariant.
 
+## Known limitation: chmod cannot make a directory unwritable
+
+`os.chmod(dir, 0o500)` does not prevent writes on Windows — the CI runner writes
+into such a directory happily. Two queue tests that assert `enqueue()` *returns
+None* when the queue is unwritable are therefore POSIX-only.
+
+The half that matters everywhere still runs there: `enqueue()` must **never
+raise**, because a failing `SessionEnd` hook must not disrupt a session no matter
+what state the queue directory is in. Only the return-value assertion is skipped,
+and only because the precondition cannot be established.
+
 ## Untested on Windows generally
 
 - The background indexer's watcher (`watchfiles` on Windows file locking).

@@ -156,19 +156,52 @@ class MalformedJobTest(QueueTestCase):
 
 
 class UnwritableQueueTest(QueueTestCase):
-    """Acceptance 4: enqueue never raises when the queue dir is unwritable."""
+    """Acceptance 4: enqueue never raises when the queue dir is unwritable.
 
+    Split deliberately. The half that matters everywhere is *never raises*: the
+    SessionEnd hook must not disrupt a session no matter what state the queue
+    directory is in. The half that asserts ``None`` is returned needs the
+    directory to actually be unwritable, and ``chmod(0o500)`` does not achieve
+    that on Windows — the runner writes the job file happily, so the assertion
+    fails for an environmental reason rather than a defect. That half is
+    POSIX-only; see WINDOWS.md.
+    """
+
+    def test_enqueue_never_raises_on_unwritable_dir(self) -> None:
+        self.qdir.mkdir(parents=True)
+        os.chmod(self.qdir, 0o500)  # read + execute, no write (POSIX)
+        try:
+            queue.enqueue({"v": 1, "kind": "session-end"}, queue_dir=self.qdir)
+        except BaseException as exc:  # pragma: no cover - exactly what must not happen
+            self.fail(f"enqueue raised {exc!r}; a hook failure must never disrupt a session")
+        finally:
+            os.chmod(self.qdir, 0o700)
+
+    @unittest.skipIf(sys.platform == "win32",
+                     "chmod(0o500) does not make a directory unwritable on Windows, "
+                     "so there is nothing to fail on; the never-raises half runs there")
     def test_enqueue_returns_none_on_unwritable_dir(self) -> None:
         self.qdir.mkdir(parents=True)
-        os.chmod(self.qdir, 0o500)  # read + execute, no write
+        os.chmod(self.qdir, 0o500)
         try:
             result = queue.enqueue({"v": 1, "kind": "session-end"}, queue_dir=self.qdir)
-        except BaseException as exc:  # pragma: no cover - this is exactly what must not happen
-            self.fail(f"enqueue raised {exc!r} instead of returning None")
         finally:
             os.chmod(self.qdir, 0o700)
         self.assertIsNone(result)
 
+    def test_enqueue_never_raises_when_parent_unwritable_and_dir_missing(self) -> None:
+        parent = self.tmp / "unwritable-parent"
+        parent.mkdir()
+        os.chmod(parent, 0o500)
+        try:
+            queue.enqueue({"v": 1, "kind": "session-end"}, queue_dir=parent / "queue")
+        except BaseException as exc:  # pragma: no cover
+            self.fail(f"enqueue raised {exc!r} when mkdir could not succeed")
+        finally:
+            os.chmod(parent, 0o700)
+
+    @unittest.skipIf(sys.platform == "win32",
+                     "chmod(0o500) does not make a directory unwritable on Windows")
     def test_enqueue_returns_none_when_parent_unwritable_and_dir_missing(self) -> None:
         # queue_dir does not exist yet, and its parent cannot be written to,
         # so mkdir(parents=True) itself must fail without raising past enqueue().
