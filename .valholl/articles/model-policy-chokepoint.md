@@ -108,6 +108,38 @@ Note the asymmetry with the plugin registry, which *does* isolate and skip a
 broken plugin (see `plugins.py`). Same word, opposite correct answer, because one
 adds capability and the other removes permission.
 
+## Flatten errors at the boundary, not at the call
+
+A provider that flattens exceptions from its *requests* is only half-protected.
+Client or connection construction throws too, and those exceptions are often the
+chattiest ones available: botocore's `NoRegionError`, `ProfileNotFound`,
+`InvalidConfigError` and `EndpointConnectionError` can carry profile names,
+config file paths and endpoint hostnames.
+
+Found by testing rather than by reading. The Bedrock plugin correctly wrapped its
+`converse` call, but its client constructor sat outside the `try`, so:
+
+```python
+with mock.patch("boto3.client", raises(ValueError("secret sk-ant-LEAK123"))):
+    provider.generate("hi")
+# -> ValueError('secret sk-ant-LEAK123')   raw message, planted secret intact
+```
+
+**The rule: flatten at the boundary of the provider, so every path out is
+covered by construction rather than by remembering.** Flattening inside the
+client helper protects every call site; flattening around one call protects one
+call.
+
+The test that pins this must exercise **both** paths — an exception from
+construction and an exception from the request — and assert in each case that the
+message matches `^<Provider> request failed \(\w+\)$` and does not contain a
+planted secret. A single-path test passes while the other path leaks, which is
+exactly what happened here.
+
+This generalizes past model providers: it applies to any plugin that talks to a
+remote system, including a history source, and it is the same discipline the
+import ledger already follows in storing only exception class names.
+
 ## Honest scope
 
 This is a **strong contract, not a sandbox**. It governs Muninn's own calls. It
