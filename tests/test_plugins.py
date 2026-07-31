@@ -69,6 +69,25 @@ class WellFormedPluginTest(unittest.TestCase):
         self.assertEqual(result.specs[0].embedders[0].name, "fake-embedder")
 
 
+class FactoryInsteadOfInstanceTest(unittest.TestCase):
+    """An entry point pointed at a factory function, not a built PluginSpec.
+
+    Not one of the spec's 14 numbered criteria, but directly requested: the
+    error_class for this specific mistake should say more than a bare
+    TypeError, since it is the most likely way a plugin author trips over
+    the "instance, not factory" convention.
+    """
+
+    def test_factory_function_is_rejected_with_a_named_error(self) -> None:
+        def factory() -> PluginSpec:
+            return PluginSpec(name="fromfactory", version="1.0.0")
+
+        result = _discover_with(_fake_entry_point("factory_ep", factory))
+        self.assertEqual(result.specs, ())
+        self.assertEqual(len(result.errors), 1)
+        self.assertEqual(result.errors[0].error_class, "PluginSpecNotInstance")
+
+
 class RangeCompatibilityTest(unittest.TestCase):
     def test_overlapping_range_loads_and_non_overlapping_fails_loudly(self) -> None:
         # Criterion 9. core API_VERSION == 1.

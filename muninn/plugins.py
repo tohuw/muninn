@@ -147,6 +147,21 @@ class IncompatibleApiVersion(ValueError):
     """``[min_api, max_api]`` does not overlap core's ``API_VERSION``."""
 
 
+class PluginSpecNotInstance(TypeError):
+    """The entry point resolved to something other than a ``PluginSpec`` instance.
+
+    The one shape discovery accepts is a module-level ``PluginSpec`` instance
+    (the same convention ``muninn.policy`` uses for its entry-point group) —
+    never a zero-arg factory function. Huginn accepts either a spec or a
+    factory, and that ambiguity buys nothing: a single accepted shape means a
+    misconfigured entry point fails loudly with a name that says exactly what
+    went wrong, rather than surfacing as a bare ``TypeError`` a plugin author
+    has to go read our source to decode. The most likely mistake this catches
+    is pointing the entry point at a *function* that builds a ``PluginSpec``
+    instead of at the built instance itself.
+    """
+
+
 def _validate(spec: PluginSpec, seen_names: set[str]) -> None:
     """Raise one of the four validation errors above, or return.
 
@@ -198,10 +213,13 @@ def discover_plugins() -> DiscoveryResult:
             continue
 
         if not isinstance(candidate, PluginSpec):
+            hint = " (looks like a factory function, not an instance)" if callable(candidate) else ""
+            exc = PluginSpecNotInstance(
+                f"entry point did not resolve to a PluginSpec instance: "
+                f"got {type(candidate).__name__}{hint}"
+            )
             errors.append(PluginLoadError(
-                entry_point=ep.name, error_class="TypeError",
-                detail=f"entry point did not resolve to a PluginSpec: {type(candidate).__name__}",
-            ))
+                entry_point=ep.name, error_class=type(exc).__name__, detail=str(exc)))
             continue
 
         try:

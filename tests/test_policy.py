@@ -130,5 +130,28 @@ class EffectiveProvidersTest(unittest.TestCase):
             self.assertEqual(effective_providers(candidates), (("y", "p"),))
 
 
+class BrokenPolicyEntryPointTest(unittest.TestCase):
+    """A policy entry point that fails to load must not simply vanish.
+
+    Dropping a broken policy would silently widen the effective permission
+    set — exactly what this module exists to prevent, since the broken
+    policy might have been the one thing narrowing a restricted build. So a
+    load failure becomes a synthetic policy that refuses everything, not an
+    absent one. This pins that behaviour so a future refactor cannot
+    "simplify" it away without a red test.
+    """
+
+    def test_load_failure_refuses_rather_than_vanishes(self) -> None:
+        broken = mock.Mock()
+        broken.name = "broken-policy"
+        broken.load = mock.Mock(side_effect=RuntimeError("credentials missing"))
+        with mock.patch("muninn.policy.entry_points", return_value=[broken]):
+            resolved = resolve()
+            self.assertEqual(len(resolved), 1)
+            self.assertEqual(resolved[0].allow, ())  # refuses everything
+            with self.assertRaises(PolicyRefused):
+                check("anything", "anyprovider")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -15,6 +15,8 @@ from pathlib import Path
 from . import __version__, exports, indexer, ingest, queue, store
 from .hooks import install as hooks_install
 from .paths import DB_PATH, QUEUE_DIR, STATE_DIR, default_roots
+from .plugins import discover_plugins
+from .policy import resolve as resolve_policies
 from .query import Filters
 from .receipt import Outcome
 
@@ -446,8 +448,55 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print(f"\nimport lock held by actor {lock['actor']} (pid {lock['pid']}) "
                   f"since {lock['acquired_at']}")
 
+    _print_plugins_section()
+    _print_policy_section()
+
     st.close()
     return 0
+
+
+def _print_plugins_section() -> None:
+    """Spec 008: a mismatched/broken plugin must be a loud line in doctor, never a silent skip.
+
+    discover_plugins() is @lru_cache'd (see muninn/plugins.py) so a change to
+    installed plugins is only picked up on the next process start — stated
+    here rather than left to be discovered by surprise when a freshly
+    installed plugin doesn't appear until the CLI is re-invoked (it always
+    is, since each `muninn` invocation is a fresh process — but a long-lived
+    `muninn index --watch` would need a restart).
+    """
+    result = discover_plugins()
+    print("\nplugins (discovered once per process; restart to pick up changes)")
+    if not result.specs and not result.errors:
+        print("  (none installed)")
+    for spec in result.specs:
+        caps = []
+        if spec.embedders:
+            caps.append(f"{len(spec.embedders)} embedder(s)")
+        if spec.text_providers:
+            caps.append(f"{len(spec.text_providers)} text provider(s)")
+        if spec.history_sources:
+            caps.append(f"{len(spec.history_sources)} history source(s)")
+        cap_str = ", ".join(caps) if caps else "no capabilities"
+        print(f"  {spec.name:16} v{spec.version:10} api [{spec.min_api},{spec.max_api}]  {cap_str}")
+    for err in result.errors:
+        # Only error.error_class is a class name — never render err.detail
+        # verbatim here even though this module's own validation errors are
+        # safe; a third-party entry point's exception message is not, and
+        # there must be exactly one code path for "what gets shown."
+        print(f"  WARNING: {err.entry_point!r} failed to load — {err.error_class}")
+
+
+def _print_policy_section() -> None:
+    """Spec 008: which model policies are active, so a restricted build is visibly restricted."""
+    policies = resolve_policies()
+    print("\nmodel policy (every LLM/embedding call routes through these; they intersect)")
+    for policy in policies:
+        provider = policy.require_provider or "any provider"
+        allow = ", ".join(policy.allow) if policy.allow else "(none — refuses everything)"
+        print(f"  {policy.name:16} provider={provider:14} allow=[{allow}]")
+        if policy.reason:
+            print(f"                   reason: {policy.reason}")
 
 
 def _size(path: str | Path) -> str:
