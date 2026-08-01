@@ -16,13 +16,20 @@ whole point of a "restricted contract":
 2. **No match means refuse, not fall back.** If no policy addresses a
    (model, provider) pair, that pair is refused. There is no permissive
    fallback path distinct from the explicit default policy below.
+3. **A failure to *discover* a policy narrows, never widens.** Not just a
+   failure to load one. "I could not read the metadata that would have told me
+   a policy exists" and "no policy exists" are different facts, and treating
+   the first as the second is how a restricted build silently unrestricts
+   itself. See model-policy-chokepoint.md, "Discovery is the attack surface,
+   not just loading" — that section records a working exploit against the
+   first implementation of this module.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from importlib.metadata import entry_points
-from typing import Iterable
+from importlib.metadata import distributions
+from typing import Any, Iterable
 
 POLICY_ENTRY_POINT_GROUP = "muninn.policy"
 
@@ -42,6 +49,7 @@ class ModelPolicy:
     choice, not a global fullmatch-vs-search switch, because a global
     fullmatch would silently break every existing unanchored pattern the
     moment one policy author wanted a suffix-only match.
+
     """
 
     name: str
@@ -93,17 +101,103 @@ def _fail_closed(name: str, exc: BaseException) -> ModelPolicy:
     )
 
 
+def _normalise(name: str) -> str:
+    """PyPA's distribution-name normalisation: runs of ``-_.`` collapse, lowercased."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _policy_entry_points() -> tuple[list[Any], tuple[str, ...]]:
+    """Every ``muninn.policy`` entry point on ``sys.path``, plus shadowed dist names.
+
+    **Why this walks ``distributions()`` instead of calling
+    ``entry_points(group=...)``.** ``entry_points()`` deduplicates by
+    *normalised distribution name, first on ``sys.path`` wins*, and it applies
+    that rule before anything looks at which groups a distribution actually
+    contributes. So a directory containing nothing but
+    ``<same-name>-9.9.dist-info/METADATA`` — no ``entry_points.txt`` at all —
+    placed earlier on ``sys.path`` masks the real distribution entirely, and
+    ``entry_points(group="muninn.policy")`` returns ``[]``. ``resolve()`` then
+    cannot tell that from "no policy is installed" and hands back the
+    permissive ``DEFAULT_POLICY``: an installed exclusion policy is defeated by
+    a directory of two files and a ``PYTHONPATH`` entry, with no error anywhere.
+
+    Verified against this module before the fix, with a real policy installed
+    that allowed only ``^us\\.anthropic\\.``::
+
+        A. real policy installed:  resolved ['no-local-model']  local-llama-7b REFUSED
+        B. shadow dist prepended:  resolved ['default']         local-llama-7b ALLOWED
+
+    Walking distributions ourselves keeps both, so a masked distribution's
+    policy still binds. The cost is real: a genuinely duplicate-installed
+    distribution now contributes its policy twice. That is the right direction
+    to be wrong in — policies intersect, so a duplicate is redundant rather
+    than dangerous, whereas a dropped one is the fail-open above.
+
+    The duplicate normalised names are returned rather than merely tolerated,
+    because two distributions claiming one name *is* the shadowing signal.
+    ``doctor`` prints them; see ``cli._print_policy_section``.
+    """
+    eps: list[Any] = []
+    seen: dict[str, int] = {}
+    for dist in distributions():
+        try:
+            contributed = [ep for ep in dist.entry_points if ep.group == POLICY_ENTRY_POINT_GROUP]
+            # .metadata can raise on a malformed/truncated METADATA file, so it
+            # is read inside the guard: a distribution we cannot name must not
+            # cost us the policies we already collected.
+            name = _normalise(str(dist.metadata["Name"] or ""))
+        except Exception:   # noqa: BLE001 - see below
+            # A distribution whose metadata cannot be parsed is skipped, not
+            # fatal. This is the one place a *discovery* failure loses a
+            # policy, and it is unavoidable — an unreadable entry_points.txt
+            # cannot tell us what it would have said. It does not widen
+            # anything relative to the alternative, which is propagating and
+            # taking down every policy including the ones that parsed.
+            #
+            # ``Exception`` only, unlike the load guard in ``resolve()``:
+            # reading and parsing metadata does not execute third-party code,
+            # so ``SystemExit`` is not a realistic outcome here, and swallowing
+            # a ``KeyboardInterrupt`` per-distribution would make this loop
+            # resist Ctrl-C for no benefit.
+            continue
+        if not contributed:
+            continue
+        eps.extend(contributed)
+        if name:   # a nameless distribution cannot be reported as a duplicate of anything
+            seen[name] = seen.get(name, 0) + 1
+    return eps, tuple(sorted(n for n, count in seen.items() if count > 1))
+
+
+def shadowed_distribution_names() -> tuple[str, ...]:
+    """Normalised names contributing a policy from more than one distribution.
+
+    A restricted build should have exactly one distribution per name. Two means
+    either a broken install or something deliberately shadowing the policy
+    distribution (see ``_policy_entry_points``), and both deserve a loud line
+    in ``doctor`` rather than silence.
+    """
+    return _policy_entry_points()[1]
+
+
 def resolve() -> tuple[ModelPolicy, ...]:
     """Discover contributed policies via entry points; fall back to the default.
 
     Deliberately uncached (unlike ``plugins.discover_plugins()``): policy
     resolution is cheap — no I/O beyond entry-point metadata already loaded by
-    the interpreter — and leaving it uncached means tests can monkeypatch
-    ``importlib.metadata.entry_points`` per-test without also having to manage
-    cache invalidation.
+    the interpreter — and leaving it uncached means a test can point
+    ``sys.path`` at a fixture distribution per-test without also having to
+    manage cache invalidation.
+
+    Note for anyone writing a test here: monkeypatching
+    ``muninn.policy.entry_points`` no longer works, because this function does
+    not call it. That is not incidental — the old tests all patched it, which
+    is exactly why the masking bug documented in ``_policy_entry_points`` was
+    invisible to a green suite. Patch ``muninn.policy._policy_entry_points``
+    for unit tests, and see ``ShadowedDistributionTest`` in tests/test_policy.py
+    for the one that builds real ``.dist-info`` directories on disk.
     """
     policies: list[ModelPolicy] = []
-    for ep in entry_points(group=POLICY_ENTRY_POINT_GROUP):
+    for ep in _policy_entry_points()[0]:
         try:
             candidate = ep.load()
         except Exception as exc:  # noqa: BLE001 - must not propagate; see _fail_closed
