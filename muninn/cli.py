@@ -12,7 +12,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import __version__, exports, indexer, ingest, queue, raven, ravenserve, store
+from . import __version__, daemon, exports, ingest, queue, raven, store
 from .hooks import install as hooks_install
 from .paths import DB_PATH, QUEUE_DIR, STATE_DIR, default_roots
 from .plugins import discover_plugins
@@ -43,56 +43,26 @@ def cmd_index(args: argparse.Namespace) -> int:
     (invariant 4) — that blending is exactly what let claudex's "0 written, 61
     cached" read as "nothing new" when it meant "already imported".
     """
-    roots = default_roots()
-    if args.source:
-        roots = {k: v for k, v in roots.items() if k == args.source}
-    st = store.open_store(args.db)
+    roots = _roots_for(args)
 
     if args.watch:
-        # Continuous mode: sweep, then drain the queue and react to file
-        # events indefinitely. See .valholl/articles/continuous-ingest-not-periodic.md
-        # — this is the long-running "background indexer" layer, not a
-        # one-shot sweep. Import receipts are logged one line per import
-        # rather than collected, since the process never terminates on its
-        # own to print a final summary.
-        def _log(receipts: list) -> None:
-            for r in receipts:
-                print(f"import #{r.ledger_id} {r.outcome.value} "
-                      f"added={r.delta.added} updated={r.delta.updated} "
-                      f"skipped={r.delta.skipped}")
+        # The FOREGROUND ingest loop, and only that. Since spec 010 the raven
+        # descriptor, /api/menu and the state file belong to `muninn serve`;
+        # this path deliberately publishes none of them, so someone can watch
+        # ingest happen on a console without a service also being installed,
+        # and so two processes never race to own one descriptor path.
+        #
+        # It still takes the single-instance lock, because the failure to
+        # prevent is two loops draining one queue and sweeping one archive —
+        # and that failure does not care which command started them. Naming
+        # the mistake: locking only in `serve` would make `index --watch` look
+        # harmless while it silently doubles every import.
+        #
+        # The store is opened by the daemon rather than here, so the lock is
+        # taken before anything touches the archive.
+        return _run_ingest_loop(args, roots, menubar=False, holder=daemon.HOLDER_WATCH)
 
-        print(f"muninn indexer watching {', '.join(str(p) for p in roots.values())}")
-
-        # The watcher is the only process Muninn runs for any length of time, so
-        # it is also where the raven descriptor is published and /api/menu is
-        # served (docs/specs/009-raven-descriptor-menu.md). Muninn is therefore
-        # absent from the shared menubar whenever the watcher is not running,
-        # which is a documented steady state and not a bug to work around here.
-        # attach() returns None rather than raising: a menubar section must never
-        # cost this process its ingest.
-        service = None if args.no_menubar else ravenserve.attach(args.db)
-        if service is not None:
-            print(f"muninn raven serving http://127.0.0.1:{service.port}/api/menu")
-            # SIGTERM is how a service manager stops this process, and Python's
-            # default handler for it does NOT unwind the stack — so the `finally`
-            # below never runs and the descriptor is left behind naming a dead
-            # port. That is survivable (the host checks the pid), but "stopped by
-            # launchd" should not be indistinguishable from "crashed": turning
-            # the signal into SystemExit is what makes the ordinary stop clean.
-            # SIGINT already raises KeyboardInterrupt, so it needs nothing.
-            _exit_on_sigterm()
-        try:
-            indexer.watch(st, roots, on_receipts=_log)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            # Withdraw before closing the store, so the descriptor is gone
-            # before the process can be observed shutting down. A hard kill
-            # skips this and Appistry reports "Not running" from the pid check.
-            if service is not None:
-                service.stop()
-            st.close()
-        return 0
+    st = store.open_store(args.db)
 
     # A one-shot `muninn index` walks every configured root exactly like
     # indexer.sweep() does (that function IS ingest_path over every root) —
@@ -121,20 +91,74 @@ def cmd_index(args: argparse.Namespace) -> int:
     return 0
 
 
-def _exit_on_sigterm() -> None:
-    """Make SIGTERM unwind the stack, so the watcher's cleanup actually runs.
+def _roots_for(args: argparse.Namespace) -> dict[str, Path]:
+    """Configured transcript roots, narrowed by ``--source`` if given."""
+    roots = default_roots()
+    source = getattr(args, "source", None)
+    if source:
+        roots = {k: v for k, v in roots.items() if k == source}
+    return roots
 
-    Best-effort: ``signal.signal`` only works on the main thread and raises
-    ``ValueError`` anywhere else, and a Windows build may not have ``SIGTERM`` at
-    all. Neither is worth failing an indexer over — the descriptor is merely left
-    stale in that case, which the host already handles by checking the pid.
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Run the daemon: continuous ingest, the raven surface, and a state file.
+
+    See docs/specs/010-daemon.md. Named ``serve`` rather than ``daemon`` to match
+    Huginn's verb for the same thing — a user who runs both ravens learns one
+    word — and because it is what the process *does* rather than what it is.
+
+    This function is deliberately thin. Everything about the lifecycle lives in
+    muninn/daemon.py, so that "what the daemon owns" is answerable by reading one
+    module rather than by reading a CLI handler and inferring.
     """
-    import signal
+    return _run_ingest_loop(args, _roots_for(args),
+                            menubar=not args.no_menubar, holder=daemon.HOLDER_SERVE)
 
+
+def _announce(message: str) -> None:
+    """Print one daemon line and flush it.
+
+    The flush is the whole reason this is not just ``print``. Python
+    block-buffers stdout when it is not a tty, which is exactly what a service
+    manager gives a daemon — so every line here (the port it bound, each import
+    receipt) sat in a 8 KiB buffer and reached the log only when the process
+    exited. Verified before the fix: a live `muninn serve` redirected to a file
+    left the file empty for its entire run, and the startup lines all appeared at
+    once on shutdown. A daemon whose log is empty while it works is
+    indistinguishable from a daemon that is not working, which is the specific
+    invisibility this project keeps re-learning about staleness.
+    """
+    print(message, flush=True)
+
+
+def _run_ingest_loop(args: argparse.Namespace, roots: dict[str, Path], *,
+                     menubar: bool, holder: str) -> int:
+    """Shared body of `serve` and `index --watch`. One loop, two front doors.
+
+    The difference between them is entirely the ``menubar``/``holder`` pair, and
+    keeping it that narrow is the point: a future change to shutdown ordering or
+    to the lock cannot apply to one command and not the other, which is exactly
+    how `index --watch` came to be the thing publishing a descriptor in the first
+    place (spec 009's "The lifecycle question").
+    """
+    service = daemon.Daemon(
+        args.db, roots,
+        menubar=menubar,
+        # Only `serve` publishes a state file. A foreground watcher expects no
+        # supervisor and advertises no port, so a state file would be a claim
+        # that something can manage it — and `doctor` would report a daemon that
+        # no service manager knows about.
+        publish_state=(holder == daemon.HOLDER_SERVE),
+        holder=holder,
+        announce=_announce,
+    )
     try:
-        signal.signal(signal.SIGTERM, lambda *_a: sys.exit(0))
-    except (AttributeError, OSError, ValueError):
-        pass
+        return service.run()
+    except daemon.AlreadyRunning as exc:
+        print(f"muninn: {exc}", file=sys.stderr)
+        print("        stop it first, or run `muninn doctor` to see what is holding the lock.",
+              file=sys.stderr)
+        return daemon.EXIT_ALREADY_RUNNING
 
 
 def _print_index_result(source: str, result: ingest.IngestResult) -> None:
@@ -493,24 +517,110 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     _print_plugins_section()
     _print_policy_section()
+    _print_daemon_section()
     _print_menubar_section()
 
     st.close()
     return 0
 
 
-def _print_menubar_section() -> None:
-    """Spec 009: whether Muninn is currently discoverable in the shared menubar.
+def _print_daemon_section() -> None:
+    """Spec 010: is the daemon running, on what port, and what holds the lock.
 
-    Worth a line even though the answer is usually "no": a user who cannot find
-    Muninn in the menubar has no other way to tell "the indexer is not running"
+    Three separate facts, deliberately not collapsed into one verdict:
+
+    - **The lock** answers "is an ingest loop running at all", and it answers it
+      for `index --watch` too, which writes no state file. It is the only one of
+      the three the kernel maintains, so it survives a SIGKILL that leaves the
+      other two stale.
+    - **The state file** answers "can a supervisor find it", and names the port.
+    - The descriptor (next section) answers "is Muninn in the menubar".
+
+    Naming the mistake a reader might make: a stale state file plus a free lock
+    is not "running". It is a crashed daemon, and reporting it as running is the
+    invisible-staleness failure this project has already been bitten by — so the
+    pid is cross-checked against the OS rather than trusted because a file says
+    so.
+    """
+    print("\ndaemon (`muninn serve`)")
+
+    held, lock_pid, holder = daemon.SingleInstance.probe()
+    lock_file = daemon.lock_path()
+    if held is None:
+        # Unknown, not free. An unenforced guard reported as "nothing running"
+        # is worse than no line at all.
+        print(f"  lock        {lock_file}")
+        print("              UNKNOWN — no file-locking primitive here, or the lock "
+              "file cannot be opened")
+    elif held:
+        where = f"pid {lock_pid}" if lock_pid is not None else "an unrecorded pid"
+        print(f"  lock        held by {where} ({holder})")
+    else:
+        print("  lock        free — no ingest loop is running")
+
+    state = daemon.read_state()
+    state_file = daemon.state_path()
+    if state is None:
+        if state_file.exists():
+            print(f"  state       {state_file}")
+            print("              present but unreadable — treat the daemon as not running")
+        else:
+            print("  state       absent — start it with `muninn serve`")
+        return
+
+    # Every value below is rendered through a narrowing step rather than
+    # interpolated as it was read. The file is Muninn's own 0600 one, so this is
+    # not a trust boundary so much as a refusal to build one: `doctor`'s output is
+    # what an agent relays to a human (CLAUDE.md, "The agent-facing contract"), and
+    # a field printed verbatim makes whatever wrote that file an author of it. A
+    # `db` path carrying an ANSI escape could rewrite the line above it.
+    pid = state.get("pid") if isinstance(state.get("pid"), int) else None
+    port = state.get("port") if isinstance(state.get("port"), int) else None
+    if pid is None or not store.pid_alive(pid):
+        print(f"  state       {state_file}")
+        print(f"  WARNING: state file names pid {pid if pid is not None else '(unrecorded)'}, "
+              f"which is not running — the daemon crashed; the file is stale")
+        return
+    print(f"  running     pid {pid} · since {_epoch_to_iso(state.get('started'))}")
+    # "no menu port" is a real state, not an error: ravenserve.attach() returns
+    # None rather than costing the daemon its ingest (spec 009 #9), so a daemon
+    # with no port is still doing the job that matters.
+    print(f"  menu port   {port if port is not None else 'none (the raven did not bind; see below)'}")
+    print(f"  archive     {raven.safe_label(state.get('db'), 200) or '(unrecorded)'}")
+
+
+def _epoch_to_iso(value: object) -> str:
+    """Render the state file's epoch ``started`` for a human, or say it is unusable.
+
+    The field is epoch seconds to match Huginn's ``daemon.json`` and Muninn's own
+    raven descriptor (see daemon.write_state); rendering it is this layer's job.
+    A value that will not convert is reported as such rather than printed raw —
+    "started 1.7e+09" in a health report is worse than an admission.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "an unrecorded time"
+    try:
+        return dt.datetime.fromtimestamp(value, dt.timezone.utc).isoformat(timespec="seconds")
+    except (OSError, OverflowError, ValueError):
+        return "an unusable timestamp"
+
+
+def _print_menubar_section() -> None:
+    """Whether Muninn is currently discoverable in the shared menubar (spec 009).
+
+    Worth a line even though the answer may be "no": a user who cannot find
+    Muninn in the menubar has no other way to tell "the daemon is not running"
     from "the descriptor went somewhere the host does not look", and those need
     completely different fixes. The path is printed for exactly that reason —
     it is the shared ravens directory, not Muninn's own state dir, and confusing
     the two is the mistake this line makes visible.
+
+    Since spec 010 the publisher is `muninn serve`, not `index --watch`. That
+    changed the heading and nothing else: the descriptor's contents, location and
+    liveness rules are unchanged, which is why the host needed no coordination.
     """
     path = raven.descriptor_path()
-    print("\nshared menubar (published only while `muninn index --watch` runs)")
+    print("\nshared menubar (published while `muninn serve` runs)")
     print(f"  descriptor  {path}")
     if not path.exists():
         print("              absent — Muninn is not in the menubar right now")
@@ -602,16 +712,37 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", default=str(DB_PATH), help="archive path")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    p_serve = sub.add_parser(
+        "serve", help="run the daemon: continuous ingest plus the menubar raven",
+        description="Run Muninn as a service. Sweeps on startup, then drains the "
+                    "SessionEnd queue and reacts to transcript changes forever; "
+                    "publishes the raven descriptor and serves /api/menu on "
+                    "loopback; writes a state file a supervisor can read; and "
+                    "tears all three down on SIGTERM, SIGHUP or Ctrl-C. "
+                    "See docs/specs/010-daemon.md.")
+    p_serve.add_argument("--source", choices=("claude", "codex"),
+                         help="ingest only this source (default: every configured root)")
+    p_serve.add_argument("--no-menubar", action="store_true",
+                         help="do not publish a raven descriptor or serve /api/menu; "
+                              "ingest only (docs/specs/009)")
+    p_serve.set_defaults(func=cmd_serve)
+
     p_index = sub.add_parser("index", help="ingest transcripts into the archive")
     p_index.add_argument("--source", choices=("claude", "codex"))
     p_index.add_argument("--json", action="store_true",
                          help="print only the machine-readable import receipt(s)")
     p_index.add_argument("--watch", action="store_true",
-                         help="run the background indexer: sweep, then drain the "
-                              "queue and react to file changes indefinitely")
+                         help="run the ingest loop in the foreground: sweep, then "
+                              "drain the queue and react to file changes "
+                              "indefinitely. Publishes nothing — use `muninn "
+                              "serve` for the menubar raven and a state file")
+    # Accepted and inert, deliberately rather than removed. Since spec 010
+    # `index --watch` publishes no descriptor at all, so this flag's request is
+    # already satisfied — and an existing launchd plist or shell alias that
+    # passes it would otherwise start failing on an unrecognised argument, which
+    # is a worse outcome than a flag that says it has nothing left to do.
     p_index.add_argument("--no-menubar", action="store_true",
-                         help="with --watch, do not publish a raven descriptor or "
-                              "serve /api/menu on loopback (docs/specs/009)")
+                         help=argparse.SUPPRESS)
     p_index.set_defaults(func=cmd_index)
 
     p_search = sub.add_parser(
