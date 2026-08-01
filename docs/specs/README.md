@@ -39,9 +39,17 @@ what publishes the descriptor. **Read 010 before 009's lifecycle section**, whic
 010 supersedes on that one point and on nothing else. `index --watch` remains as
 the foreground/debug ingest path.
 
-Later phases not yet spec'd: the console, the agent skill, the Cisco
-distribution's plugins, and the login-agent installer (which waits on `corvidae`
-publishing its `LoginAgent` ABC — see 010, "Follow-up seam").
+Spec 010 also covers the **login-agent installer** (`muninn install-agent` /
+`uninstall-agent`), which it originally deferred as a follow-up seam and now
+records as filled. The mechanism is the shared `corvidae` package's
+`LoginAgentSpec`/`LoginAgent`, not a second copy in this repo, and the daemon
+itself needed no change — see 010, "The login-agent installer". Muninn's launchd
+label, plist, systemd unit, log path and Windows Run value are all disjoint from
+Huginn's, because both ravens are meant to be installed at once and every
+collision would be silent.
+
+Later phases not yet spec'd: the console, the agent skill, and the Cisco
+distribution's plugins.
 
 ## How to work one of these
 

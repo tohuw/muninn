@@ -11,7 +11,18 @@ keywords = ["claude", "codex", "transcripts", "search", "agents", "history"]
 # Deliberately small, mirroring Huginn. The archive is stdlib sqlite3/FTS5;
 # semantic search is optional and lives in the [semantic] extra so the default
 # install has no ML surface at all.
+#
+# corvidae is the shared raven package (tohuw/huginn#42): stdlib-only, zero
+# dependencies of its own, so adding it costs the install nothing measurable.
+# Muninn consumes its login-agent seam rather than owning a second copy of
+# launchd/systemd/Run-key handling — see muninn/agent_install.py and
+# docs/specs/010-daemon.md, "Follow-up seam". The range is CalVer-year
+# compatible and pinned the same way Huginn pins it: corvidae promises that
+# every 2026.* release is compatible with every other, and that a breaking
+# change waits for the next year component. Widening past <2027 would silently
+# accept the release that is allowed to break us.
 dependencies = [
+    "corvidae>=2026.8.1,<2027",
     "fastapi>=0.115",
     "uvicorn>=0.30",
     "watchfiles>=0.24",

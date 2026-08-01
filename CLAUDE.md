@@ -65,9 +65,14 @@ finding to report, not an obstacle to route around.
 
 ## Conventions
 
-- **Python ≥3.12**, `uv`, `hatchling`. Dependencies stay minimal (`fastapi`,
-  `uvicorn`, `watchfiles`). Anything ML-shaped goes in the optional `[semantic]`
-  extra — it must not be a default install.
+- **Python ≥3.12**, `uv`, `hatchling`. Dependencies stay minimal (`corvidae`,
+  `fastapi`, `uvicorn`, `watchfiles`). Anything ML-shaped goes in the optional
+  `[semantic]` extra — it must not be a default install.
+- **`corvidae` is the shared raven package**, stdlib-only with zero dependencies
+  of its own, pinned to a CalVer year (`>=2026.8.1,<2027`). Muninn *consumes* it
+  and never vendors from it: if its surface cannot express something Muninn needs,
+  that is a finding to report upstream, not to work around locally. One
+  implementation was the entire point.
 - **CalVer**: `YYYY.MM.DD` with optional `.MICRO`, enforced by
   `tests/test_version.py`. `muninn.__version__` must equal `pyproject.toml`.
   Git tags add a leading `v`.
@@ -90,8 +95,9 @@ uv run ruff check muninn tests tools           # lint
 uv run muninn index                            # ingest transcripts (one shot)
 uv run muninn serve                            # the daemon: continuous ingest + menubar raven
 uv run muninn index --watch                    # the same ingest loop, foreground, publishing nothing
+uv run muninn install-agent                    # start `serve` at login (launchd/systemd/Run key)
 uv run muninn search "query"                   # search
-uv run muninn doctor                           # archive health, index lag, daemon state
+uv run muninn doctor                           # archive health, index lag, daemon + login-agent state
 uv run python tools/corpus-survey.py --self-test   # privacy self-test
 ```
 

@@ -6,8 +6,8 @@ tags: ["huginn", "upstream", "extensibility", "contributions"]
 timestamp: "2026-07-30T00:00:00Z"
 category: "extensibility"
 status: "current"
-updated: "2026-07-30"
-summary: "Building Muninn surfaced concrete weaknesses in Huginn: an exact-match plugin API version, an imperative menubar with no extension seam and a stale hardcoded path, no lag reporting for derived data, launchd-only background install, and no model-policy chokepoint. Each is a candidate upstream contribution."
+updated: "2026-08-01"
+summary: "Building Muninn surfaced concrete weaknesses in Huginn: an exact-match plugin API version, an imperative menubar with no extension seam and a stale hardcoded path, no lag reporting for derived data, launchd-only background install, and no model-policy chokepoint. Several are now fixed upstream; #5 was fixed *and* shared, becoming the corvidae login-agent seam both projects consume."
 related: ["shared-menubar", "continuous-ingest-not-periodic", "model-policy-chokepoint", "provenance-classification"]
 ---
 
@@ -72,13 +72,48 @@ unindexed transcripts**, silently.
 `doctor`, and warn past a threshold. Staleness must be visible. See
 [[continuous-ingest-not-periodic]].
 
-## 5. Background install is launchd-only
+## 5. Background install is launchd-only — FIXED UPSTREAM, and now shared
 
-`huginn/agent_install.py` supports macOS launchd only, though Huginn ships a
-Windows tray app and `WINDOWS.md` documents platform gaps candidly.
+**Status: resolved, and resolved the way this entry asked for.** Huginn added
+systemd user units and a Windows Run-key backend, then extracted all three plus
+the `LoginAgentSpec`/`LoginAgent` seam into the shared `corvidae` package
+(tohuw/huginn#42), published as `corvidae 2026.8.1`. Muninn consumes that package
+— `muninn/agent_install.py` supplies a spec and nothing else — so
+`muninn install-agent` exists with **no second implementation of launchd, systemd,
+or the registry anywhere in this repo**. See [[continuous-ingest-not-periodic]] and
+`docs/specs/010-daemon.md`.
 
-**Fix:** add systemd user units (Linux) and Scheduled Task / tray-owned process
-(Windows). Muninn needs all three anyway; the implementation should be shared.
+Note on issue numbers, since this article cites several: corvidae's README and
+`huginn/agent_install.py` both attribute the login-agent work to huginn#39 and its
+hardening to huginn#41, whereas this article's headings above map #39 to lag
+reporting and #41 to the model-policy chokepoint. One of the two mappings is stale.
+Trust the upstream files over this article for *which number*; nothing here depends
+on the answer, and it is flagged rather than silently corrected because guessing
+would make it worse.
+
+The original text, for the record: `huginn/agent_install.py` supported macOS
+launchd only, though Huginn shipped a Windows tray app and `WINDOWS.md` documented
+platform gaps candidly. The fix asked for was systemd user units and a Windows
+mechanism, *shared* rather than written twice, because Muninn needed all three
+anyway.
+
+**What is worth retaining, since the sharing is the interesting part.** Extraction
+was cheap here for one specific reason that will not always hold: the original
+Huginn work built the seam with a second consumer in mind, so the OS boundary was
+already one overridable method per backend
+(`launchctl`/`systemctl`/`registry`). That is what
+lets Muninn's tests exercise Linux and Windows paths on a macOS host, and it is
+what let the security hardening (`plistlib` rather than an XML template, systemd
+refusing `\n`/`\r`/`%`, 0600 files with refused symlinks) cross the boundary intact
+rather than being reasoned about twice. **A shared package is worth the coupling
+when the expensive part is the edge cases, not the code.**
+
+The one thing extraction did *not* answer, and could not: what a consumer's own
+supervisor should do about a consumer-specific lock. Muninn's daemon exits 1 when
+its single-instance lock is held, and `KeepAlive`/`Restart=on-failure` turn that
+into a crash loop — so `install-agent` refuses while a loop is running. corvidae
+has the same shape for Windows tray ownership and correctly left the rest to the
+consumer.
 
 ## 6. No model-policy chokepoint
 

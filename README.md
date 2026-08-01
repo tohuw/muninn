@@ -75,8 +75,8 @@ before it went. It also publishes Muninn's row in the shared menubar.
 It is built to be supervised, not to supervise itself: it records
 `~/.local/state/muninn/daemon.json` (pid, port, and where to relaunch it from) and
 exits cleanly on `SIGTERM`, `SIGHUP` and Ctrl-C, withdrawing everything it
-published. Point launchd, systemd or a login item at it. `muninn doctor` reports
-whether it is running, its port, and whether its menubar descriptor is published.
+published. `muninn doctor` reports whether it is running, its port, and whether
+its menubar descriptor is published.
 
 Only one ingest loop may run at a time — a second is refused, naming the first —
 because two loops would drain one queue twice and fight over one descriptor.
@@ -84,6 +84,36 @@ because two loops would drain one queue twice and fight over one descriptor.
 with no port and no state file, for watching ingest happen on a console.
 
 See [`docs/specs/010-daemon.md`](docs/specs/010-daemon.md).
+
+### Start it at login
+
+```sh
+uv run muninn install-agent      # macOS: a LaunchAgent; Linux: a systemd user unit;
+                                 # Windows: an HKCU Run entry
+uv run muninn uninstall-agent    # removes it, and stops the daemon it supervises
+```
+
+The mechanism is the shared [`corvidae`](https://pypi.org/project/corvidae/)
+package, so Huginn and Muninn share one implementation rather than each carrying a
+copy. **Both ravens can be installed at once** — that is the point of a shared
+menubar — and every path, label and registry value Muninn uses is disjoint from
+Huginn's.
+
+What each platform actually gives you differs, and the difference is not papered
+over: macOS restarts the daemon if it dies, Linux restarts it on *failure* only
+(so `systemctl --user stop muninn` stays effective, and a headless host also wants
+`loginctl enable-linger $USER`), and the Windows Run key starts it once per login
+and never restarts it.
+
+`install-agent` **refuses while an ingest loop is already running**, because a
+supervisor relaunching a process that exits immediately is a restart loop rather
+than a service. Stop the loop and run it again; `muninn doctor` names what holds
+the lock, and now also reports whether a login agent is installed.
+
+One thing to know before relocating state: the installed agent runs from the OS's
+environment, **not** the shell you installed from, so `XDG_STATE_HOME` and
+`RAVENS_STATE_DIR` exported in a terminal have no effect at login. Set them
+somewhere login sessions see (`launchctl setenv`, a systemd user drop-in).
 
 ## How it works
 
@@ -149,7 +179,7 @@ database is ever needed**; the only real cost is generating embeddings once.
 - [x] Distributable corpus survey (`tools/corpus-survey.py`)
 - [x] Background indexer: `SessionEnd` hook + watcher + reconciling sweep
 - [x] Daemon (`muninn serve`) owning ingest, the menubar raven, and clean shutdown
-- [ ] Login-agent installer (launchd / systemd / Windows), via the shared `corvidae` package
+- [x] Login-agent installer (launchd / systemd / Windows), via the shared `corvidae` package
 - [ ] Structured filters: `--repo --branch --file --tool --model --outcome`
 - [ ] `muninn doctor` — index lag, parse health, calibration drift
 - [ ] Index-time enrichment: topic, outcome, decisions, artifacts

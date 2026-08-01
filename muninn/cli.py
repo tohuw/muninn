@@ -12,7 +12,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import __version__, daemon, exports, ingest, queue, raven, store
+from . import __version__, agent_install, daemon, exports, ingest, queue, raven, store
 from .hooks import install as hooks_install
 from .paths import DB_PATH, QUEUE_DIR, STATE_DIR, default_roots
 from .plugins import discover_plugins
@@ -437,6 +437,26 @@ def cmd_install_hooks(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_install_agent(args: argparse.Namespace) -> int:
+    """Install a login agent that runs `muninn serve` at every login.
+
+    Thin on purpose, exactly like ``cmd_serve``: the mechanism is
+    ``corvidae.login_agent`` and the Muninn-specific parts are
+    ``muninn/agent_install.py``, so "what gets installed where" is answerable by
+    reading one module rather than by reading a CLI handler and inferring.
+
+    The exit code is the contract and the printed wording is not — corvidae says
+    so explicitly about its own backends' output, which may change within a CalVer
+    year. 0 installed, 1 refused or the OS mechanism failed, 2 no mechanism here.
+    """
+    return agent_install.install()
+
+
+def cmd_uninstall_agent(args: argparse.Namespace) -> int:
+    """Remove the login agent. Same exit-code discipline as install-agent."""
+    return agent_install.uninstall()
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Report archive health. Staleness must be visible, never silent."""
     st = store.open_store(args.db)
@@ -543,6 +563,7 @@ def _print_daemon_section() -> None:
     so.
     """
     print("\ndaemon (`muninn serve`)")
+    _print_login_agent_line()
 
     held, lock_pid, holder = daemon.SingleInstance.probe()
     lock_file = daemon.lock_path()
@@ -587,6 +608,43 @@ def _print_daemon_section() -> None:
     # with no port is still doing the job that matters.
     print(f"  menu port   {port if port is not None else 'none (the raven did not bind; see below)'}")
     print(f"  archive     {raven.safe_label(state.get('db'), 200) or '(unrecorded)'}")
+
+
+def _print_login_agent_line() -> None:
+    """Whether a login agent will start `muninn serve` at the next login.
+
+    Part of the daemon section rather than a section of its own, because it
+    answers a fourth question about the same subject — "will this come back by
+    itself" — and a reader who has to correlate two sections to learn that the
+    daemon is running *but* nothing will restart it has been given a puzzle
+    instead of a report.
+
+    Printed **first, and before any of the early returns below.** That position is
+    load-bearing: a crashed daemon leaves a stale state file, which is exactly the
+    case that returns early — and it is also exactly the case where "is anything
+    going to restart it" is the most useful line on screen. Ordering it after the
+    lock would have made the answer disappear at the moment it matters most.
+
+    "not installed" is a completely normal state, not a warning: an external
+    supervisor the user configured by hand, or a foreground `muninn serve` in a
+    terminal, are both legitimate and neither leaves a plist behind. So this
+    reports and does not advise, except to name the verb.
+    """
+    agent = agent_install.get_login_agent()
+    if agent is None:
+        # Not a failure. corvidae returns None for a platform it has no
+        # mechanism for, and saying so is better than omitting the line and
+        # letting the reader assume "not installed".
+        print(f"  at login    no start-at-login mechanism on {sys.platform}")
+        return
+    if agent.installed():
+        # The path, not just the verdict — a `doctor` that says "installed" while
+        # the file lives somewhere the reader is not looking (a redirected
+        # $XDG_CONFIG_HOME, say) is the same invisible-mismatch failure the
+        # descriptor line exists to prevent.
+        print(f"  at login    installed · {agent.label} · {agent_install.config_location(agent)}")
+    else:
+        print(f"  at login    not installed — `muninn install-agent` adds a {agent.label}")
 
 
 def _epoch_to_iso(value: object) -> str:
@@ -770,6 +828,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_install.add_argument("--check", action="store_true",
                            help="report status only; never write settings.json")
     p_install.set_defaults(func=cmd_install_hooks)
+
+    # Named to match Huginn's verbs exactly, for the same reason `serve` is:
+    # someone running both ravens should learn one word. See
+    # docs/specs/010-daemon.md, "Follow-up seam".
+    p_install_agent = sub.add_parser(
+        "install-agent", help="start `muninn serve` at every login (launchd/systemd/Run key)",
+        description="Install a login agent that runs `muninn serve` at login, so "
+                    "the archive keeps ingesting and Muninn stays in the shared "
+                    "menubar without anyone remembering to start it. macOS gets a "
+                    "LaunchAgent (which also restarts it if it dies), Linux a "
+                    "systemd user unit (restart on failure only, so `systemctl "
+                    "--user stop muninn` stays effective), Windows an HKCU Run "
+                    "entry (start only; it is not a supervisor). Refuses while "
+                    "another ingest loop holds the single-instance lock, because "
+                    "supervising a process that exits immediately is a restart "
+                    "loop rather than a service.")
+    p_install_agent.set_defaults(func=cmd_install_agent)
+
+    p_uninstall_agent = sub.add_parser(
+        "uninstall-agent", help="remove the login agent installed by install-agent")
+    p_uninstall_agent.set_defaults(func=cmd_uninstall_agent)
 
     p_search.add_argument("query")
     p_search.add_argument("--limit", type=int, default=20)
