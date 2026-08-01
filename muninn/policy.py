@@ -50,12 +50,51 @@ class ModelPolicy:
     fullmatch would silently break every existing unanchored pattern the
     moment one policy author wanted a suffix-only match.
 
+    ``__post_init__`` validates ``allow`` rather than trusting the annotation,
+    because the two mistakes it catches both fail *open* and neither one
+    raises on its own. Naming them, since a reader will make one of them:
+
+    1. **The missing comma.** ``allow=r"^us\\.anthropic\\."`` instead of
+       ``allow=(r"^us\\.anthropic\\.",)`` is a plain ``str``, not a 1-tuple,
+       and nothing in Python or ruff objects. ``_permits`` then iterates
+       *characters*, so the policy is really ``allow=("^", "u", "s", "\\",
+       ".", ...)`` — and since ``.`` matches any character, that permits
+       essentially every model id, while ``bool(allow)`` stays truthy so an
+       "empty allow-list" guard passes too. Verified: an exclusion policy
+       written this way permitted ``gpt-4o-EVIL``, ``totally-unapproved`` and
+       ``x``.
+    2. **The malformed pattern.** Compiling eagerly here means
+       ``allow=("[unclosed",)`` is a ``re.error`` at *construction*, where
+       ``resolve()``'s guard turns it into a refuse-everything policy. Left to
+       compile lazily inside the permit check, it escaped as ``re.error`` —
+       which is not ``PolicyRefused``, so a caller catching only
+       ``PolicyRefused`` saw a crash, and a caller treating unknown
+       exceptions as retryable retried instead of refusing.
+
+    A ``ModelPolicy`` that raises from here is never a policy that got
+    skipped: ``resolve()`` substitutes the refuse-everything policy from
+    ``_fail_closed``, exactly as it does for an entry point that fails to
+    import.
     """
 
     name: str
     allow: tuple[str, ...]          # regex allowlist of model ids, re.search semantics
     require_provider: str | None = None    # None = any provider
     reason: str = ""                       # shown verbatim on refusal
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.allow, tuple):
+            raise TypeError(
+                f"policy {self.name!r}: allow must be a tuple of regex strings, got "
+                f"{type(self.allow).__name__} — a bare string is the missing-comma mistake "
+                f"and permits almost everything"
+            )
+        for pattern in self.allow:
+            if not isinstance(pattern, str):
+                raise TypeError(
+                    f"policy {self.name!r}: allow patterns must be str, got {type(pattern).__name__}"
+                )
+            re.compile(pattern)   # raises re.error here, not mid-check; see docstring
 
 
 # The permissive default is a real ModelPolicy, not a bypass branch, so the
@@ -78,9 +117,32 @@ class PolicyRefused(RuntimeError):
 
 
 def _permits(policy: ModelPolicy, model: str, provider: str) -> bool:
-    if policy.require_provider is not None and provider != policy.require_provider:
+    """``True`` if ``policy`` permits the pair. **Any** surprise here means False.
+
+    ``ModelPolicy.__post_init__`` already compiled every pattern, so the
+    ``except`` below should be unreachable. It stays because the consequence of
+    the two failure directions is wildly asymmetric: a stray exception escaping
+    a permit check is a refusal turned into a crash — or worse, into a retry,
+    if the caller's broad handler treats an unrecognised exception as
+    transient. A policy constructed by bypassing ``__post_init__``
+    (``dataclasses.replace`` on a subclass, an unpickle, ``object.__new__``)
+    would reach here uncompiled. Refusing on anything unexpected keeps the
+    failure direction the same on every path.
+
+    ``Exception``, not ``BaseException``, and the difference is deliberate —
+    the opposite choice from the load guard in ``resolve()``. Nothing a
+    *pattern* can do raises ``SystemExit``, whereas a pathological pattern can
+    backtrack for a long time, and that is precisely when a human reaches for
+    Ctrl-C. Swallowing their ``KeyboardInterrupt`` to report a refusal would
+    make this function unkillable. ``SystemExit`` at *import* is a real hazard
+    and is caught there instead.
+    """
+    try:
+        if policy.require_provider is not None and provider != policy.require_provider:
+            return False
+        return any(re.search(pattern, model) for pattern in policy.allow)
+    except Exception:   # noqa: BLE001 - a broken policy refuses; it never permits
         return False
-    return any(re.search(pattern, model) for pattern in policy.allow)
 
 
 def _fail_closed(name: str, exc: BaseException) -> ModelPolicy:

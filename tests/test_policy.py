@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -184,6 +185,91 @@ class BrokenPolicyEntryPointTest(unittest.TestCase):
             self.assertEqual(len(resolved), 1)
             self.assertEqual(resolved[0].allow, ())  # refuses everything
             with self.assertRaises(PolicyRefused):
+                check("anything", "anyprovider")
+
+
+class AllowTupleValidationTest(unittest.TestCase):
+    """``allow`` must be a tuple of compilable regex strings, checked at construction.
+
+    The missing comma — ``allow=r"^us\\.anthropic\\."`` for
+    ``allow=(r"^us\\.anthropic\\.",)`` — is a plain ``str``, which nothing in
+    Python or ruff rejects, and which makes the permit check iterate
+    *characters*. Since ``.`` matches anything, a realistic exclusion prefix
+    degenerates to allow-everything while ``bool(allow)`` stays truthy, so an
+    "empty allow-list" guard passes too.
+    """
+
+    def test_bare_string_allow_is_rejected_at_construction(self) -> None:
+        with self.assertRaises(TypeError):
+            ModelPolicy(name="missing-comma", allow=r"^us\.anthropic\.", reason="one typo")
+
+    def test_non_string_pattern_is_rejected(self) -> None:
+        with self.assertRaises(TypeError):
+            ModelPolicy(name="not-a-pattern", allow=(re.compile("^x$"),), reason="compiled, not str")
+
+    def test_the_missing_comma_would_have_permitted_everything(self) -> None:
+        """Pin *why* the type check matters, not just that it fires.
+
+        Had the bare string been accepted, these three ids would all have been
+        permitted by a policy written to allow only one vendor prefix. The
+        counterfactual is asserted directly, by passing the tuple a bare string
+        decays into, so a later reader who finds ``__post_init__`` pedantic and
+        deletes it turns this test red with the exploit spelled out.
+
+        The prefix here has no ``\\`` in it on purpose. A pattern containing
+        ``\\.`` happens to *also* be caught by the eager ``re.compile``, since
+        a lone ``\\`` character is not a valid pattern — but that is luck, not
+        coverage. ``^us-anthropic-`` splits into characters that every one
+        compile fine, and ``^`` alone matches every string under ``re.search``.
+        The tuple-type check is the one that reliably catches this class.
+        """
+        characters_of_the_typo = tuple("^us-anthropic-")
+        degenerate = ModelPolicy(name="degenerate", allow=characters_of_the_typo, reason="what a str decays to")
+        with _resolve_with(degenerate):
+            for permitted_by_accident in ("gpt-4o-EVIL", "totally-unapproved", "x"):
+                check(permitted_by_accident, "anyprovider")   # no raise: the bug, made explicit
+        self.assertTrue(bool(degenerate.allow))   # so an empty-allow guard would not have caught it
+
+    def test_malformed_regex_is_rejected_at_construction_not_at_check(self) -> None:
+        """Bug 3: lazy compilation let ``re.error`` escape the permit check.
+
+        ``re.error`` is not ``PolicyRefused``, so a caller catching only
+        ``PolicyRefused`` got a crash, and a caller treating unknown exceptions
+        as retryable retried rather than refusing. Compiling in
+        ``__post_init__`` moves the failure to construction, where
+        ``resolve()``'s guard converts it into a refuse-everything policy.
+        """
+        with self.assertRaises(re.error):
+            ModelPolicy(name="malformed", allow=("[unclosed",), reason="bad pattern")
+
+    def test_a_policy_that_fails_validation_refuses_everything(self) -> None:
+        """The invalid policy must become the fail-closed path, never be skipped."""
+        def build_it() -> ModelPolicy:
+            return ModelPolicy(name="malformed", allow=("[unclosed",), reason="bad pattern")
+
+        ep = mock.Mock()
+        ep.name = "malformed"
+        ep.load = build_it   # raises re.error when resolve() loads it
+        with mock.patch("muninn.policy._policy_entry_points", return_value=([ep], ())):
+            resolved = resolve()
+            self.assertEqual(resolved[0].allow, ())
+            with self.assertRaises(PolicyRefused):
+                check("anything", "anyprovider")
+
+    def test_check_refuses_rather_than_raising_when_a_pattern_is_uncompilable(self) -> None:
+        """Defence in depth: a policy that bypassed ``__post_init__`` still refuses.
+
+        ``object.__new__`` plus ``object.__setattr__`` is how an unpickle or a
+        C-level construction reaches a frozen dataclass without running
+        ``__post_init__``. ``_permits`` must return False, not raise.
+        """
+        smuggled = object.__new__(ModelPolicy)
+        object.__setattr__(smuggled, "name", "smuggled")
+        object.__setattr__(smuggled, "allow", ("[unclosed",))
+        object.__setattr__(smuggled, "require_provider", None)
+        object.__setattr__(smuggled, "reason", "bypassed validation")
+        with _resolve_with(smuggled):
+            with self.assertRaises(PolicyRefused):   # PolicyRefused, never re.error
                 check("anything", "anyprovider")
 
 
