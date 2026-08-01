@@ -56,7 +56,34 @@ uv run muninn search "auth redirect" --since 2026-06
 
 # Survey your corpus and derive calibration (see below).
 uv run muninn survey
+
+# Run it as a service. This is the one that matters for durability.
+uv run muninn serve
+
+# Health, including whether the daemon is running and on what port.
+uv run muninn doctor
 ```
+
+### Run the daemon
+
+`muninn serve` is what makes the archive-of-record guarantee real. It sweeps on
+startup, then drains the `SessionEnd` queue and reacts to transcript changes for
+as long as it runs — so a session written while nothing was watching is still
+recovered, and a session deleted by Claude Code's 30-day sweep was captured
+before it went. It also publishes Muninn's row in the shared menubar.
+
+It is built to be supervised, not to supervise itself: it records
+`~/.local/state/muninn/daemon.json` (pid, port, and where to relaunch it from) and
+exits cleanly on `SIGTERM`, `SIGHUP` and Ctrl-C, withdrawing everything it
+published. Point launchd, systemd or a login item at it. `muninn doctor` reports
+whether it is running, its port, and whether its menubar descriptor is published.
+
+Only one ingest loop may run at a time — a second is refused, naming the first —
+because two loops would drain one queue twice and fight over one descriptor.
+`muninn index --watch` is still the foreground/debug path: the same ingest loop
+with no port and no state file, for watching ingest happen on a console.
+
+See [`docs/specs/010-daemon.md`](docs/specs/010-daemon.md).
 
 ## How it works
 
@@ -120,7 +147,9 @@ database is ever needed**; the only real cost is generating embeddings once.
 
 - [x] Storage, ingest, provenance classification, losslessness contract tests
 - [x] Distributable corpus survey (`tools/corpus-survey.py`)
-- [ ] Background indexer: `SessionEnd` hook + watcher + reconciling sweep
+- [x] Background indexer: `SessionEnd` hook + watcher + reconciling sweep
+- [x] Daemon (`muninn serve`) owning ingest, the menubar raven, and clean shutdown
+- [ ] Login-agent installer (launchd / systemd / Windows), via the shared `corvidae` package
 - [ ] Structured filters: `--repo --branch --file --tool --model --outcome`
 - [ ] `muninn doctor` — index lag, parse health, calibration drift
 - [ ] Index-time enrichment: topic, outcome, decisions, artifacts

@@ -79,9 +79,38 @@ raise**, because a failing `SessionEnd` hook must not disrupt a session no matte
 what state the queue directory is in. Only the return-value assertion is skipped,
 and only because the precondition cannot be established.
 
+## The daemon on Windows: two real degradations, both stated rather than hidden
+
+`muninn serve` (docs/specs/010-daemon.md) is written for POSIX signals and POSIX
+file locking. Neither exists in the same form on Windows, so two of its guarantees
+weaken there. Both are best-effort by design, and neither costs ingest:
+
+1. **`SIGHUP` does not exist, and `SIGTERM` is not what a Windows service
+   manager sends.** The teardown that withdraws the raven descriptor and removes
+   `daemon.json` runs on Ctrl-C, and on a normal `SystemExit`. A process killed
+   by `TerminateProcess` — which is what Task Manager's End Task and most
+   service stops do — skips it entirely, exactly like a POSIX `SIGKILL`. The
+   result is a stale descriptor and a stale state file. **That is reported, not
+   silent:** the menubar host checks the recorded pid before trusting a
+   descriptor, and `muninn doctor` cross-checks `daemon.json`'s pid and says
+   "the daemon crashed; the file is stale". A restart over both files works.
+2. **The single-instance lock uses `msvcrt.locking` rather than `flock`**, and
+   is untested on a real Windows machine. If no locking primitive is available
+   at all, the daemon **fails open** — it starts anyway, with a warning, and
+   `doctor` reports the guard as *unknown* rather than as free. That direction is
+   deliberate: two ingest loops waste work and can clobber a descriptor, whereas
+   a daemon that refuses to start loses transcripts, and losing transcripts is
+   the one failure this project exists to prevent.
+
+The daemon's own tests skip on Windows (`POSIX_ONLY` in `tests/test_daemon.py`)
+because they signal a real process and assert mode bits, neither of which means
+anything there. As elsewhere in this document, that is a gap in *verification*,
+not a claim that it works.
+
 ## Untested on Windows generally
 
 - The background indexer's watcher (`watchfiles` on Windows file locking).
+- The daemon's lifecycle end to end — see above.
 - `install-hooks` writing to `%USERPROFILE%\.claude\settings.json`.
 - Rewrite detection when a transcript is held open by another process — Windows
   disallows deleting or renaming open files, and the atomic
