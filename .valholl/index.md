@@ -19,7 +19,7 @@ the code does.
 ## Durability
 
 - [The index is an archive of record](articles/archive-of-record.md) — transcripts are deleted after 30 days
-- [Continuous ingest, not periodic](articles/continuous-ingest-not-periodic.md) — why a cron indexer loses data, and why the loop needs a daemon to own it
+- [Continuous ingest, not periodic](articles/continuous-ingest-not-periodic.md) — why a cron indexer loses data, why the loop needs a daemon to own it, and what a login-agent supervisor does with the lock
 - [The transcript JSONL format is not a stable API](articles/unstable-jsonl-format.md) — accepted risk, and how it degrades
 
 ## Ingest
@@ -40,7 +40,7 @@ the code does.
 ## Extensibility
 
 - [The shared menubar (menu-as-data)](articles/shared-menubar.md) — one raven, two minds; published by `muninn serve` since spec 010
-- [Lessons for Huginn](articles/lessons-for-huginn.md) — improvements to contribute upstream
+- [Lessons for Huginn](articles/lessons-for-huginn.md) — improvements to contribute upstream; #5 became the shared `corvidae` login-agent seam
 
 ## Process
 

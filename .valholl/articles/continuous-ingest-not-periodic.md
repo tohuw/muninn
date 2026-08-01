@@ -75,10 +75,36 @@ Two things learned building it, both worth keeping:
   winner's descriptor on its way out, so a healthy daemon silently leaves the
   menubar.
 
-The supervisor *installer* — launchd, systemd, Windows startup — is still absent,
-deliberately: it is being extracted from Huginn into the shared `corvidae` package
-rather than written twice. See [[lessons-for-huginn]] #5, which called this out
-before either project acted on it.
+## The supervisor installer, and the crash loop the lock does not prevent
+
+The supervisor *installer* — launchd, systemd, Windows startup — now exists as
+`muninn install-agent`, built on the shared `corvidae` package rather than written
+twice. See [[lessons-for-huginn]] #5, which called this out before either project
+acted on it, and `docs/specs/010-daemon.md` for the concrete values.
+
+Two things learned filling that seam, both about the *interaction* between a
+supervisor and the single-instance lock rather than about either alone:
+
+- **An exit code the lock produces becomes a crash loop once a supervisor is
+  reading it.** `muninn serve` exits 1 when the lock is held, which is right on its
+  own — a supervisor must not report a daemon it did not start as running. But
+  launchd's `KeepAlive` relaunches a process that exits 1 forever, and systemd's
+  `Restart=on-failure` does the same until it gives up and leaves the unit
+  `failed`. So a perfectly healthy `muninn index --watch` in a terminal turns a
+  fresh install into a log full of "already running". The lock prevented the data
+  failure and *created* a lifecycle one, at the exact moment the user asked for a
+  service. `install-agent` therefore refuses while a loop holds the lock, rather
+  than the daemon changing how it exits.
+- **A supervisor does not inherit the environment of the shell that installed
+  it.** Measured: an install run with `HOME`, `XDG_STATE_HOME` and
+  `RAVENS_STATE_DIR` all redirected to a tempdir produced a daemon that ingested
+  into the real archive, because launchd starts the agent from its own
+  environment. This is the same class of invisibility this article is about — the
+  install reported success and the daemon ran, and only the log said where. Not
+  worked around: capturing a terminal's transient state into config that runs at
+  every login for years is worse than the surprise, and an `EnvironmentVariables`
+  plist key is the exact thing Huginn's #41 XML injection manufactured out of a
+  directory name.
 
 ## Requirements
 

@@ -107,10 +107,35 @@ because they signal a real process and assert mode bits, neither of which means
 anything there. As elsewhere in this document, that is a gap in *verification*,
 not a claim that it works.
 
+## `install-agent` on Windows starts, but does not supervise
+
+`muninn install-agent` writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\MuninnDaemon`
+via the shared `corvidae` package. **The Run key starts a process once per login
+and never restarts it**, so the guarantee is strictly weaker than macOS's launchd
+`KeepAlive` or Linux's `Restart=on-failure`: a daemon that exits — including one
+killed by `TerminateProcess`, per the section above — stays down until the next
+login. That is stated rather than smoothed over, and `install-agent` says so on
+stdout when it succeeds.
+
+Muninn declares **no tray registry value**, unlike Huginn. Huginn's tray app
+registers itself in the Run key and supervises Huginn's daemon, so corvidae refuses
+to install a second autostart there. Muninn ships no tray: Appistry is the shared
+menubar host, it registers itself through a Start Menu Startup shortcut rather than
+the Run key, and it only *reads* Muninn's raven descriptor — it never starts or
+stops `muninn serve`. So there is nothing to defer to, and a Run value named
+`Muninn` belonging to something else will not block a valid install.
+
+The Run-key backend is exercised in `tests/test_agent_install.py` against a fake
+`winreg` through corvidae's overridable `registry()` boundary, so it is covered on
+every platform — but, as everywhere in this document, that is coverage of the
+*logic*, not evidence it works on real Windows.
+
 ## Untested on Windows generally
 
 - The background indexer's watcher (`watchfiles` on Windows file locking).
 - The daemon's lifecycle end to end — see above.
+- `install-agent` writing a real `HKCU` Run value, and whether the daemon it
+  starts at a real login behaves.
 - `install-hooks` writing to `%USERPROFILE%\.claude\settings.json`.
 - Rewrite detection when a transcript is held open by another process — Windows
   disallows deleting or renaming open files, and the atomic

@@ -57,6 +57,7 @@ The module is still `muninn/daemon.py`, because that is what the subsystem is.
 | Single-instance guard | `daemon.SingleInstance` | New. `daemon.lock`, advisory `flock`. |
 | Termination | `daemon.install_termination_handlers()` | SIGTERM + SIGHUP. |
 | Reporting | `cli._print_daemon_section()` | New `doctor` section. |
+| Start-at-login | `corvidae.login_agent` via `muninn/agent_install.py` | The follow-up seam, now filled. **The daemon itself needed no change.** |
 
 **`muninn index --watch` stays** and is now the *foreground/debug* path: the same
 ingest loop, publishing nothing — no port, no descriptor, no state file. It is
@@ -322,16 +323,28 @@ not**, which is the reason for 0600 rather than the archive's own precedent.
 ## Definition of done
 
 ```sh
-uv run python -m pytest tests -q       # 278 passed, 1 skipped, 97 subtests
+uv run python -m pytest tests -q       # 339 passed, 1 skipped, 109 subtests
 uv run ruff check .
 uv run muninn serve                    # descriptor + state appear; Ctrl-C removes both
 uv run muninn doctor                   # daemon section names the pid and port
 kill -TERM $(python3 -c 'import json;print(json.load(open("'"$HOME"'/.local/state/muninn/daemon.json"))["pid"])')
+uv run muninn install-agent            # plist appears; launchd starts the daemon
+uv run muninn uninstall-agent          # plist gone, daemon stopped, both files removed
 ```
+
+The count was **278 passed, 1 skipped, 97 subtests** when the daemon alone landed;
+the installer added 61 tests and 12 subtests.
 
 Verified additionally against a live daemon in a redirected `HOME`: SIGTERM,
 SIGHUP, SIGINT and SIGKILL each signalled at a real process, with the descriptor,
 the state file, the lock and a real `/api/menu` fetch checked at every step.
+
+The installer was verified the same way — a real `launchctl load`, a real daemon
+under launchd's supervision, and a real `uninstall-agent`. That last one is the
+useful evidence for this spec's own claim that the daemon needed no change:
+`launchctl unload -w` sends `SIGTERM`, and both `daemon.json` and the raven
+descriptor were gone afterwards, with the lock free. The teardown spec 010 built
+for a supervisor was exercised by an actual supervisor.
 
 ### Mutation-verified, because a passing signal test proves less than it looks
 
@@ -370,17 +383,12 @@ observe.
 - **Do not modify** `tests/test_losslessness.py`, `tests/test_ledger.py`,
   `tests/test_indexer.py`, `tests/test_raven.py`, `tests/test_query.py`,
   `tests/test_queue.py`, `tests/test_exports.py`, `tests/test_version.py`.
-  This spec modified **none** of them.
+  This spec modified **none** of them — nor `tests/test_daemon.py`, which the
+  installer work added nothing to either: the installer's tests live in
+  `tests/test_agent_install.py`.
 
 ## Out of scope
 
-- **A launchd/systemd/Windows installer, and any `install-agent` verb.**
-  Huginn's `LoginAgent` ABC is being extracted into the shared `corvidae`
-  package; Muninn consumes it in a follow-up. The daemon is built so an external
-  supervisor can start and stop it cleanly — that is what the signal handling and
-  the state file are *for* — and no login-agent code is vendored here.
-- **A `corvidae` dependency.** Not added and not bumped; the version that would
-  carry `LoginAgent` is unpublished. See "Follow-up seam" below.
 - **A `stop`/`restart`/`status` verb.** A supervisor sends signals and reads the
   state file; `doctor` reports. Adding process-management verbs would duplicate
   what launchd and systemd already do better, and `muninn serve` would then own a
@@ -388,16 +396,173 @@ observe.
 - **The console.** Still unspec'd, and `/` and `/session/<id>` are still stubs —
   a real UI there would carry prose and force spec 009's token decision open.
 
-## Follow-up seam: `corvidae`
+Formerly out of scope and **now filled** — see "The login-agent installer" below:
+the launchd/systemd/Windows installer, the `install-agent` verb, and the
+`corvidae` dependency.
 
-The daemon is the *supervised* half; the *supervisor installer* is the missing
-half, and it is deliberately missing. When `corvidae` ships its `LoginAgent` ABC:
+## The login-agent installer (the follow-up seam, now filled)
 
-- Add the dependency and implement one adapter that runs `muninn serve`.
-- Add `install-agent` / `uninstall-agent` to the CLI.
-- The daemon itself should need **no change**: it already writes a state file, it
-  already exits 0 on SIGTERM and SIGHUP, and it already refuses to double-start.
-  If it does need a change, that is a defect in this spec, not in `corvidae`.
+This section was written as future work while `corvidae` was unpublished. It is
+implemented, and the daemon needed **no change** — which is what the seam was
+predicting, so it is recorded as a confirmation rather than quietly deleted.
 
-Nothing in `muninn/` imports `corvidae` today, and `pyproject.toml` is untouched
-by this spec.
+`corvidae 2026.8.1` is on PyPI (Apache-2.0, stdlib-only, **zero dependencies**),
+and `pyproject.toml` now carries `corvidae>=2026.8.1,<2027`. The upper bound is
+the CalVer year: corvidae promises every `2026.*` release is compatible with every
+other and that a breaking change waits for the next year component, so `<2027` is
+precisely "not the release that is allowed to break us."
+
+**`muninn/agent_install.py` supplies a `LoginAgentSpec` and nothing else.** No
+launchd, systemd, or registry code lives in this repo, and adding a local copy of
+one of corvidae's checks would be a defect rather than belt-and-braces — two
+copies of a security property drift, and the copy a reader finds first is the one
+they trust. Inherited unchanged: `plistlib.dumps` of a real dict rather than an XML
+template, systemd refusing `\n`/`\r`/`%`, `mkstemp` + `os.replace` at 0600 with a
+0600 backup taken *before* content lands, refused symlinks at the target and the
+temp path, launchd keeping `KeepAlive`, systemd using `Restart=on-failure`, and
+the `loginctl enable-linger` caveat printed for headless hosts.
+
+Muninn's values, every one of them disjoint from Huginn's:
+
+| | Muninn | Huginn |
+|---|---|---|
+| launchd label | `is.tohuw.muninn` | `is.tohuw.huginn` |
+| plist | `~/Library/LaunchAgents/is.tohuw.muninn.plist` | `…/is.tohuw.huginn.plist` |
+| systemd unit | `$XDG_CONFIG_HOME/systemd/user/muninn.service` | `…/huginn.service` |
+| launchd log | `$XDG_STATE_HOME/muninn/agent.log` | `~/.local/state/huginn/agent.log` |
+| Run value | `MuninnDaemon` | `HuginnDaemon` (+ tray's `Huginn`) |
+| backup tag | `muninn-bak` | `huginn-bak` |
+
+`argv` is `[sys.executable, "-m", "muninn.cli", "serve"]` — **`serve`, not `index
+--watch`**, since only `serve` publishes the descriptor, the port and the state
+file. No `--no-menubar`: being in the shared menubar whenever the machine is up is
+the reason to install this at all.
+
+`sys.executable` and the checkout root are resolved by the **same expressions
+`write_state` uses for `python` and `repo`**, and a test asserts the two agree. An
+installed unit whose `WorkingDirectory` disagrees with the running daemon's
+reported `repo` is unanswerable from `doctor` alone.
+
+**No `tray_registry_value`.** Huginn declares one because `windows/Huginn.Tray`
+registers itself in the Run key *and supervises Huginn's daemon*, so a second
+autostart there would resurrect a daemon the user just quit. Muninn ships no tray:
+Appistry is the shared menubar host, it registers itself through a Start Menu
+Startup shortcut rather than the Run key, and it only *reads* Muninn's descriptor.
+Inventing a value name would make an unrelated key's presence refuse a valid
+install.
+
+### Install refuses while an ingest loop already holds the lock
+
+The interaction this spec left for the seam to decide. The lock already prevents
+the *data* failure by making the second loop exit `EXIT_ALREADY_RUNNING` (1). What
+it cannot prevent is what a supervisor does with that exit code:
+
+- **launchd** keeps `KeepAlive`, so it relaunches a daemon that exits 1 forever.
+  The user gets an `agent.log` filling with "another muninn ingest loop is already
+  running" and a service that never comes up.
+- **systemd** treats exit 1 as a failure under `Restart=on-failure`, so it does
+  the same until `StartLimitBurst` gives up and leaves the unit `failed`.
+
+Both are crash loops caused by a *healthy* manually-started loop. So `install-agent`
+refuses, exits 1, and writes nothing — the same shape and exit code as corvidae's
+Windows refusal when a tray owns startup, and for the same double-owner reason.
+The rule:
+
+- Holder is `index --watch` → **always a conflict.** A foreground debug watcher is
+  by definition not the agent's own daemon, so the crash loop is certain.
+- Any holder, agent **not yet installed** → a conflict. Nothing a supervisor
+  started can hold the lock, so something else does.
+- Agent **already installed** → *not* a conflict. The holder is almost certainly
+  the agent's own daemon, and refusing would make it impossible to re-run
+  `install-agent` after moving the checkout or changing interpreters — the one
+  time a refresh is most needed.
+- Lock state **unknown** (`probe()` returns `None`) → no conflict, matching this
+  spec's own fail-open. Inverting it would make `install-agent` impossible
+  wherever the guard is unenforceable, which is worse than a possible
+  double-start.
+
+`uninstall-agent` checks nothing: removing the agent while its daemon runs is the
+normal case, and `launchctl unload -w` stopping it is the point rather than a
+hazard.
+
+### The installed agent does not inherit the installing shell's environment
+
+Measured, because it is the one thing here that surprises. launchd starts the agent
+from its own environment, so a `$XDG_STATE_HOME` or `$RAVENS_STATE_DIR` exported in
+a terminal is **absent** at login and the daemon resolves both to their defaults.
+Verified during implementation: an install run with every path redirected to a
+tempdir produced a daemon that ingested into the real
+`~/.local/state/muninn/muninn.db`, discovered from a log file.
+
+Not worked around. An `EnvironmentVariables` dict capturing the installing shell
+would bake one terminal's transient state into config that runs at every login for
+years, and it is the exact plist key Huginn's issue #41 C3 injection created out of
+a directory name. A user who genuinely relocates Muninn's state sets the variable
+where login sessions see it (`launchctl setenv`, a systemd user environment
+drop-in), which is a statement about their machine rather than about this install.
+
+### `doctor`
+
+The existing `daemon` section gains a fourth fact rather than a competing section
+— a reader who has to correlate two sections to learn the daemon is up *but*
+nothing will restart it has been handed a puzzle instead of a report:
+
+```
+daemon (`muninn serve`)
+  at login    installed · LaunchAgent · /Users/you/Library/LaunchAgents/is.tohuw.muninn.plist
+  lock        held by pid 15586 (serve)
+  running     pid 15586 · since 2026-08-01T22:06:41+00:00
+```
+
+Printed **first, before the early returns** for a stale or absent state file. That
+position is load-bearing: the crashed-daemon path returns early, and it is exactly
+where "is anything going to restart it" is the most useful line on screen. "not
+installed" is a normal state, not a warning — an external supervisor configured by
+hand, or a foreground `muninn serve`, are both legitimate and leave no plist.
+
+### Acceptance criteria (installer)
+
+15. `install-agent` writes a plist/unit/Run value whose command runs `muninn serve`.
+16. Every named location is disjoint from Huginn's — asserted as a set, so a
+    future field that collides fails the same test.
+17. install → `installed()` true → uninstall → `installed()` false, per backend.
+18. Linux and Windows are exercised **on macOS** through corvidae's overridable
+    `systemctl`/`registry` boundary. No test requires those OSes.
+19. `install-agent` exits 1 and writes nothing while `index --watch` holds the
+    lock; exits 0 once it is free.
+20. Re-running `install-agent` over the agent's own running daemon is allowed.
+21. `doctor` reports installed/not-installed inside the daemon section, including
+    when the state file is stale.
+22. Exit codes are the contract: 0 installed, 1 refused or the OS mechanism
+    failed, 2 no mechanism on this platform. No test parses corvidae's wording,
+    which corvidae explicitly does not promise.
+
+Mutation-verified, in the same spirit as the signal tests above. Each of these
+**must** fail the suite, and each was checked: Muninn's label set to Huginn's (3
+tests), `argv` switched to `index --watch` (5), the lock check removed from
+`install` (2), the lock check made unconditional (3), `doctor`'s line removed (5),
+the Run value set to Huginn's tray value (3), and the log path moved to Huginn's
+(4).
+
+**One test-isolation defect was found by that mutation run and is worth
+recording:** the lock tests originally called the real `get_login_agent()`, so they
+were safe only because the code under test refused. With the refusal mutated away,
+the suite installed a live LaunchAgent into the developer's real
+`~/Library/LaunchAgents` and started a real daemon. `_TempState.redirect_agent()`
+now confines the backend to a tempdir, and every test that reaches `install()` or
+`installed()` uses it. A test that avoids a side effect only because the code
+declined is not isolated.
+
+### Guardrails (installer)
+
+- **Do not vendor or re-implement any part of corvidae's login-agent code**, and
+  do not add a local copy of one of its checks. One implementation was the whole
+  point (tohuw/huginn#42).
+- **Do not soften `KeepAlive` or switch systemd to `Restart=always`.** Both were
+  chosen with reasons recorded upstream.
+- **Do not let Muninn's label, plist, unit, log or Run value drift onto Huginn's.**
+  Every collision is silent, and the user's symptom is "the other raven stopped
+  starting at login", months later.
+- **Do not add `EnvironmentVariables` to the plist** to capture the installing
+  shell. See above.
+- **Do not assert on corvidae's printed wording.** The exit code is the contract.
