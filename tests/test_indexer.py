@@ -181,6 +181,81 @@ class RewriteDetectionTest(IndexerTestCase):
         st.close()
 
 
+class WatchTerminationTest(IndexerTestCase):
+    """An exhausted event source must end the loop, not spin in it.
+
+    ``watchfiles.watch`` is called with ``raise_interrupt=False``, so Ctrl-C makes
+    its generator *return* instead of propagating. ``watch()`` used to read that
+    with ``next(generator, None)`` — and ``None`` is also what an ordinary timeout
+    tick yields, so an interrupted watcher looped forever at full speed, ignored
+    SIGINT, and had to be SIGKILLed. Since spec 009 that also strands the raven
+    descriptor, naming a port nothing is listening on.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # The root has to exist, or watch() never builds an event generator at
+        # all: it falls through to a plain sleep loop over an empty watch list.
+        # A test that forgot this would exercise nothing and still look green.
+        self.src.mkdir(parents=True, exist_ok=True)
+
+    def test_an_exhausted_event_source_returns(self) -> None:
+        st = store.open_store(self.db)
+        polls = 0
+
+        def one_shot_then_done(paths, *, interval_s, force_polling):
+            # Exactly what an interrupted watchfiles generator does: yield a tick
+            # or two, then return rather than raise.
+            nonlocal polls
+            polls += 1
+            yield set()
+
+        try:
+            # max_iterations is deliberately NOT set: the point is that watch()
+            # terminates on its own. A bounded loop would pass either way, which
+            # is precisely why the original bug survived a green suite.
+            indexer.watch(st, {"claude": self.src}, queue_dir=self.qdir,
+                          watch_fn=one_shot_then_done)
+        finally:
+            st.close()
+        self.assertEqual(polls, 1, "the generator must not be rebuilt after it ends")
+
+    def test_an_immediately_empty_source_returns(self) -> None:
+        st = store.open_store(self.db)
+
+        def never_yields(paths, *, interval_s, force_polling):
+            return iter(())
+
+        try:
+            indexer.watch(st, {"claude": self.src}, queue_dir=self.qdir,
+                          watch_fn=never_yields)
+        finally:
+            st.close()
+
+    def test_an_empty_change_set_is_not_mistaken_for_exhaustion(self) -> None:
+        """The other direction: a timeout tick must keep the loop alive.
+
+        ``set()`` is falsy, so a fix that tested truthiness instead of identity
+        would stop the watcher on its first idle poll — trading a spin for a
+        watcher that quietly stops watching, which is worse.
+        """
+        st = store.open_store(self.db)
+        ticks = 0
+
+        def ticker(paths, *, interval_s, force_polling):
+            nonlocal ticks
+            while True:
+                ticks += 1
+                yield set()
+
+        try:
+            indexer.watch(st, {"claude": self.src}, queue_dir=self.qdir,
+                          max_iterations=3, watch_fn=ticker)
+        finally:
+            st.close()
+        self.assertEqual(ticks, 3)
+
+
 class IdempotenceTest(IndexerTestCase):
     """Acceptance 9: drain_once twice for the same job yields `duplicate` the
     second time — never a second `imported` that could misread as new data.
