@@ -87,9 +87,11 @@ finding to report, not an obstacle to route around.
 uv sync                                        # set up
 uv run python -m unittest discover tests -v    # tests
 uv run ruff check muninn tests tools           # lint
-uv run muninn index                            # ingest transcripts
+uv run muninn index                            # ingest transcripts (one shot)
+uv run muninn serve                            # the daemon: continuous ingest + menubar raven
+uv run muninn index --watch                    # the same ingest loop, foreground, publishing nothing
 uv run muninn search "query"                   # search
-uv run muninn doctor                           # archive health, index lag
+uv run muninn doctor                           # archive health, index lag, daemon state
 uv run python tools/corpus-survey.py --self-test   # privacy self-test
 ```
 

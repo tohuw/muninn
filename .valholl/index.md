@@ -2,7 +2,7 @@
 okf_version: "0.1"
 title: "Muninn knowledge base"
 description: "Architecture, durability, ingest, calibration, and governance knowledge for Muninn."
-updated: "2026-07-31"
+updated: "2026-08-01"
 ---
 
 # Muninn knowledge base
@@ -19,7 +19,7 @@ the code does.
 ## Durability
 
 - [The index is an archive of record](articles/archive-of-record.md) — transcripts are deleted after 30 days
-- [Continuous ingest, not periodic](articles/continuous-ingest-not-periodic.md) — why a cron indexer loses data
+- [Continuous ingest, not periodic](articles/continuous-ingest-not-periodic.md) — why a cron indexer loses data, and why the loop needs a daemon to own it
 - [The transcript JSONL format is not a stable API](articles/unstable-jsonl-format.md) — accepted risk, and how it degrades
 
 ## Ingest
@@ -39,7 +39,7 @@ the code does.
 
 ## Extensibility
 
-- [The shared menubar (menu-as-data)](articles/shared-menubar.md) — one raven, two minds
+- [The shared menubar (menu-as-data)](articles/shared-menubar.md) — one raven, two minds; published by `muninn serve` since spec 010
 - [Lessons for Huginn](articles/lessons-for-huginn.md) — improvements to contribute upstream
 
 ## Process
