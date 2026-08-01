@@ -5,22 +5,56 @@ tests encode the invariants from
 .valholl/articles/model-policy-chokepoint.md — see docs/specs/008-plugin-contract.md
 acceptance criteria 1-7. Policies intersect; they never union. No policy
 matching a (model, provider) pair means refuse, never fall back.
+
+**Read ``ShadowedDistributionTest`` before adding a test here.** Every test in
+the original version of this file monkeypatched
+``importlib.metadata.entry_points``, and that is exactly why a fail-open in
+``resolve()`` sat behind a green suite: the bug was in *how policies are
+discovered*, and patching the discovery call replaced the buggy code with a
+mock. A mock-only suite can only ever test what happens after discovery
+succeeds. So the shadowing test builds real ``.dist-info`` directories on disk
+and runs a subprocess, and it is the one test here that could have caught it.
 """
 from __future__ import annotations
 
+import importlib
+import json
+import re
+import subprocess
+import sys
+import tempfile
+import textwrap
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from muninn.policy import DEFAULT_POLICY, ModelPolicy, PolicyRefused, check, effective_providers, resolve
+from muninn.policy import (
+    DEFAULT_POLICY,
+    ModelPolicy,
+    PolicyRefused,
+    check,
+    effective_providers,
+    resolve,
+    shadowed_distribution_names,
+)
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+requires_subprocess = unittest.skipIf(
+    sys.platform == "win32",
+    "subprocess/thread fan-out wedges the Windows CI runner; the same "
+    "properties are covered in-process on all platforms",
+)
 
 
 def _fake_entry_points(*policies: ModelPolicy):
-    """Build a fake ``entry_points(group=...)`` result carrying ``policies``.
+    """Build a fake entry-point list carrying ``policies``.
 
-    Mirrors the shape ``importlib.metadata.entry_points(group=...)`` returns:
-    an iterable of objects with ``.name`` and ``.load()``. Monkeypatching this
-    function (rather than installing a real distribution) is what the spec
-    asks for — no subprocess, no real package on sys.path.
+    Mirrors the shape ``importlib.metadata`` entry points have: objects with
+    ``.name`` and ``.load()``. These unit tests patch
+    ``muninn.policy._policy_entry_points`` — the seam *below* discovery —
+    rather than ``entry_points``, which ``resolve()`` deliberately no longer
+    calls. See the module docstring for why that distinction is load-bearing.
     """
     eps = []
     for i, policy in enumerate(policies):
@@ -32,7 +66,8 @@ def _fake_entry_points(*policies: ModelPolicy):
 
 
 def _resolve_with(*policies: ModelPolicy):
-    return mock.patch("muninn.policy.entry_points", return_value=_fake_entry_points(*policies))
+    return mock.patch("muninn.policy._policy_entry_points",
+                      return_value=(_fake_entry_points(*policies), ()))
 
 
 class IntersectionTest(unittest.TestCase):
@@ -97,7 +132,7 @@ class PermissiveDefaultTest(unittest.TestCase):
     def test_default_applies_with_no_policy_plugins_and_is_a_real_policy(self) -> None:
         # Criterion 6: no policy plugins installed -> exactly (DEFAULT_POLICY,),
         # and it is a real ModelPolicy object, not a special-cased bypass.
-        with mock.patch("muninn.policy.entry_points", return_value=[]):
+        with mock.patch("muninn.policy._policy_entry_points", return_value=([], ())):
             resolved = resolve()
             self.assertEqual(resolved, (DEFAULT_POLICY,))
             self.assertIsInstance(resolved[0], ModelPolicy)
@@ -145,12 +180,336 @@ class BrokenPolicyEntryPointTest(unittest.TestCase):
         broken = mock.Mock()
         broken.name = "broken-policy"
         broken.load = mock.Mock(side_effect=RuntimeError("credentials missing"))
-        with mock.patch("muninn.policy.entry_points", return_value=[broken]):
+        with mock.patch("muninn.policy._policy_entry_points", return_value=([broken], ())):
             resolved = resolve()
             self.assertEqual(len(resolved), 1)
             self.assertEqual(resolved[0].allow, ())  # refuses everything
             with self.assertRaises(PolicyRefused):
                 check("anything", "anyprovider")
+
+    def test_system_exit_at_policy_import_fails_closed(self) -> None:
+        """A policy module calling ``sys.exit()`` at import must refuse, not exit.
+
+        ``ep.load()`` imports arbitrary third-party code, and ``SystemExit``
+        does not inherit from ``Exception``. Caught only as ``Exception``, a
+        stray ``sys.exit()`` in a policy module propagated out of ``resolve()``
+        — and therefore out of ``check()`` — so the chokepoint became an
+        interpreter shutdown instead of a refusal. Any caller with a
+        ``try/except PolicyRefused`` around a model call saw the process die.
+        """
+        for exc in (SystemExit(3), KeyboardInterrupt()):
+            with self.subTest(exc=type(exc).__name__):
+                exiting = mock.Mock()
+                exiting.name = "exiting-policy"
+                exiting.load = mock.Mock(side_effect=exc)
+                with mock.patch("muninn.policy._policy_entry_points", return_value=([exiting], ())):
+                    resolved = resolve()   # must return, not propagate
+                    self.assertEqual(len(resolved), 1)
+                    self.assertEqual(resolved[0].allow, ())
+                    self.assertIn(type(exc).__name__, resolved[0].reason)
+                    with self.assertRaises(PolicyRefused):
+                        check("anything", "anyprovider")
+
+
+class AllowTupleValidationTest(unittest.TestCase):
+    """``allow`` must be a tuple of compilable regex strings, checked at construction.
+
+    The missing comma — ``allow=r"^us\\.anthropic\\."`` for
+    ``allow=(r"^us\\.anthropic\\.",)`` — is a plain ``str``, which nothing in
+    Python or ruff rejects, and which makes the permit check iterate
+    *characters*. Since ``.`` matches anything, a realistic exclusion prefix
+    degenerates to allow-everything while ``bool(allow)`` stays truthy, so an
+    "empty allow-list" guard passes too.
+    """
+
+    def test_bare_string_allow_is_rejected_at_construction(self) -> None:
+        with self.assertRaises(TypeError):
+            ModelPolicy(name="missing-comma", allow=r"^us\.anthropic\.", reason="one typo")
+
+    def test_non_string_pattern_is_rejected(self) -> None:
+        with self.assertRaises(TypeError):
+            ModelPolicy(name="not-a-pattern", allow=(re.compile("^x$"),), reason="compiled, not str")
+
+    def test_the_missing_comma_would_have_permitted_everything(self) -> None:
+        """Pin *why* the type check matters, not just that it fires.
+
+        Had the bare string been accepted, these three ids would all have been
+        permitted by a policy written to allow only one vendor prefix. The
+        counterfactual is asserted directly, by passing the tuple a bare string
+        decays into, so a later reader who finds ``__post_init__`` pedantic and
+        deletes it turns this test red with the exploit spelled out.
+
+        The prefix here has no ``\\`` in it on purpose. A pattern containing
+        ``\\.`` happens to *also* be caught by the eager ``re.compile``, since
+        a lone ``\\`` character is not a valid pattern — but that is luck, not
+        coverage. ``^us-anthropic-`` splits into characters that every one
+        compile fine, and ``^`` alone matches every string under ``re.search``.
+        The tuple-type check is the one that reliably catches this class.
+        """
+        characters_of_the_typo = tuple("^us-anthropic-")
+        degenerate = ModelPolicy(name="degenerate", allow=characters_of_the_typo, reason="what a str decays to")
+        with _resolve_with(degenerate):
+            for permitted_by_accident in ("gpt-4o-EVIL", "totally-unapproved", "x"):
+                check(permitted_by_accident, "anyprovider")   # no raise: the bug, made explicit
+        self.assertTrue(bool(degenerate.allow))   # so an empty-allow guard would not have caught it
+
+    def test_malformed_regex_is_rejected_at_construction_not_at_check(self) -> None:
+        """Bug 3: lazy compilation let ``re.error`` escape the permit check.
+
+        ``re.error`` is not ``PolicyRefused``, so a caller catching only
+        ``PolicyRefused`` got a crash, and a caller treating unknown exceptions
+        as retryable retried rather than refusing. Compiling in
+        ``__post_init__`` moves the failure to construction, where
+        ``resolve()``'s guard converts it into a refuse-everything policy.
+        """
+        with self.assertRaises(re.error):
+            ModelPolicy(name="malformed", allow=("[unclosed",), reason="bad pattern")
+
+    def test_a_policy_that_fails_validation_refuses_everything(self) -> None:
+        """The invalid policy must become the fail-closed path, never be skipped."""
+        def build_it() -> ModelPolicy:
+            return ModelPolicy(name="malformed", allow=("[unclosed",), reason="bad pattern")
+
+        ep = mock.Mock()
+        ep.name = "malformed"
+        ep.load = build_it   # raises re.error when resolve() loads it
+        with mock.patch("muninn.policy._policy_entry_points", return_value=([ep], ())):
+            resolved = resolve()
+            self.assertEqual(resolved[0].allow, ())
+            with self.assertRaises(PolicyRefused):
+                check("anything", "anyprovider")
+
+    def test_check_refuses_rather_than_raising_when_a_pattern_is_uncompilable(self) -> None:
+        """Defence in depth: a policy that bypassed ``__post_init__`` still refuses.
+
+        ``object.__new__`` plus ``object.__setattr__`` is how an unpickle or a
+        C-level construction reaches a frozen dataclass without running
+        ``__post_init__``. ``_permits`` must return False, not raise.
+        """
+        smuggled = object.__new__(ModelPolicy)
+        object.__setattr__(smuggled, "name", "smuggled")
+        object.__setattr__(smuggled, "allow", ("[unclosed",))
+        object.__setattr__(smuggled, "require_provider", None)
+        object.__setattr__(smuggled, "reason", "bypassed validation")
+        with _resolve_with(smuggled):
+            with self.assertRaises(PolicyRefused):   # PolicyRefused, never re.error
+                check("anything", "anyprovider")
+
+
+def _write_policy_distribution(root: Path, *, version: str, with_entry_points: bool) -> Path:
+    """Write a real ``.dist-info`` for distribution ``muninn-testpolicy`` under ``root``.
+
+    With ``with_entry_points=False`` this is the shadow: same distribution
+    name, ``METADATA`` only, no ``entry_points.txt`` — two files that are
+    enough to mask the real distribution's entry points from
+    ``entry_points(group=...)``.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    dist_info = root / f"muninn_testpolicy-{version}.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: muninn-testpolicy\nVersion: {version}\n", encoding="utf-8")
+    if with_entry_points:
+        (dist_info / "entry_points.txt").write_text(
+            "[muninn.policy]\nno-local-model = muninn_testpolicy:POLICY\n", encoding="utf-8")
+        (root / "muninn_testpolicy.py").write_text(textwrap.dedent(r'''
+            from muninn.policy import ModelPolicy
+
+            # The owner's real use case: not "bedrock only" but "do not use the
+            # local model this package offers" — a strict exclusion, expressed
+            # as an allowlist of the one vendor prefix that is approved.
+            POLICY = ModelPolicy(
+                name="no-local-model",
+                allow=(r"^us\.anthropic\.",),
+                reason="the local model package is excluded",
+            )
+        ''').lstrip(), encoding="utf-8")
+    return root
+
+
+class ShadowedDistributionTest(unittest.TestCase):
+    r"""An installed exclusion policy must survive a distribution that masks its name.
+
+    This is the one test in this file that exercises real
+    ``importlib.metadata`` discovery, and the only reason it exists is that the
+    mock-based tests above structurally cannot catch what it catches.
+
+    ``entry_points()`` deduplicates by *normalised distribution name, first on
+    ``sys.path`` wins*, and applies that rule before looking at which groups a
+    distribution contributes. So a directory holding only
+    ``muninn_testpolicy-9.9.dist-info/METADATA`` — no ``entry_points.txt`` —
+    earlier on ``sys.path`` made ``entry_points(group="muninn.policy")`` return
+    ``[]``. ``resolve()`` could not distinguish that from "no policy
+    installed" and returned the permissive ``DEFAULT_POLICY``. Measured against
+    this module before the fix, with the exclusion policy below installed::
+
+        real policy installed:  resolved ['no-local-model']  local-llama-7b REFUSED
+        shadow prepended:       resolved ['default']         local-llama-7b ALLOWED
+
+    Run in a subprocess with ``PYTHONPATH`` set rather than by mutating
+    ``sys.path`` in-process, because ``importlib.metadata`` caches its
+    ``sys.path`` scan per path entry: the ordering this test depends on is not
+    reliably reproducible once the parent interpreter has already scanned. A
+    fresh interpreter is the honest way to ask the question.
+    """
+
+    def _probe(self, *path_entries: Path) -> dict:
+        """Resolve policy in a fresh interpreter with ``path_entries`` prepended."""
+        program = textwrap.dedent('''
+            import json, sys
+            from muninn.policy import PolicyRefused, check, resolve, shadowed_distribution_names
+            try:
+                check("local-llama-7b", "local")
+                refused = False
+            except PolicyRefused:
+                refused = True
+            print(json.dumps({
+                "resolved": [p.name for p in resolve()],
+                "local_model_refused": refused,
+                "shadowed": list(shadowed_distribution_names()),
+            }))
+        ''')
+        env_path = [str(p) for p in path_entries] + [str(REPO_ROOT)]
+        proc = subprocess.run(
+            [sys.executable, "-c", program],
+            capture_output=True, text=True, timeout=90,
+            env={"PYTHONPATH": ":".join(env_path), "PATH": "/usr/bin:/bin",
+                 "SYSTEMROOT": "", "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(proc.returncode, 0, f"probe failed:\n{proc.stderr}")
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    @requires_subprocess
+    def test_metadata_only_shadow_cannot_disable_the_installed_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            real = _write_policy_distribution(tmpdir / "site-real", version="1.0", with_entry_points=True)
+            shadow = _write_policy_distribution(tmpdir / "site-shadow", version="9.9", with_entry_points=False)
+
+            # Baseline: the exclusion policy binds when nothing shadows it.
+            alone = self._probe(real)
+            self.assertEqual(alone["resolved"], ["no-local-model"])
+            self.assertTrue(alone["local_model_refused"])
+            self.assertEqual(alone["shadowed"], [])
+
+            # The bug: shadow first on sys.path. The policy must STILL bind.
+            shadowed = self._probe(shadow, real)
+            self.assertEqual(shadowed["resolved"], ["no-local-model"],
+                             "a metadata-only distribution masked the real one and the "
+                             "excluded local model became usable again")
+            self.assertTrue(shadowed["local_model_refused"])
+
+    @requires_subprocess
+    def test_two_distributions_sharing_a_name_are_reported(self) -> None:
+        """The duplication is the shadowing signal, so ``doctor`` must be able to say so."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            a = _write_policy_distribution(tmpdir / "site-a", version="1.0", with_entry_points=True)
+            b = _write_policy_distribution(tmpdir / "site-b", version="2.0", with_entry_points=True)
+            both = self._probe(a, b)
+            self.assertEqual(both["shadowed"], ["muninn-testpolicy"])
+            self.assertTrue(both["local_model_refused"])
+
+    @requires_subprocess
+    def test_no_policy_installed_still_allows_everything(self) -> None:
+        """The permissive default is unchanged: absence of a policy is not a restriction."""
+        with tempfile.TemporaryDirectory() as tmp:
+            nothing = Path(tmp) / "site-empty"
+            nothing.mkdir()
+            result = self._probe(nothing)
+            self.assertEqual(result["resolved"], [DEFAULT_POLICY.name])
+            self.assertFalse(result["local_model_refused"])
+            self.assertEqual(result["shadowed"], [])
+
+
+class ShadowedDistributionInProcessTest(unittest.TestCase):
+    """The in-process twin of ``ShadowedDistributionTest``, so Windows is covered too.
+
+    Per WINDOWS.md, subprocess fan-out wedges the Windows CI runner, and the
+    convention here is that every subprocess-skipped property has an in-process
+    equivalent running on all three platforms. This is that equivalent, and it
+    also fails against the pre-fix ``resolve()``.
+
+    ``importlib.invalidate_caches()`` after each ``sys.path`` mutation is what
+    makes this reliable — ``importlib.metadata`` caches its scan per path entry,
+    so without it a freshly added directory may not be seen. The subprocess
+    version is kept anyway: a fresh interpreter proves the property with no
+    cache-invalidation caveat at all, which is worth having for a security
+    control even though it costs a Windows skip.
+    """
+
+    def setUp(self) -> None:
+        self._saved_path = list(sys.path)
+        self._saved_modules = set(sys.modules)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        sys.path[:] = self._saved_path
+        for name in set(sys.modules) - self._saved_modules:
+            del sys.modules[name]          # drop the fixture policy module
+        importlib.invalidate_caches()
+        self._tmp.cleanup()
+
+    def _prepend(self, path: Path) -> None:
+        sys.path.insert(0, str(path))
+        importlib.invalidate_caches()
+
+    def test_metadata_only_shadow_cannot_disable_the_installed_policy(self) -> None:
+        tmpdir = Path(self._tmp.name)
+        real = _write_policy_distribution(tmpdir / "site-real", version="1.0", with_entry_points=True)
+        shadow = _write_policy_distribution(tmpdir / "site-shadow", version="9.9", with_entry_points=False)
+
+        self._prepend(real)
+        self.assertEqual([p.name for p in resolve()], ["no-local-model"])
+        with self.assertRaises(PolicyRefused):
+            check("local-llama-7b", "local")
+
+        self._prepend(shadow)   # masks `real` from entry_points(group=...) entirely
+        self.assertEqual([p.name for p in resolve()], ["no-local-model"],
+                         "a metadata-only distribution masked the real one and the "
+                         "excluded local model became usable again")
+        with self.assertRaises(PolicyRefused):
+            check("local-llama-7b", "local")
+
+    def test_two_distributions_sharing_a_name_are_reported(self) -> None:
+        tmpdir = Path(self._tmp.name)
+        self._prepend(_write_policy_distribution(tmpdir / "site-a", version="1.0", with_entry_points=True))
+        self._prepend(_write_policy_distribution(tmpdir / "site-b", version="2.0", with_entry_points=True))
+        self.assertEqual(shadowed_distribution_names(), ("muninn-testpolicy",))
+        with self.assertRaises(PolicyRefused):
+            check("local-llama-7b", "local")
+
+    def test_a_deleted_entry_points_file_does_not_widen_the_permitted_set(self) -> None:
+        """No adversary needed: the same class of failure if metadata is just lost.
+
+        A distribution whose ``entry_points.txt`` was removed contributes
+        nothing — that much is unavoidable, since a missing file cannot say what
+        it would have said. What must hold is that the *other* installed
+        policy's restriction is unaffected, rather than the whole resolution
+        collapsing to the permissive default.
+        """
+        tmpdir = Path(self._tmp.name)
+        intact = _write_policy_distribution(tmpdir / "site-intact", version="1.0", with_entry_points=True)
+        broken = _write_policy_distribution(tmpdir / "site-broken", version="2.0", with_entry_points=True)
+        (broken / "muninn_testpolicy-2.0.dist-info" / "entry_points.txt").unlink()
+        self._prepend(intact)
+        self._prepend(broken)
+        self.assertEqual([p.name for p in resolve()], ["no-local-model"])
+        with self.assertRaises(PolicyRefused):
+            check("local-llama-7b", "local")
+
+
+class ShadowedNamesHelperTest(unittest.TestCase):
+    def test_real_environment_reports_no_duplicate_policy_distributions(self) -> None:
+        """A sanity check on the live interpreter: the helper runs and finds nothing.
+
+        Cheap, but it is the only test that exercises the real
+        ``distributions()`` walk in-process, so a crash in metadata handling
+        (a malformed METADATA in some installed dependency, say) shows up here
+        rather than only in ``doctor``.
+        """
+        self.assertEqual(shadowed_distribution_names(), ())
 
 
 if __name__ == "__main__":

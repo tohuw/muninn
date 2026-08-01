@@ -123,6 +123,26 @@ class FailureIsolationTest(unittest.TestCase):
         self.assertEqual(result.errors[0].entry_point, "broken")
         self.assertEqual(result.errors[0].error_class, "RuntimeError")
 
+    def test_system_exit_at_plugin_import_is_isolated_like_any_other_failure(self) -> None:
+        """``SystemExit`` does not inherit from ``Exception``, so it needed naming.
+
+        ``ep.load()`` imports arbitrary third-party code. A stray ``sys.exit()``
+        left in a plugin module propagated out of ``discover_plugins()``, which
+        ``doctor`` calls — so one author's debugging leftover killed the command
+        whose job is to report that the plugin is broken. Same fix and same
+        reasoning as the load guard in ``muninn/policy.py``; kept in step so the
+        two entry-point loaders do not disagree about what is isolable.
+        """
+        healthy = PluginSpec(name="healthy", version="1.0.0")
+        for exc in (SystemExit(1), KeyboardInterrupt()):
+            with self.subTest(exc=type(exc).__name__):
+                result = _discover_with(
+                    _fake_entry_point("exiting", exc),
+                    _fake_entry_point("healthy", healthy),
+                )
+                self.assertEqual([s.name for s in result.specs], ["healthy"])
+                self.assertEqual([e.error_class for e in result.errors], [type(exc).__name__])
+
 
 class ErrorTextIsClassNameOnlyTest(unittest.TestCase):
     def test_surfaced_detail_has_no_spaces_and_matches_class_name_shape(self) -> None:

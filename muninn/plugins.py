@@ -208,7 +208,17 @@ def discover_plugins() -> DiscoveryResult:
     for ep in eps:
         try:
             candidate = ep.load()
-        except Exception as exc:  # noqa: BLE001 - isolate one plugin's failure from the rest
+        except (Exception, SystemExit, KeyboardInterrupt) as exc:  # noqa: BLE001 - see below
+            # SystemExit and KeyboardInterrupt are named alongside Exception
+            # because neither inherits from it, and ep.load() imports arbitrary
+            # third-party code. A stray sys.exit() at a plugin module's import
+            # time would otherwise propagate out of discover_plugins() — which
+            # `doctor` calls — so one plugin author's debugging leftover would
+            # take down the command whose entire job is to report that the
+            # plugin is broken. Isolation has to cover the ways a module can
+            # end a process, not only the ways it can raise. Kept identical to
+            # the load guard in muninn/policy.py::resolve so the two entry-point
+            # loaders do not diverge on which exceptions count as isolable.
             errors.append(PluginLoadError(entry_point=ep.name, error_class=type(exc).__name__))
             continue
 

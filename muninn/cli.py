@@ -17,6 +17,7 @@ from .hooks import install as hooks_install
 from .paths import DB_PATH, QUEUE_DIR, STATE_DIR, default_roots
 from .plugins import discover_plugins
 from .policy import resolve as resolve_policies
+from .policy import shadowed_distribution_names as shadowed_policy_distributions
 from .query import Filters
 from .receipt import Outcome
 
@@ -497,6 +498,19 @@ def _print_policy_section() -> None:
         print(f"  {policy.name:16} provider={provider:14} allow=[{allow}]")
         if policy.reason:
             print(f"                   reason: {policy.reason}")
+
+    # Two distributions claiming one normalised name is the signal that
+    # something is shadowing the policy distribution — the fail-open documented
+    # in muninn/policy.py::_policy_entry_points and in
+    # .valholl/articles/model-policy-chokepoint.md, "Discovery is the attack
+    # surface." The policies still bind (that is the fix), but a restricted
+    # build should have exactly one distribution per name, so the duplicate is
+    # reported rather than tolerated quietly. Only names are printed, never a
+    # filesystem path: a path can leak a home directory or an internal
+    # distribution's layout, per the rule plugins load errors already follow.
+    for name in shadowed_policy_distributions():
+        print(f"  WARNING: {name!r} contributes a model policy from more than one installed "
+              f"distribution — a duplicate or shadowed install; verify which one is authoritative")
 
 
 def _size(path: str | Path) -> str:

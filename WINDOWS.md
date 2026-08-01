@@ -24,7 +24,7 @@ support as plausible, not proven.
 
 ## Known limitation: subprocess and thread-fan-out tests
 
-Four tests are skipped on Windows, marked `@requires_subprocess`:
+Seven tests are skipped on Windows, marked `@requires_subprocess`:
 
 | Test | Property |
 |---|---|
@@ -32,6 +32,14 @@ Four tests are skipped on Windows, marked `@requires_subprocess`:
 | `test_query.py::test_cli_json_flag_emits_a_json_array` | `--json` shape via the real CLI |
 | `test_exports.py::test_float_update_time_digests_identically_across_processes` | digest stability across processes |
 | `test_indexer.py::test_n_concurrent_imports_yield_one_imported_rest_duplicate` | import lock serializes |
+| `test_policy.py::ShadowedDistributionTest` (3 tests) | a shadowed policy distribution is still enforced |
+
+The three policy tests are the same property as
+`ShadowedDistributionInProcessTest`, which runs everywhere. They are kept as a
+subprocess pair anyway because a fresh interpreter proves the property with no
+`importlib.invalidate_caches()` caveat — `importlib.metadata` caches its scan
+per `sys.path` entry, so the in-process twin depends on invalidating that cache
+correctly. For a security control it is worth having one test that does not.
 
 On that runner these do not *fail* — they **wedge**, hanging in
 `subprocess.communicate()` or `threading.Thread.start()` until the job timeout

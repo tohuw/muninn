@@ -132,6 +132,16 @@ Semantics that are not negotiable:
   refusal message includes each refusing policy's `reason` verbatim.
 - **Config cannot widen.** If a config or flag names a model the policy forbids,
   the policy wins. Test this explicitly.
+- **A failure to *discover* a policy narrows, never widens.** Added after the
+  first implementation shipped a fail-open here; see
+  `.valholl/articles/model-policy-chokepoint.md`, "Discovery is the attack
+  surface, not just loading." `resolve()` must **not** call
+  `entry_points(group=...)`, which deduplicates by normalised distribution name
+  with first-on-`sys.path` winning and so lets a metadata-only directory mask a
+  real policy distribution into invisibility. Walk `distributions()` and filter
+  each one's `entry_points` by group instead. Two distributions contributing a
+  policy under one normalised name is the shadowing signal and is reported in
+  `doctor`.
 - **The default is permissive but real.** With no policy plugins installed, a
   single built-in `ModelPolicy(name="default", allow=(".*",), ...)` applies, so
   the code path is exercised in normal use rather than only in restricted builds.
@@ -156,6 +166,32 @@ Semantics that are not negotiable:
 7. **Regex anchoring** — `allow=("^us\\.anthropic\\.",)` does not permit
    `evil-us.anthropic.foo`. Assert the anchoring behaviour you implement, and
    document it.
+
+Criteria 15-18 were added after review found four fail-opens in the first
+implementation. Note that criteria 1-7 are all satisfiable by monkeypatching
+`entry_points` — which is what the original tests did, and why 15 was invisible
+to a green suite. **A mock at the discovery seam cannot test discovery.**
+
+15. **A shadowed distribution's policy still binds** — build real `.dist-info`
+    directories on disk: a genuine policy distribution, plus a metadata-only
+    distribution with the same name (no `entry_points.txt`) earlier on
+    `sys.path`. The policy must still be enforced. Use a subprocess with
+    `PYTHONPATH` rather than mutating `sys.path` in-process, because
+    `importlib.metadata` caches its per-path-entry scan. Also assert two
+    same-named distributions are reported, and that no policy installed still
+    allows everything.
+16. **`allow` is validated at construction** — `ModelPolicy(allow="string")` is
+    rejected (the missing comma makes the permit check iterate *characters*, and
+    `.` matches anything, so the policy permits nearly everything while
+    `bool(allow)` stays truthy). Non-`str` elements are rejected too.
+17. **A malformed pattern refuses rather than raising** — `allow=("[unclosed",)`
+    fails at construction, not mid-check, and a policy that fails validation
+    becomes the refuse-everything path. `re.error` must never reach a caller
+    that catches only `PolicyRefused`.
+18. **`SystemExit` at policy import fails closed** — neither `SystemExit` nor
+    `KeyboardInterrupt` inherits from `Exception`, so a stray `sys.exit()` in a
+    policy module propagated out of `check()`. Same test for
+    `plugins.discover_plugins()`, which had the identical gap.
 
 `tests/test_plugins.py`:
 
