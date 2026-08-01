@@ -100,6 +100,15 @@ wheels = [
 ]
 
 [[package]]
+name = "corvidae"
+version = "2026.8.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0f/a9/98ccbd61b80847a241198e32c5309d82ea077e5b905c43515374a0c09d3e/corvidae-2026.8.1.tar.gz", hash = "sha256:52289dc09e32bc09f55247e5987dd702f7a5b8f82b854b8818c911328072f0df", size = 50485, upload-time = "2026-08-01T22:55:57.529Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/70/c9/e5fe8ef05d21573fe7387adf46cb6209c796e0497c421d90e0d80654338b/corvidae-2026.8.1-py3-none-any.whl", hash = "sha256:e54a8487a3e32bd223d32321f330925583c3d1b01f42be1f7c866a1202ace6a9", size = 29897, upload-time = "2026-08-01T22:55:58.299Z" },
+]
+
+[[package]]
 name = "fastapi"
 version = "0.141.1"
 source = { registry = "https://pypi.org/simple" }
@@ -401,6 +410,7 @@ name = "muninn-console"
 version = "2026.7.30"
 source = { editable = "." }
 dependencies = [
+    { name = "corvidae" },
     { name = "fastapi" },
     { name = "uvicorn" },
     { name = "watchfiles" },
@@ -420,6 +430,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "corvidae", specifier = ">=2026.8.1,<2027" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "mlx-embeddings", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'semantic'", specifier = ">=0.0.3" },
     { name = "numpy", marker = "extra == 'semantic'", specifier = ">=2.0" },
