@@ -262,7 +262,16 @@ def resolve() -> tuple[ModelPolicy, ...]:
     for ep in _policy_entry_points()[0]:
         try:
             candidate = ep.load()
-        except Exception as exc:  # noqa: BLE001 - must not propagate; see _fail_closed
+        except (Exception, SystemExit, KeyboardInterrupt) as exc:  # noqa: BLE001 - see _fail_closed
+            # SystemExit and KeyboardInterrupt are named explicitly because
+            # neither inherits from Exception, and ep.load() *imports arbitrary
+            # third-party code*. A stray sys.exit() at a policy module's import
+            # time would otherwise propagate out of every function in this
+            # module — including check() — turning the chokepoint into an
+            # interpreter shutdown rather than a refusal. Written as a tuple
+            # rather than `except BaseException` so it is visible that the
+            # choice was made per-exception, and so a genuinely
+            # unrecoverable BaseException still propagates.
             policies.append(_fail_closed(ep.name, exc))
             continue
         if not isinstance(candidate, ModelPolicy):

@@ -187,6 +187,29 @@ class BrokenPolicyEntryPointTest(unittest.TestCase):
             with self.assertRaises(PolicyRefused):
                 check("anything", "anyprovider")
 
+    def test_system_exit_at_policy_import_fails_closed(self) -> None:
+        """A policy module calling ``sys.exit()`` at import must refuse, not exit.
+
+        ``ep.load()`` imports arbitrary third-party code, and ``SystemExit``
+        does not inherit from ``Exception``. Caught only as ``Exception``, a
+        stray ``sys.exit()`` in a policy module propagated out of ``resolve()``
+        — and therefore out of ``check()`` — so the chokepoint became an
+        interpreter shutdown instead of a refusal. Any caller with a
+        ``try/except PolicyRefused`` around a model call saw the process die.
+        """
+        for exc in (SystemExit(3), KeyboardInterrupt()):
+            with self.subTest(exc=type(exc).__name__):
+                exiting = mock.Mock()
+                exiting.name = "exiting-policy"
+                exiting.load = mock.Mock(side_effect=exc)
+                with mock.patch("muninn.policy._policy_entry_points", return_value=([exiting], ())):
+                    resolved = resolve()   # must return, not propagate
+                    self.assertEqual(len(resolved), 1)
+                    self.assertEqual(resolved[0].allow, ())
+                    self.assertIn(type(exc).__name__, resolved[0].reason)
+                    with self.assertRaises(PolicyRefused):
+                        check("anything", "anyprovider")
+
 
 class AllowTupleValidationTest(unittest.TestCase):
     """``allow`` must be a tuple of compilable regex strings, checked at construction.
