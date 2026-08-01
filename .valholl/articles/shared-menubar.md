@@ -6,9 +6,9 @@ tags: ["menubar", "macos", "swift", "extensibility", "huginn"]
 timestamp: "2026-07-30T00:00:00Z"
 category: "extensibility"
 status: "current"
-updated: "2026-07-30"
-summary: "Nobody wants two ravens in their menubar. A shared RavenMenuBar renders a JSON menu spec fetched from each discovered raven, so Huginn and Muninn coexist in one surface with host election, and either can run standalone."
-related: ["what-muninn-is", "lessons-for-huginn"]
+updated: "2026-08-01"
+summary: "Nobody wants two ravens in their menubar. A shared RavenMenuBar renders a JSON menu spec fetched from each discovered raven, so Huginn and Muninn coexist in one surface with host election, and either can run standalone. Muninn is present while `muninn serve` runs; the descriptor moved from the indexer to a real daemon without any change to the protocol or the host."
+related: ["what-muninn-is", "lessons-for-huginn", "continuous-ingest-not-periodic"]
 ---
 
 # The shared menubar (menu-as-data)
@@ -81,17 +81,46 @@ which is normative for the wire format):
   raven from an unrelated process that inherited a recycled PID.
 - One raven in the menubar, two minds behind it.
 
-## Muninn is only present while its indexer runs
+## Muninn is present while its daemon runs
 
-Muninn has no daemon, and the shared menubar did not justify inventing one. The
-descriptor is published by `muninn index --watch` — the one process that already
-runs for as long as the machine is up — and withdrawn when it stops. So **Muninn
-is absent from the menubar whenever the watcher is not running**, which the host
-renders as a raven that was never installed, and a crashed watcher's stale
-descriptor renders as "Not running" with the reason on screen. Both are legitimate
-steady states; a raven that lied about being reachable would be worse. Whether
-Muninn *should* be present independently of the indexer is an open owner decision
-recorded in docs/specs/009.
+**Superseded, and the correction is the interesting part.** This section used to
+read "Muninn is only present while its *indexer* runs", because Muninn had no
+daemon and the shared menubar alone did not justify inventing one. The descriptor
+was published by `muninn index --watch` — the only process that ran for any length
+of time — so Muninn was absent from the menubar whenever nobody happened to be
+running a debug command. Spec 009 recorded that as an open owner decision rather
+than a bug.
+
+The owner closed it: *"Muninn needs a daemon to be grabbing sessions."* And note
+what the deciding argument was **not** — it was not the menubar. It was ingest.
+Continuous ingest is Muninn's entire durability claim
+([[continuous-ingest-not-periodic]]), and a claim that depends on a human
+remembering to run a watcher is not a claim. The menu row was always a
+*consequence* of something being up, never a reason for it to be; treating it as
+the reason is what produced the wrong answer the first time.
+
+So since docs/specs/010-daemon.md:
+
+- **`muninn serve` publishes the descriptor and serves `/api/menu`.** It is a real
+  service: it sweeps, drains, watches, writes a state file a supervisor can read,
+  and tears all three down on SIGTERM or SIGHUP.
+- **`muninn index --watch` publishes nothing.** It is the foreground/debug ingest
+  path now. Both take one advisory lock, so the two can never race to own one
+  descriptor path — the failure there is subtle and worth naming: the **loser's**
+  teardown deletes the **winner's** descriptor, so a perfectly healthy raven drops
+  out of the menubar.
+- **Muninn is absent from the menubar when the daemon is not running**, which the
+  host still renders as a raven that was never installed, and a crashed daemon's
+  stale descriptor still renders as "Not running" with the reason on screen. Both
+  remain legitimate steady states; a raven that lied about being reachable would
+  be worse.
+
+**The protocol did not change and neither did the host.** Same descriptor fields,
+same shared directory, same liveness rules, same payload. Only *which local
+process writes the file* changed, which is exactly the kind of change a
+self-published-descriptor protocol is supposed to make free — no coordinated
+release with Appistry or Huginn, no version bump on any side. That is worth
+recording as evidence for the design, not just as a fact about this change.
 
 ## Design rules
 

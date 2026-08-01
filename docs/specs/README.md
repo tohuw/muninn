@@ -18,8 +18,9 @@ wiki wins and the contradiction is a bug worth reporting.
 | [007 — Tiered retention](007-tiered-retention.md) | ready | 001, 005 |
 | [008 — Plugin contract](008-plugin-contract.md) | ready | — |
 | [009 — Raven descriptor and `/api/menu`](009-raven-descriptor-menu.md) | implemented | 003 |
+| [010 — The daemon](010-daemon.md) | implemented | 003, 009 |
 
-Specs 002 and 003 both modify `muninn/cli.py`, as do 004 and 005. Run
+Specs 002 and 003 both modify `muninn/cli.py`, as do 004, 005 and 010. Run
 overlapping specs sequentially, or in separate git worktrees, so they cannot
 collide.
 
@@ -27,13 +28,20 @@ Spec 007 deletes data on purpose and is the most dangerous of the set. Its one
 inviolable rule: never drop prose for a session whose raw source is already gone.
 
 Spec 009 covers only Muninn's **producer** side of the shared menubar — the raven
-descriptor and the `/api/menu` payload it serves while `muninn index --watch` runs.
-It publishes no console: `/` and `/session/<id>` are deliberately stubs, because a
-real UI on that port would carry transcript prose and would force spec 009's
-"unauthenticated by design" decision to be reopened.
+descriptor and the `/api/menu` payload. It publishes no console: `/` and
+`/session/<id>` are deliberately stubs, because a real UI on that port would carry
+transcript prose and would force spec 009's "unauthenticated by design" decision
+to be reopened.
 
-Later phases not yet spec'd: the console, the agent skill, and the Cisco
-distribution's plugins.
+Spec 010 answers the owner decision spec 009 left open ("The lifecycle question"):
+Muninn now has a daemon, `muninn serve`, and it — not `muninn index --watch` — is
+what publishes the descriptor. **Read 010 before 009's lifecycle section**, which
+010 supersedes on that one point and on nothing else. `index --watch` remains as
+the foreground/debug ingest path.
+
+Later phases not yet spec'd: the console, the agent skill, the Cisco
+distribution's plugins, and the login-agent installer (which waits on `corvidae`
+publishing its `LoginAgent` ABC — see 010, "Follow-up seam").
 
 ## How to work one of these
 
