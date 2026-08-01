@@ -38,6 +38,11 @@ logger = logging.getLogger("muninn.indexer")
 # exception type across platforms, so the fallback below matches on errno.
 _INOTIFY_LIMIT_ERRNOS = {24, 28}  # EMFILE (too many open files), ENOSPC (inotify watch limit)
 
+# Sentinel for "the event generator is finished", distinct from every value it
+# can legitimately yield -- including ``None`` and the empty set, which are what
+# a timeout tick looks like. See the exhaustion branch in ``watch()``.
+_EXHAUSTED = object()
+
 
 def _now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
@@ -171,7 +176,7 @@ def watch(st: Store, roots: dict[str, Path], *, interval_s: float = 2.0,
                 watch_paths, interval_s=interval_s, force_polling=force_polling))
 
         try:
-            changes = next(generator, None)
+            changes = next(generator, _EXHAUSTED)
         except OSError as exc:
             if getattr(exc, "errno", None) in _INOTIFY_LIMIT_ERRNOS and not force_polling:
                 # Thousands of transcript files is exactly where the inotify
@@ -184,6 +189,19 @@ def watch(st: Store, roots: dict[str, Path], *, interval_s: float = 2.0,
                 generator = None
                 continue
             raise
+
+        if changes is _EXHAUSTED:
+            # The event source ended. ``watchfiles.watch`` is called with
+            # ``raise_interrupt=False``, so Ctrl-C makes its generator *return*
+            # rather than propagate — and the previous ``next(generator, None)``
+            # turned that into an infinite spin, because ``None`` is also what a
+            # timeout tick yields. The process then ignored SIGINT entirely and
+            # had to be SIGKILLed, which (since spec 009) also means the raven
+            # descriptor was left behind naming a dead port. Naming the mistake
+            # for the next reader: ``None`` is not usable as "exhausted" here,
+            # because it is a legitimate value from the loop's own default.
+            logger.info("muninn indexer: watch ended (interrupted); stopping")
+            return
 
         if changes:
             _emit(drain_once(st, actor="hook", queue_dir=queue_dir))

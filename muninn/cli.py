@@ -12,7 +12,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import __version__, exports, indexer, ingest, queue, store
+from . import __version__, exports, indexer, ingest, queue, raven, ravenserve, store
 from .hooks import install as hooks_install
 from .paths import DB_PATH, QUEUE_DIR, STATE_DIR, default_roots
 from .plugins import discover_plugins
@@ -62,9 +62,35 @@ def cmd_index(args: argparse.Namespace) -> int:
                       f"skipped={r.delta.skipped}")
 
         print(f"muninn indexer watching {', '.join(str(p) for p in roots.values())}")
+
+        # The watcher is the only process Muninn runs for any length of time, so
+        # it is also where the raven descriptor is published and /api/menu is
+        # served (docs/specs/009-raven-descriptor-menu.md). Muninn is therefore
+        # absent from the shared menubar whenever the watcher is not running,
+        # which is a documented steady state and not a bug to work around here.
+        # attach() returns None rather than raising: a menubar section must never
+        # cost this process its ingest.
+        service = None if args.no_menubar else ravenserve.attach(args.db)
+        if service is not None:
+            print(f"muninn raven serving http://127.0.0.1:{service.port}/api/menu")
+            # SIGTERM is how a service manager stops this process, and Python's
+            # default handler for it does NOT unwind the stack — so the `finally`
+            # below never runs and the descriptor is left behind naming a dead
+            # port. That is survivable (the host checks the pid), but "stopped by
+            # launchd" should not be indistinguishable from "crashed": turning
+            # the signal into SystemExit is what makes the ordinary stop clean.
+            # SIGINT already raises KeyboardInterrupt, so it needs nothing.
+            _exit_on_sigterm()
         try:
             indexer.watch(st, roots, on_receipts=_log)
+        except KeyboardInterrupt:
+            pass
         finally:
+            # Withdraw before closing the store, so the descriptor is gone
+            # before the process can be observed shutting down. A hard kill
+            # skips this and Appistry reports "Not running" from the pid check.
+            if service is not None:
+                service.stop()
             st.close()
         return 0
 
@@ -93,6 +119,22 @@ def cmd_index(args: argparse.Namespace) -> int:
               f"· {_size(args.db)}")
     st.close()
     return 0
+
+
+def _exit_on_sigterm() -> None:
+    """Make SIGTERM unwind the stack, so the watcher's cleanup actually runs.
+
+    Best-effort: ``signal.signal`` only works on the main thread and raises
+    ``ValueError`` anywhere else, and a Windows build may not have ``SIGTERM`` at
+    all. Neither is worth failing an indexer over — the descriptor is merely left
+    stale in that case, which the host already handles by checking the pid.
+    """
+    import signal
+
+    try:
+        signal.signal(signal.SIGTERM, lambda *_a: sys.exit(0))
+    except (AttributeError, OSError, ValueError):
+        pass
 
 
 def _print_index_result(source: str, result: ingest.IngestResult) -> None:
@@ -451,9 +493,37 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     _print_plugins_section()
     _print_policy_section()
+    _print_menubar_section()
 
     st.close()
     return 0
+
+
+def _print_menubar_section() -> None:
+    """Spec 009: whether Muninn is currently discoverable in the shared menubar.
+
+    Worth a line even though the answer is usually "no": a user who cannot find
+    Muninn in the menubar has no other way to tell "the indexer is not running"
+    from "the descriptor went somewhere the host does not look", and those need
+    completely different fixes. The path is printed for exactly that reason —
+    it is the shared ravens directory, not Muninn's own state dir, and confusing
+    the two is the mistake this line makes visible.
+    """
+    path = raven.descriptor_path()
+    print("\nshared menubar (published only while `muninn index --watch` runs)")
+    print(f"  descriptor  {path}")
+    if not path.exists():
+        print("              absent — Muninn is not in the menubar right now")
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        pid, port = payload.get("pid"), payload.get("port")
+    except (OSError, ValueError):
+        print("              present but unreadable — the host will report it as malformed")
+        return
+    alive = store.pid_alive(pid if isinstance(pid, int) else None)
+    state = "serving" if alive else "STALE (its process is gone; the host will say so)"
+    print(f"              {state} · pid {pid} · port {port}")
 
 
 def _print_plugins_section() -> None:
@@ -539,6 +609,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--watch", action="store_true",
                          help="run the background indexer: sweep, then drain the "
                               "queue and react to file changes indefinitely")
+    p_index.add_argument("--no-menubar", action="store_true",
+                         help="with --watch, do not publish a raven descriptor or "
+                              "serve /api/menu on loopback (docs/specs/009)")
     p_index.set_defaults(func=cmd_index)
 
     p_search = sub.add_parser(
