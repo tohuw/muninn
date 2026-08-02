@@ -1,10 +1,21 @@
 """The raven side of the shared menubar: descriptor, menu payload, sanitising.
 
 Normative sources: docs/specs/009-raven-descriptor-menu.md and
-.valholl/articles/shared-menubar.md. The wire contract itself is Appistry's
-``SPEC.md`` ("The Raven Protocol", version 1); this module is Muninn's
-implementation of the *raven* half of it, and the shapes here must match that
-document rather than seeming reasonable on their own.
+.valholl/articles/shared-menubar.md. The wire contract itself is
+``SPEC.md`` ("The Raven Protocol", version 1) in the host's repository,
+https://github.com/tohuw/roost; this module is Muninn's implementation of the
+*raven* half of it, and the shapes here must match that document rather than
+seeming reasonable on their own.
+
+**A note on the host's name, because this file and its neighbours say "Appistry"
+throughout.** The public shared menubar is now **Roost** — the repository was
+renamed ``tohuw/appistry`` to ``tohuw/roost``, and its runtime was already
+``roost``. "Appistry" in these docstrings means that host under its old name and
+nothing else; the *internal* Cisco app launcher of the same name is unrelated to
+the protocol and is not what any of them refer to. The old references are left in
+place rather than swept, because none of them is a URL or an import and rewriting
+prose in eight files would obscure the two changes that matter here. Nothing about
+the protocol changed with the name.
 
 Three things live here and nothing else: where the descriptor goes, what it
 says, and what ``/api/menu`` returns. The HTTP surface is ``muninn/ravenserve.py``

@@ -2,10 +2,14 @@
 
 **Status:** implemented (producer side only).
 **Read first:** `.valholl/articles/shared-menubar.md` — normative for *why* there
-is one menubar rather than two. Then Appistry's `SPEC.md` ("The Raven Protocol",
+is one menubar rather than two. Then the host's `SPEC.md` ("The Raven Protocol",
 version 1), which is normative for the **wire format** and outranks this document
-on any question of shape. Verified against `tohuw/appistry` at commit
-`137ea7e3d8efed1b764cf267daf2a1d685f2c577`.
+on any question of shape. Verified against that repository at commit
+`137ea7e3d8efed1b764cf267daf2a1d685f2c577`, when it was named `tohuw/appistry`; it
+is now **[`tohuw/roost`](https://github.com/tohuw/roost)** and the host is called
+**Roost**. "Appistry" below is that same host under its old name — the protocol did
+not change with the rename, so the commit above is still the verified reference
+point.
 
 ## Why
 

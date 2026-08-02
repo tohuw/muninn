@@ -181,7 +181,8 @@ def write_state(port: int | None, *, path: Path | None = None,
     # never restricted. This file names a loopback port that answers
     # unauthenticated requests, and ``python``/``repo`` are paths a tray app may
     # relaunch from — integrity matters even where confidentiality does not
-    # (the reasoning Huginn recorded for its own 0600, its issue #41 M5).
+    # (the reasoning Huginn recorded for its own 0600, finding M5 of the security
+    # review of its issue #41 — not of #41's own scope, which was model policy).
     _restrict(directory, 0o700)
 
     payload = json.dumps({

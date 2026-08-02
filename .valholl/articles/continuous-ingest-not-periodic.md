@@ -103,8 +103,8 @@ supervisor and the single-instance lock rather than about either alone:
   install reported success and the daemon ran, and only the log said where. Not
   worked around: capturing a terminal's transient state into config that runs at
   every login for years is worse than the surprise, and an `EnvironmentVariables`
-  plist key is the exact thing Huginn's #41 XML injection manufactured out of a
-  directory name.
+  plist key is the exact thing the XML injection found by the security review of
+  Huginn's #41 (its finding C3) manufactured out of a directory name.
 
 ## Requirements
 
