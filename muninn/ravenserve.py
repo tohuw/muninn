@@ -1,32 +1,34 @@
 """The loopback listener that serves ``/api/menu``, and its lifecycle.
 
-Normative source: docs/specs/009-raven-descriptor-menu.md. Read
-``muninn/raven.py`` first — it owns the descriptor and the payload; this module
-owns the socket and the publish/withdraw lifecycle around it.
+Normative sources: docs/specs/009-raven-descriptor-menu.md for the payload and
+this surface, docs/specs/010-daemon.md for who runs it. Read ``muninn/raven.py``
+first — it owns the descriptor and the payload; this module owns the socket and
+the publish/withdraw lifecycle around it.
 
-## Why this is bolted to ``muninn index --watch`` and nothing else
+## ``muninn serve`` runs this, and ``muninn index --watch`` deliberately does not
 
-Muninn has no daemon. That is not an oversight to be corrected here: every other
-entry point is a one-shot CLI invocation that exits in milliseconds, and the
-whole archive design (``muninn/queue.py``, ``muninn/paths.py``) is built so that
-even the ``SessionEnd`` hook touches nothing but a directory. The single process
-that already runs for as long as the user's machine is up is
-``muninn index --watch`` (docs/specs/003-background-indexer.md), so that is where
-the descriptor is published and where this server listens.
+Spec 009 bolted this onto ``muninn index --watch``, because Muninn had no daemon
+and the watcher was the only process that ran for any length of time. Spec 010
+gave it one, and the owner decision that closed the question was **not** about the
+menubar — it was about ingest, which is Muninn's whole durability claim. The menu
+row was always a consequence of something being up, never a reason for it to be.
+So ``daemon.Daemon`` calls :func:`attach` and the foreground watcher publishes
+nothing: two publishers of one descriptor path means the **loser's** teardown
+deletes the **winner's** file, and a healthy raven silently drops out of the
+menubar (see daemon.py, "Why there is a single-instance lock").
 
-The consequence, stated plainly rather than hidden: **when the watcher is not
-running, Muninn is absent from the menubar.** No descriptor exists, so Appistry
+The consequence, stated plainly rather than hidden: **when the daemon is not
+running, Muninn is absent from the menubar.** No descriptor exists, so the host
 shows nothing for Muninn — the same as a Muninn that was never installed. If a
-descriptor is left behind by a crash, Appistry checks the recorded PID and
+descriptor is left behind by a crash, the host checks the recorded PID and
 ``started`` and renders "Not running (its recorded process is gone)." with the
-reason on screen. Both are legitimate steady states, and the alternative
-considered and rejected was inventing a second daemon whose only job is to answer
-a menu fetch. That would be a new always-on subsystem, a new lifecycle to get
-wrong, and a new loopback port on a machine that did not ask for one — to serve a
-menu section. The tradeoff is real and belongs to the project's owner: if Muninn
-should be present in the menubar regardless of the indexer, that is a decision to
-make deliberately, not something this module should quietly assume by starting a
-daemon of its own. See docs/specs/009, "The lifecycle question".
+reason on screen. Both remain legitimate steady states; a raven that lied about
+being reachable would be worse.
+
+Note what did *not* change when the publisher did: same descriptor fields, same
+shared directory, same liveness rules, same payload. Only which local process
+writes the file, which is the kind of change a self-published-descriptor protocol
+is meant to make free — no coordinated release with the host or the other raven.
 
 ## The token decision, and it is a decision
 
