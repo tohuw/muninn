@@ -10,8 +10,10 @@ value nothing else owns.
 
 ## Nothing here implements launchd, systemd, or the registry
 
-`corvidae.login_agent` does, and the hardening it carries came from Huginn's
-issue #41 with a working exploit behind each item: the plist is built by
+`corvidae.login_agent` does, and the hardening it carries came from a security
+review of Huginn's issue #41 — of the surface that change added, not of its own
+scope, which was the model-policy chokepoint — with a working exploit behind each
+item: the plist is built by
 ``plistlib.dumps`` of a real dict rather than formatted into an XML template (a
 directory name containing XML injected live launchd keys), systemd refuses
 ``\\n``/``\\r``/``%`` in any value rather than escaping them, config is written via
@@ -65,8 +67,9 @@ log file.
 This is not worked around, and adding an ``EnvironmentVariables`` dict to capture
 the installing shell would be the wrong fix twice over: it would bake one
 terminal's transient state into config that runs at every login for years, and it
-is the exact key that Huginn's issue #41 C3 XML injection created out of a
-directory name. A user who genuinely relocates Muninn's state sets the variable
+is the exact key that the XML injection created out of a directory name (finding
+C3 of that same review; see above for why the review and #41 are not the same
+thing). A user who genuinely relocates Muninn's state sets the variable
 where login sessions see it (``launchctl setenv``, a systemd user environment
 drop-in) — which is a statement about their machine rather than about this
 install. Recorded in ``docs/specs/010-daemon.md`` so it is discoverable before

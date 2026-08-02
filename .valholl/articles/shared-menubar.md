@@ -144,9 +144,17 @@ recording as evidence for the design, not just as a fact about this change.
 
 ## Scope note
 
-The menubar itself shipped as a separate Python project (`tohuw/appistry`), not as
-a rewrite inside Huginn's Swift app — so the "coordinated change to public Huginn
-with a version bump on both sides" this article originally anticipated became three
-independent implementations of one documented protocol instead. Appistry's
-`SPEC.md` is normative for the wire format; Muninn's producer side is
-docs/specs/009 and Huginn's is its own.
+The menubar itself shipped as a separate Python project — public, Apache-2.0, and
+named **Roost** ([`tohuw/roost`](https://github.com/tohuw/roost); the repository was
+called `appistry` when this work was done, which is why earlier sections and
+`muninn/raven.py` say so) — not as a rewrite inside Huginn's Swift app. The
+"coordinated change to public Huginn with a version bump on both sides" this
+article originally anticipated became three independent implementations of one
+documented protocol instead. Roost's `SPEC.md` is normative for the wire format;
+Muninn's producer side is docs/specs/009 and Huginn's is its own.
+
+Huginn's Swift app was **not** retired by this. It still builds, still owns
+Huginn's daemon lifecycle — which Roost deliberately does not — and is now one of
+two options a Huginn user picks between. That is worth recording because the
+article above reads as though the rewrite replaced it; what actually happened is
+that the rewrite went somewhere else and left it standing.
