@@ -496,8 +496,9 @@ tempdir produced a daemon that ingested into the real
 
 Not worked around. An `EnvironmentVariables` dict capturing the installing shell
 would bake one terminal's transient state into config that runs at every login for
-years, and it is the exact plist key Huginn's issue #41 C3 injection created out of
-a directory name. A user who genuinely relocates Muninn's state sets the variable
+years, and it is the exact plist key the C3 injection created out of a directory
+name — a finding from the security review of the surface Huginn's issue #41 added,
+not from #41's own scope, which was the model-policy chokepoint. A user who genuinely relocates Muninn's state sets the variable
 where login sessions see it (`launchctl setenv`, a systemd user environment
 drop-in), which is a statement about their machine rather than about this install.
 

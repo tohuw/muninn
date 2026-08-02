@@ -83,13 +83,28 @@ the `LoginAgentSpec`/`LoginAgent` seam into the shared `corvidae` package
 or the registry anywhere in this repo**. See [[continuous-ingest-not-periodic]] and
 `docs/specs/010-daemon.md`.
 
-Note on issue numbers, since this article cites several: corvidae's README and
-`huginn/agent_install.py` both attribute the login-agent work to huginn#39 and its
-hardening to huginn#41, whereas this article's headings above map #39 to lag
-reporting and #41 to the model-policy chokepoint. One of the two mappings is stale.
-Trust the upstream files over this article for *which number*; nothing here depends
-on the answer, and it is flagged rather than silently corrected because guessing
-would make it worse.
+**Resolved, since this article previously flagged the numbers as contradictory.**
+Both mappings were right about #39 and this article was right about #41; what was
+wrong was the phrase "hardening from #41". The upstream titles, checked directly:
+
+- **#39 — "No lag reporting for derived state, and background install is
+  launchd-only."** One issue covering *both*, which is why #4 above and #5 here
+  cite the same number without either being stale. Citing #39 for the login-agent
+  work is exact.
+- **#41 — "Plugin registry is purely additive: no way to express 'only these
+  models may be used'."** The model-policy chokepoint, as §6 below says.
+
+So the plist/symlink/0600 hardening did not come from #41's scope. It came from a
+**security review of the surface #41 added**, which swept `agent_install.py` on its
+way through — which is why that file's findings carry `C`/`H`/`M` ids rather than
+issue numbers. Corrected upstream in `packages/corvidae/README.md` and
+`huginn/agent_install.py`, and locally in `muninn/agent_install.py` and
+docs/specs/010.
+
+Worth keeping as a lesson rather than deleting: "the hardening from #41" was a
+*true-sounding* citation, which is the kind that survives review. An issue number
+attached to a security property is a claim about scope, and a review of one change
+is not the same thing as the change.
 
 The original text, for the record: `huginn/agent_install.py` supported macOS
 launchd only, though Huginn shipped a Windows tray app and `WINDOWS.md` documented

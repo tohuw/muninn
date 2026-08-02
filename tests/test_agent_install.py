@@ -354,7 +354,8 @@ class LaunchdTest(_TempState):
         self.assertEqual(parsed["ProgramArguments"][1:], ["-m", "muninn.cli", "serve"])
 
     def test_the_plist_is_built_by_plistlib_not_a_template(self) -> None:
-        # corvidae's issue #41 C3 hardening, verified through Muninn's own spec:
+        # corvidae's C3 hardening, verified through Muninn's own spec (finding C3
+        # of the security review of Huginn's #41, not of #41's own scope):
         # a working directory carrying XML must land as inert data in the one value
         # it belongs to, adding no keys. Before the fix upstream, an equivalent
         # payload injected a live DYLD_INSERT_LIBRARIES dict.
@@ -497,7 +498,7 @@ class SystemdTest(_TempState):
             self.assertEqual(agent.install(), 1)
 
     def test_a_newline_in_the_checkout_path_is_refused_not_escaped(self) -> None:
-        # corvidae's issue #41 C3 hardening, inherited: \n ends a systemd
+        # corvidae's C3 hardening, inherited: \n ends a systemd
         # directive, so a path containing one injected arbitrary ones. Refusing
         # is right rather than escaping — this is a checkout path, so a value
         # with a newline in it is a broken install to report.

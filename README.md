@@ -10,7 +10,8 @@ _Developed with AI assistance. See the git history for which agents contributed.
 Huginn is Thought; Muninn is Memory. [Huginn](https://github.com/tohuw/huginn)
 answers "what are my agents doing right now." Muninn answers "what did we do,
 decide, and learn." They are complementary and share a single menubar surface —
-nobody wants two ravens up there.
+[Roost](https://github.com/tohuw/roost) — because nobody wants two ravens up
+there.
 
 > **Status: early.** The storage and ingest foundation works and is covered by
 > tests. Search is minimal, enrichment and the console are not built yet. See
@@ -47,7 +48,11 @@ uv sync
 ## Usage
 
 ```sh
-# Ingest local transcripts. Idempotent; safe to run repeatedly.
+# Run it as a service. This is the normal way to run Muninn.
+uv run muninn serve
+uv run muninn install-agent   # ...and have it start at login
+
+# Ingest local transcripts once, by hand. Idempotent; safe to run repeatedly.
 uv run muninn index
 
 # Search the archive.
@@ -56,9 +61,6 @@ uv run muninn search "auth redirect" --since 2026-06
 
 # Survey your corpus and derive calibration (see below).
 uv run muninn survey
-
-# Run it as a service. This is the one that matters for durability.
-uv run muninn serve
 
 # Health, including whether the daemon is running and on what port.
 uv run muninn doctor
@@ -70,7 +72,10 @@ uv run muninn doctor
 startup, then drains the `SessionEnd` queue and reacts to transcript changes for
 as long as it runs — so a session written while nothing was watching is still
 recovered, and a session deleted by Claude Code's 30-day sweep was captured
-before it went. It also publishes Muninn's row in the shared menubar.
+before it went. It also publishes Muninn's row in the shared menubar. **It is the
+normal way to run Muninn**, and `install-agent` below is how you stop having to
+remember it; `muninn index` remains a one-shot ingest for when you want to watch
+one happen.
 
 It is built to be supervised, not to supervise itself: it records
 `~/.local/state/muninn/daemon.json` (pid, port, and where to relaunch it from) and
@@ -84,6 +89,28 @@ because two loops would drain one queue twice and fight over one descriptor.
 with no port and no state file, for watching ingest happen on a console.
 
 See [`docs/specs/010-daemon.md`](docs/specs/010-daemon.md).
+
+### The shared menubar
+
+While `muninn serve` runs it publishes a **raven descriptor** into a shared
+directory and answers `GET /api/menu` on loopback. The menubar that reads those is
+**[Roost](https://github.com/tohuw/roost)** — a separate Apache-2.0 project, one
+macOS menu bar / Windows tray item that renders whichever ravens are running.
+Install it from its own repository; Muninn does not ship, depend on, or install
+it, and publishing is best-effort, so ingest never pays for a menubar.
+
+Roost's `SPEC.md` is normative for the wire format. Muninn's producer side is
+[`docs/specs/009-raven-descriptor-menu.md`](docs/specs/009-raven-descriptor-menu.md),
+including the two decisions worth knowing before reading the code: every row is a
+link (Muninn publishes no action endpoint), and there is no `token_path`, so
+`/api/menu` is unauthenticated by design and the `Host`/`Origin` checks are the
+only thing defending that port.
+
+**Muninn is absent from the menubar when its daemon is not running.** That is a
+legitimate steady state, not a bug: no descriptor exists, and Roost draws nothing
+for a raven it cannot find — the same as one that was never installed. A crashed
+daemon's stale descriptor renders as "Not running" with the reason on screen,
+because Roost checks the recorded pid.
 
 ### Start it at login
 
@@ -184,7 +211,8 @@ database is ever needed**; the only real cost is generating embeddings once.
 - [ ] `muninn doctor` — index lag, parse health, calibration drift
 - [ ] Index-time enrichment: topic, outcome, decisions, artifacts
 - [ ] Hybrid retrieval with optional embeddings
-- [ ] Console and shared menubar
+- [x] Shared-menubar raven: descriptor and `/api/menu`, rendered by [Roost](https://github.com/tohuw/roost)
+- [ ] Console
 - [ ] Agent skill
 
 Muninn supersedes [`claudex`](https://github.com/tohuw/claudex) and
