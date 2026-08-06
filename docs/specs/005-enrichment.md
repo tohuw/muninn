@@ -1,7 +1,28 @@
 # Spec 005 — Index-time enrichment
 
-**Status:** ready to implement after 001, 004 and **011**
+**Status: implemented.** After 001, 004 and **011**.
 **Owner of design:** planned by Opus, implemented by Sonnet
+
+> **As built**, with three decisions worth reading before changing anything here:
+>
+> - **The parser is strict — the whole response must be the JSON document.** The
+>   lenient alternative (scan for the first `{...}`) is how prompt injection wins:
+>   the response derives from transcript text, a transcript can contain a JSON
+>   object, and a scanner lifts the attacker's object out of quoted prose and
+>   stores it as the session's facets. A provider that echoes its prompt now
+>   produces a recorded failure instead of `topic="pwned"`.
+> - **An un-surveyed archive is refused, not defaulted** (exit 2, naming
+>   `muninn survey`). Substituting a constant would silently reintroduce the
+>   hard-coded gate spec 011 removed.
+> - **Redaction runs on the way out, never on the way in.** The archive keeps
+>   the raw prose because it is the only copy; the provider call is the new
+>   exposure, so that is where the boundary sits.
+>
+> Measured on the backfilled corpus (3,730 sessions): 440 planned, ~2,525 model
+> calls, 1,501 excluded as tool-invoked and 1,789 below the gate — with derived
+> gates of 11,211 / 17,640 / 18,465 words for claude / claude-cloud / codex.
+> `muninn/policy.py` landed earlier with spec 008; this spec added
+> `muninn/redact.py`, `providers.py`, `enrich.py` and `muninn enrich`.
 **Read first:** `.valholl/articles/derived-calibration.md` (the gate must be
 derived, not chosen) and `.valholl/articles/provenance-classification.md` (what
 must never be enriched).

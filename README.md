@@ -13,10 +13,11 @@ decide, and learn." They are complementary and share a single menubar surface �
 [Roost](https://github.com/tohuw/roost) — because nobody wants two ravens up
 there.
 
-> **Status: early.** Storage, ingest, the daemon, search with structured
-> filters, and corpus calibration all work and are covered by tests. Enrichment,
-> semantic retrieval and the console are not built yet — so `--outcome` matches
-> nothing and there is no `--semantic`. See [Roadmap](#roadmap).
+> **Status: early, but no longer minimal.** Storage, ingest, the daemon, search
+> with structured filters, corpus calibration, enrichment and hybrid retrieval
+> all work and are covered by tests. The console is not built. Semantic search
+> needs `uv sync --extra semantic` (or a plugin) — without a provider it refuses
+> rather than quietly falling back to lexical. See [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -74,6 +75,11 @@ uv run muninn import ~/Downloads/data-2026-08-01.zip
 
 # Survey your corpus and derive calibration (see below).
 uv run muninn survey
+
+# Extract topic/outcome/decisions from substantive sessions. Costs model calls —
+# --dry-run tells you how many before you spend any.
+uv run muninn enrich --dry-run
+uv run muninn search "the retry decision" --outcome fixed
 
 # Health: index lag, queue, calibration drift, daemon and login-agent state.
 uv run muninn doctor
@@ -234,12 +240,23 @@ SQLite FTS5 over prose chunks. Measured on a real corpus: **0.8 s to index, 33 M
 while broad `OR` queries degraded linearly to 45 ms — which is why query
 expansion is capped rather than unbounded.
 
-Semantic recall is designed to be optional and pluggable via an
-`EmbeddingProvider` protocol. **The protocol exists; no provider ships in this
-package**, so there is no `--semantic` flag yet — search today is lexical.
-Measured for when it lands: brute-force numpy cosine is ~2 ms at 60k chunks ×
-1024 dims, so **no vector database is ever needed**; the only real cost is
-generating the embeddings once.
+Semantic recall is optional and pluggable via an `EmbeddingProvider` protocol.
+`muninn embed` generates vectors; `search --semantic` fuses them with the lexical
+results by reciprocal rank, and `muninn correlate` answers "conversations like
+this one". Without a provider installed, `--semantic` **exits non-zero and says
+so** — it never returns lexical results labelled as semantic.
+
+Measured on a real 83,745-chunk archive: **0.68 ms for a cosine top-20**. So
+**no vector database is ever needed** — a matrix multiply and an `argpartition`
+are enough well past any plausible corpus. The only real cost is generating the
+embeddings once, which is why `embed` is a separate, resumable command.
+
+```sh
+uv sync --extra semantic        # the local Apple-silicon provider, plus numpy
+uv run muninn embed             # one-time; resumable, --dry-run to plan
+uv run muninn search "that time SSE kept dropping" --semantic
+uv run muninn correlate a7efca23
+```
 
 ## Roadmap
 
@@ -253,9 +270,9 @@ generating the embeddings once.
 - [x] `muninn survey` — derived thresholds in an inspectable `calibration.json`
 - [x] Prose-index backfill (`muninn backfill`) from `claudex` / `codexdex`
 - [x] `muninn resume` — reopen a session, or say honestly why it cannot be
-- [ ] Index-time enrichment: topic, outcome, decisions, artifacts
-- [ ] Hybrid retrieval with optional embeddings — no `EmbeddingProvider` ships yet
-- [ ] `muninn brief` (needs enrichment) and `muninn correlate` (needs embeddings)
+- [x] Index-time enrichment (`muninn enrich`): topic, outcome, decisions, artifacts
+- [x] Hybrid retrieval: `muninn embed`, `search --semantic/--deep`, `muninn correlate`
+- [ ] `muninn brief` — a synthesis across matching sessions, carrying provenance per claim
 - [x] Shared-menubar raven: descriptor and `/api/menu`, rendered by [Roost](https://github.com/tohuw/roost)
 - [ ] Console
 - [ ] Agent skill

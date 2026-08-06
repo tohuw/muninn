@@ -13,8 +13,8 @@ wiki wins and the contradiction is a bug worth reporting.
 | [002 — Export importers](002-export-importers.md) | ready | 001 |
 | [003 — Background indexer](003-background-indexer.md) | ready | 001 |
 | [004 — Structured filters](004-structured-filters.md) | ready | — |
-| [005 — Enrichment](005-enrichment.md) | ready | 001, 004 |
-| [006 — Hybrid retrieval](006-hybrid-retrieval.md) | ready | 004, 005 |
+| [005 — Enrichment](005-enrichment.md) | implemented | 001, 004, 011 |
+| [006 — Hybrid retrieval](006-hybrid-retrieval.md) | implemented | 004, 005 |
 | [007 — Tiered retention](007-tiered-retention.md) | ready | 001, 005 |
 | [008 — Plugin contract](008-plugin-contract.md) | ready | — |
 | [009 — Raven descriptor and `/api/menu`](009-raven-descriptor-menu.md) | implemented | 003 |

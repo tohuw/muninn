@@ -18,6 +18,7 @@ See .valholl/articles/archive-of-record.md.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import re
 import sqlite3
@@ -28,7 +29,7 @@ from typing import Any, Iterable
 from .query import Filters, build_log_sql, build_search_sql, expand_terms
 from .receipt import Delta, Outcome, SourceFacts
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Chunking defaults. Real values come from calibration; these are fallbacks so
 # the store works before a survey has ever run.
@@ -121,6 +122,32 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
     body,
     tokenize = 'porter unicode61'
 );
+
+-- Embeddings, one row per (chunk, model). Schema v3; see docs/specs/006.
+--
+-- ``model`` is in the primary key because **vectors from different models are
+-- not comparable**. Mixing two embedding spaces in one cosine search does not
+-- error and does not look wrong — it silently returns nonsense ranked
+-- confidently — so a model change produces a new *set* of vectors and search
+-- uses one model at a time.
+--
+-- ``vec`` is raw float32 little-endian, ``dim * 4`` bytes. A BLOB rather than
+-- JSON because 60k x 1024 floats is 246 MB as bytes and several times that as
+-- text, and because the read path wants to hand the bytes straight to numpy
+-- without parsing.
+--
+-- Derived data, like ``chunks``: an embedding can always be regenerated from
+-- prose, so nothing here is covered by the archive-of-record guarantee and
+-- deleting a stale row is safe.
+CREATE TABLE IF NOT EXISTS chunk_vectors (
+    session_id TEXT NOT NULL,
+    ordinal    INTEGER NOT NULL,
+    model      TEXT NOT NULL,
+    dim        INTEGER NOT NULL,
+    vec        BLOB NOT NULL,
+    PRIMARY KEY (session_id, ordinal, model)
+);
+CREATE INDEX IF NOT EXISTS idx_vectors_model ON chunk_vectors(model);
 """
 
 # The import ledger: append-only, keyed by content digest. See
@@ -239,7 +266,18 @@ class Store:
     def replace_chunks(self, session_id: str, text: str,
                        chunk_words: int = DEFAULT_CHUNK_WORDS,
                        stride: int = DEFAULT_CHUNK_STRIDE) -> int:
-        """Rebuild the FTS rows for one session. Safe: chunks are derived data."""
+        """Rebuild the FTS rows for one session. Safe: chunks are derived data.
+
+        Also drops any embedding whose ordinal no longer exists. A session that
+        grew and was re-chunked into fewer windows would otherwise leave
+        orphaned vectors behind — rows keyed to an ordinal with no text, which
+        cosine search would happily return and then fail to render, because the
+        snippet they point at is gone. Vectors for surviving ordinals are left
+        alone rather than deleted wholesale: they are *stale* (the window's text
+        may have shifted) but they are also expensive, and `muninn embed`
+        refreshes them on its next pass. Deleting every vector on every re-index
+        would make re-ingesting one session cost a full re-embed of it.
+        """
         self.conn.execute("DELETE FROM chunks WHERE session_id = ?", (session_id,))
         rows = [(session_id, i, body)
                 for i, body in enumerate(chunk_text(text, chunk_words, stride))]
@@ -247,6 +285,9 @@ class Store:
             self.conn.executemany(
                 "INSERT INTO chunks (session_id, ordinal, body) VALUES (?, ?, ?)", rows
             )
+        self.conn.execute(
+            "DELETE FROM chunk_vectors WHERE session_id = ? AND ordinal >= ?",
+            (session_id, len(rows)))
         return len(rows)
 
     def set_files(self, session_id: str, paths: Iterable[str]) -> None:
@@ -317,6 +358,36 @@ class Store:
                               (row["session_id"],))
         self.conn.commit()
         return len(rows)
+
+    def set_facets(self, session_id: str, facets) -> None:
+        """Write one session's enrichment. Never touches ``text``.
+
+        The columns already existed (nullable by design since schema v1) so this
+        needs no migration. What it must not do is participate in
+        ``upsert_session``'s never-blank-a-value merge: enrichment is *derived*
+        data and re-deriving it must be able to replace a previous answer,
+        including with a shorter one. A model that correctly narrows a
+        five-item decision list to two is improving the row, and a merge rule
+        written to protect irreplaceable prose would read that as data loss and
+        keep the stale three.
+        """
+        self.conn.execute(
+            "UPDATE sessions SET topic = ?, outcome = ?, summary = ?, facets_json = ? "
+            "WHERE session_id = ?",
+            (facets.topic, facets.outcome, facets.summary, facets.to_json(), session_id),
+        )
+
+    def get_facets(self, session_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT facets_json FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+        if row is None or not row["facets_json"]:
+            return None
+        try:
+            return json.loads(row["facets_json"])
+        except ValueError:
+            # A row written by a future schema, or corrupted. Absent beats
+            # raising out of a read path.
+            return None
 
     def mark_source_missing(self, session_id: str) -> None:
         """The raw file is gone. Keep the archived prose; just record the fact."""
