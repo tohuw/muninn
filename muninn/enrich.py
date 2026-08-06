@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from . import redact, survey
 from .providers import ProviderError, TextProvider
@@ -405,6 +405,13 @@ def plan(st: Store, calibration: dict[str, Any] | None, *,
     only — not the provenance rule. Asking to enrich a specific tool-invoked
     session is still refused, because that rule is about what enrichment is for
     rather than about cost.
+
+    Candidates come back **shortest first**. A corpus pass is hours of work and
+    the cost of a session is roughly its length, so cheapest-first banks the
+    most completed sessions per unit of time — which matters because the run is
+    resumable and can be interrupted. Longest-first, the obvious ordering, spent
+    a quarter of an hour on a single 622,232-word session before the first row
+    was committed, and a watcher could not tell that from a hang.
     """
     thresholds: dict[str, int] = {}
     for src, report in (calibration or {}).get("sources", {}).items():
@@ -425,7 +432,7 @@ def plan(st: Store, calibration: dict[str, Any] | None, *,
     rows = st.conn.execute(
         f"SELECT session_id, source, provenance, words, topic "
         f"FROM sessions WHERE {' AND '.join(where)} "
-        f"ORDER BY words DESC, session_id", params).fetchall()
+        f"ORDER BY words ASC, session_id", params).fetchall()
 
     candidates: list[Candidate] = []
     skipped: dict[str, int] = {}
@@ -474,7 +481,8 @@ class EnrichResult:
 
 
 def enrich_sessions(st: Store, candidates: Iterable[Candidate],
-                    provider: TextProvider) -> EnrichResult:
+                    provider: TextProvider,
+                    progress: "Callable[[str], None] | None" = None) -> EnrichResult:
     """Enrich each candidate, recording failures rather than raising them.
 
     One session's malformed response must not end the run — a corpus-wide pass is
@@ -484,14 +492,33 @@ def enrich_sessions(st: Store, candidates: Iterable[Candidate],
     retrying it per session would produce thousands of identical refusals.
     """
     result = EnrichResult()
-    for candidate in candidates:
+    candidates = list(candidates)
+    total = len(candidates)
+    for index, candidate in enumerate(candidates, start=1):
         text = st.session_text(candidate.session_id)
+        if progress is not None:
+            # Emitted *before* the work, not after. A 622,232-word session is
+            # ~55 chunk calls and can take a quarter of an hour; a line printed
+            # on completion means the first thing a watcher sees is fifteen
+            # minutes of silence, which is indistinguishable from a hang. It
+            # was: the first real run looked stalled until the process tree
+            # showed a healthy `claude -p` child.
+            # 8 characters is enough for a bare uuid and useless for a
+            # kind-namespaced one: `memory:areas-10tdb.md` truncates to
+            # `memory:p`, which distinguishes nothing from its neighbours. Show
+            # the tail after the prefix instead.
+            label = candidate.session_id
+            label = label[:8] if ":" not in label else label[:22]
+            calls = max(1, -(-candidate.words // max(CHUNK_WORDS - CHUNK_OVERLAP_WORDS, 1)))
+            progress(f"[{index}/{total}] {label} {candidate.source} "
+                     f"{candidate.words:,}w (~{calls} call{'s' if calls != 1 else ''})")
         try:
             facets, redactions = extract_facets(text, provider)
         except EnrichmentFailed as exc:
             result.failed += 1
             result.failures[exc.category] = result.failures.get(exc.category, 0) + 1
             st.record_parse_failure("enrich", exc.category)
+            st.commit()
             continue
         st.set_facets(candidate.session_id, facets)
         # Committed per session, not per run. A corpus pass is thousands of

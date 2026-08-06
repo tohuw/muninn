@@ -18,11 +18,36 @@
 >   the raw prose because it is the only copy; the provider call is the new
 >   exposure, so that is where the boundary sits.
 >
-> Measured on the backfilled corpus (3,730 sessions): 440 planned, ~2,525 model
-> calls, 1,501 excluded as tool-invoked and 1,789 below the gate — with derived
-> gates of 11,211 / 17,640 / 18,465 words for claude / claude-cloud / codex.
 > `muninn/policy.py` landed earlier with spec 008; this spec added
 > `muninn/redact.py`, `providers.py`, `enrich.py` and `muninn enrich`.
+
+### What running it for real changed
+
+Three things only a real pass surfaced, all in the *operational* half rather
+than the extraction half:
+
+- **Commit per session, not per run.** A corpus pass is thousands of calls over
+  hours. Committing once at the end meant a Ctrl-C, a rate limit or a closed lid
+  threw away every call already paid for — and made "run it again, it skips what
+  is done" false, since the gate's already-enriched check reads committed rows.
+- **Order shortest-first.** The obvious ordering is longest-first, and it spent
+  a quarter of an hour on a single 622,232-word session (≈55 chunk calls) before
+  committing anything. Cheapest-first banks the most completed sessions per unit
+  of time, which is what matters for a resumable job that may be interrupted.
+- **Flush every progress line.** Python block-buffers stdout when it is not a
+  tty, so the first redirected run wrote an *empty log for its entire life* and
+  was indistinguishable from a hang — it took a process-tree dump showing a
+  healthy `claude -p` child to tell the difference. `muninn/daemon.py` already
+  records this lesson for `serve`; this is the second long-running command to
+  learn it, and progress is now emitted **before** each session rather than
+  after, so the first line appears immediately.
+
+**Auth is ambient, and that is worth knowing.** `ClaudeCLIProvider` inherits the
+environment, so whether a batch bills a subscription or an API key depends on
+whether `ANTHROPIC_API_KEY` happens to be exported — invisible state deciding a
+billing route, which is the same failure class as tohuw/muninn#7. Not changed
+here (the run was scoped with `env -u` instead), but a candidate for an explicit
+provider option rather than a default anyone has to know about.
 **Read first:** `.valholl/articles/derived-calibration.md` (the gate must be
 derived, not chosen) and `.valholl/articles/provenance-classification.md` (what
 must never be enriched).

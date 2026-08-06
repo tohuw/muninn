@@ -359,11 +359,17 @@ def cmd_enrich(args: argparse.Namespace) -> int:
         print(f"muninn: provider unavailable — {reason}", file=sys.stderr)
         return 2
 
-    print(f"enriching {len(plan.candidates):,} session(s) with "
-          f"{getattr(provider, 'model', '?')} "
-          f"(~{plan.estimated_calls:,} model calls)")
+    # flush=True throughout, and it is not cosmetic. Python block-buffers stdout
+    # when it is not a tty, which is exactly what a redirected long run is — so
+    # the first real enrichment pass wrote an empty log for its entire life and
+    # looked hung. muninn/daemon.py records the same lesson for `serve`; this is
+    # the second place it applies, and both are long-running.
+    _announce(f"enriching {len(plan.candidates):,} session(s) with "
+              f"{getattr(provider, 'model', '?')} "
+              f"(~{plan.estimated_calls:,} model calls)")
     try:
-        result = enrich.enrich_sessions(st, plan.candidates, provider)
+        result = enrich.enrich_sessions(st, plan.candidates, provider,
+                                        progress=_announce)
     except PolicyRefused as exc:
         # A refused model is a statement about the run's configuration, not
         # about one session — retrying it per session would produce thousands of
@@ -373,7 +379,7 @@ def cmd_enrich(args: argparse.Namespace) -> int:
         return 2
     st.close()
 
-    print(f"enriched {result.enriched:,} · failed {result.failed:,}")
+    _announce(f"enriched {result.enriched:,} · failed {result.failed:,}")
     if result.redactions:
         # Reported by kind and count, never by value: the point of naming them
         # is that the user learns their transcripts contain credentials.

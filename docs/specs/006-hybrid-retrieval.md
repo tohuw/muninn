@@ -211,14 +211,22 @@ cleanly); the same suite passes with numpy present; the storage, cosine,
 correlation and fusion paths run end to end over the real 83,745-chunk archive
 with a deterministic hashing embedder standing in for a model.
 
-**Not verified: `muninn/embed_mlx.py` against real weights.** It has never
-downloaded a model or produced a real embedding — the local provider is written
-to the protocol and reviewed, not exercised. What that leaves open is narrow but
-real: the shape and dtype of `mlx_embeddings.generate(...).text_embeds`, and
-whether `DEFAULT_DIM` matches the model named in `DEFAULT_MODEL`. Everything
-downstream of the provider boundary is covered, because a `FakeEmbedder`
-produces the same shapes. Run it on an Apple-silicon machine before trusting
-`--semantic` end to end.
+**`muninn/embed_mlx.py` has now been run against real weights** (this was open
+for one commit; recorded because the shape of the gap is worth keeping). On
+Apple silicon, with `uv sync --extra semantic`:
+
+```
+available(): yes
+loaded + embedded in 8.1s          # includes the one-time weight fetch
+shape=(2, 384) dtype=float32 declared dim=384
+L2 norms: [1.0, 1.0]
+self-similarity 1.0000 · cross-similarity 0.4270
+```
+
+All three unknowns resolved: `mlx_embeddings.generate(...).text_embeds` converts
+to a `(n, dim)` float32 array, `DEFAULT_DIM` matches `DEFAULT_MODEL`, and the
+vectors are exactly unit length — which is the contract `cosine_topk` relies on
+to treat cosine as a plain dot product.
 
 ## Guardrails
 
