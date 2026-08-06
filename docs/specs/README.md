@@ -19,10 +19,14 @@ wiki wins and the contradiction is a bug worth reporting.
 | [008 — Plugin contract](008-plugin-contract.md) | ready | — |
 | [009 — Raven descriptor and `/api/menu`](009-raven-descriptor-menu.md) | implemented | 003 |
 | [010 — The daemon](010-daemon.md) | implemented | 003, 009 |
+| [011 — Survey and calibration](011-survey-calibration.md) | implemented | 001, 003 |
 
-Specs 002 and 003 both modify `muninn/cli.py`, as do 004, 005 and 010. Run
+Specs 002 and 003 both modify `muninn/cli.py`, as do 004, 005, 010 and 011. Run
 overlapping specs sequentially, or in separate git worktrees, so they cannot
 collide.
+
+Spec 011 unblocks **005**: enrichment's gate reads `calibration.json`, and until
+011 landed nothing wrote that file, so 005 could not be implemented as written.
 
 Spec 007 deletes data on purpose and is the most dangerous of the set. Its one
 inviolable rule: never drop prose for a session whose raw source is already gone.

@@ -12,7 +12,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import __version__, agent_install, daemon, exports, ingest, queue, raven, store
+from . import __version__, agent_install, daemon, exports, ingest, queue, raven, store, survey
 from .hooks import install as hooks_install
 from .paths import DB_PATH, QUEUE_DIR, STATE_DIR, default_roots
 from .plugins import discover_plugins
@@ -285,6 +285,73 @@ def _print_export_result(receipt) -> None:
         print("note: absence from a windowed export does not indicate upstream deletion.")
 
 
+def cmd_survey(args: argparse.Namespace) -> int:
+    """Measure the corpus and derive thresholds from it.
+
+    See muninn/survey.py and .valholl/articles/derived-calibration.md. The one
+    thing worth knowing at this layer: an empty archive is a success, not an
+    error. Surveying before ingesting is a normal order of operations, and the
+    answer — "nothing to derive from yet" — is a fact, not a failure.
+
+    ``--dry-run`` prints without writing, because a calibration is a file
+    everything downstream reads: someone should be able to see what a re-survey
+    would change before it changes it.
+    """
+    st = store.open_store(args.db)
+    doc = survey.survey(st, db=args.db, roots=_roots_for(args))
+    st.close()
+
+    path = Path(args.out) if args.out else survey.calibration_path(args.db)
+    if not args.dry_run:
+        survey.write_calibration(doc, path)
+
+    if args.json:
+        print(json.dumps(doc))
+        return 0
+
+    _print_survey(doc, path, wrote=not args.dry_run)
+    return 0
+
+
+def _print_survey(doc: dict, path: Path, *, wrote: bool) -> None:
+    """The human-readable half. Coverage first, threshold second.
+
+    Deliberate ordering: the gate is *derived to hit a coverage target*, and a
+    reader shown "4,046 words" first will read it as the number that matters and
+    compare it against someone else's. The coverage is the intent; the word count
+    is what this corpus happened to need to reach it.
+    """
+    archive = doc["archive"]
+    print(f"archive  {archive['path']}")
+    print(f"         {archive['sessions']:,} sessions · {archive['chunks']:,} chunks")
+
+    if not doc["sources"]:
+        print("\nno sessions yet — nothing to derive. Run `muninn index` first.")
+    for source, report in sorted(doc["sources"].items()):
+        gate = report["enrichment_gate"]
+        print(f"\n[{source}] {report['conversations']:,} conversations · "
+              f"{report['conversation_words']:,} words")
+        for provenance in ("human", "subagent", "tool-invoked"):
+            cls = report["provenance"][provenance]
+            note = "  (excluded from every statistic)" if provenance == "tool-invoked" else ""
+            print(f"  {provenance:13} {cls['sessions']:>6,} sessions "
+                  f"{cls['words']:>10,} words{note}")
+        if gate["sessions"]:
+            print(f"  enrich gate  >= {gate['threshold_words']:,} words -> "
+                  f"{gate['sessions']:,} sessions "
+                  f"({gate['share_of_conversations_pct']:.1f}% of conversations, "
+                  f"{gate['coverage_pct']:.1f}% of text)")
+        else:
+            print("  enrich gate  none derived (no conversation text yet)")
+
+    if doc["anomalies"]:
+        print("\nanomalies")
+        for note in doc["anomalies"]:
+            print(f"  [!] {note}")
+
+    print(f"\n{'wrote' if wrote else 'would write'}  {path}")
+
+
 def cmd_search(args: argparse.Namespace) -> int:
     st = store.open_store(args.db)
     try:
@@ -541,6 +608,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print(f"\nimport lock held by actor {lock['actor']} (pid {lock['pid']}) "
                   f"since {lock['acquired_at']}")
 
+    _print_calibration_section(st, args.db)
     _print_plugins_section()
     _print_policy_section()
     _print_daemon_section()
@@ -548,6 +616,50 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     st.close()
     return 0
+
+
+def _print_calibration_section(st: store.Store, db: str) -> None:
+    """Whether the derived thresholds still describe this corpus (spec 011).
+
+    Three states, kept distinct because they need three different actions and a
+    report that collapses them has told the reader nothing:
+
+    - **Never surveyed** — nothing downstream has thresholds at all.
+    - **Surveyed and current** — the positive answer, stated rather than implied
+      by the absence of a warning. A section that only ever speaks up when
+      something is wrong leaves a reader unable to tell "fine" from "not
+      checked".
+    - **Surveyed and drifted** — with the reasons, because "re-run survey" on
+      its own is an instruction rather than a finding.
+    """
+    path = survey.calibration_path(db)
+    print("\ncalibration (derived thresholds; `muninn survey` writes them)")
+    print(f"  file        {path}")
+    doc = survey.read_calibration(path)
+    if doc is None:
+        if path.exists():
+            print("              present but unreadable, or written by another schema "
+                  "— treat it as never surveyed")
+        else:
+            print("              never surveyed — nothing downstream has derived thresholds")
+        print("              run `muninn survey`")
+        return
+
+    print(f"  surveyed    {doc.get('surveyed_at', '(unrecorded)')}")
+    for source, report in sorted(doc.get("sources", {}).items()):
+        gate = report.get("enrichment_gate", {})
+        if gate.get("sessions"):
+            print(f"  {source:11} enrich gate >= {gate['threshold_words']:,} words "
+                  f"({gate['coverage_pct']:.0f}% of conversation text)")
+
+    reasons = survey.drift(st, doc)
+    if not reasons:
+        print("  drift       none — the thresholds still describe this corpus")
+        return
+    print(f"  WARNING: the calibration no longer describes this archive "
+          f"({len(reasons)} reason(s)); re-run `muninn survey`")
+    for reason in reasons:
+        print(f"           - {reason}")
 
 
 def _print_daemon_section() -> None:
@@ -899,6 +1011,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_doctor = sub.add_parser("doctor", help="report archive health and index lag")
     p_doctor.set_defaults(func=cmd_doctor)
+
+    p_survey = sub.add_parser(
+        "survey", help="measure the corpus and derive thresholds into calibration.json",
+        description="Measure the present corpus and write an inspectable "
+                    "calibration.json beside the archive. Muninn hard-codes no "
+                    "corpus thresholds: a fixed one encodes one person's habits "
+                    "as everyone's defaults — a proposed 300-word enrichment "
+                    "gate selected 37%% of Claude sessions but 91%% of Codex "
+                    "ones on the same machine. Every statistic is scoped to a "
+                    "provenance class, and tool-invoked sessions contribute to "
+                    "none of them. See "
+                    ".valholl/articles/derived-calibration.md.")
+    p_survey.add_argument("--source", choices=("claude", "codex"),
+                          help="measure index lag for this source only")
+    p_survey.add_argument("--out", help="write calibration here instead of beside the archive")
+    p_survey.add_argument("--dry-run", action="store_true",
+                          help="print what would be derived; write nothing")
+    p_survey.add_argument("--json", action="store_true",
+                          help="print the calibration document instead of a report")
+    p_survey.set_defaults(func=cmd_survey)
 
     p_log = sub.add_parser(
         "log", help='reverse-chronological "what did I do last week" view')
