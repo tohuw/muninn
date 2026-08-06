@@ -65,9 +65,11 @@ finding to report, not an obstacle to route around.
 
 ## Conventions
 
-- **Python ≥3.12**, `uv`, `hatchling`. Dependencies stay minimal (`corvidae`,
-  `fastapi`, `uvicorn`, `watchfiles`). Anything ML-shaped goes in the optional
-  `[semantic]` extra — it must not be a default install.
+- **Python ≥3.12**, `uv`, `hatchling`. Runtime dependencies stay minimal —
+  `corvidae` and `watchfiles`, and that is the whole list. Anything ML-shaped
+  goes in the optional `[semantic]` extra; `fastapi`/`uvicorn` live in
+  `[console]` until the console exists, because a default install must not carry
+  a web framework nothing imports (`/api/menu` is stdlib `http.server`).
 - **`corvidae` is the shared raven package**, stdlib-only with zero dependencies
   of its own, pinned to a CalVer year (`>=2026.8.1,<2027`). Muninn *consumes* it
   and never vendors from it: if its surface cannot express something Muninn needs,

@@ -23,8 +23,6 @@ keywords = ["claude", "codex", "transcripts", "search", "agents", "history"]
 # accept the release that is allowed to break us.
 dependencies = [
     "corvidae>=2026.8.1,<2027",
-    "fastapi>=0.115",
-    "uvicorn>=0.30",
     "watchfiles>=0.24",
 ]
 
@@ -35,6 +33,23 @@ dependencies = [
 semantic = [
     "numpy>=2.0",
     "mlx-embeddings>=0.0.3; platform_system == 'Darwin' and platform_machine == 'arm64'",
+]
+
+# The console (unbuilt). fastapi and uvicorn were declared as *runtime*
+# dependencies in anticipation of it and no module ever imported them — spec 009
+# recorded that at the time, and it stayed true: `muninn serve` answers
+# `/api/menu` from stdlib `http.server` (muninn/ravenserve.py), deliberately, so
+# ingest never pays for a menubar.
+#
+# Moved here rather than deleted. Deleting would lose the recorded intent;
+# leaving them in `dependencies` made every `uv sync` install FastAPI, starlette
+# and pydantic to satisfy nothing — a default install carrying a web framework
+# it does not import is the same kind of claim-without-substance the README was
+# just corrected for. When the console lands it moves back, or this extra
+# becomes how you install it.
+console = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
 ]
 
 [project.scripts]
