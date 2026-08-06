@@ -1600,8 +1600,14 @@ def _add_filter_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--source", help="claude, codex, claude-cloud, ...")
     p.add_argument("--since", help="ISO date/prefix: 2026, 2026-07, or 2026-07-31")
     p.add_argument("--until", help="ISO date/prefix, inclusive")
-    p.add_argument("--outcome", choices=("fixed", "abandoned", "ongoing"),
-                   help="wired for spec 005 enrichment; matches nothing until it lands")
+    # Choices come from enrich.OUTCOMES rather than a literal, because the
+    # literal drifted: it was written before spec 005 landed and listed three of
+    # the four values, so `--outcome exploratory` was rejected by argparse while
+    # 261 sessions in the archive carried exactly that outcome. A filter that
+    # cannot express a value the data holds is worse than no filter — it reports
+    # a usage error for a correct query.
+    p.add_argument("--outcome", choices=enrich.OUTCOMES,
+                   help="filter by enriched outcome (see `muninn enrich`)")
 
 
 def main(argv: list[str] | None = None) -> int:

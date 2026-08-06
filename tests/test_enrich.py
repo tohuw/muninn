@@ -538,6 +538,28 @@ class CliTest(_Archive):
         hits = self.st.search("alpha", filters=cli.Filters(outcome="fixed"))
         self.assertEqual([h["session_id"] for h in hits], [fixed])
 
+    def test_every_outcome_the_parser_can_produce_is_filterable(self) -> None:
+        # These drifted apart once and the archive noticed before anyone did:
+        # the CLI listed three of the four values, so `--outcome exploratory`
+        # was an argparse usage error while 261 real sessions carried exactly
+        # that outcome. A filter that cannot express a value the data holds is
+        # worse than no filter.
+        parser = cli.build_parser()
+        for outcome in enrich.OUTCOMES:
+            with self.subTest(outcome=outcome):
+                args = parser.parse_args(["search", "q", "--outcome", outcome])
+                self.assertEqual(args.outcome, outcome)
+
+    def test_each_outcome_round_trips_through_a_real_search(self) -> None:
+        for outcome in enrich.OUTCOMES:
+            sid = self.add(words=5000, text=f"[USER] {'zeta ' * 5000}")
+            self.st.set_facets(sid, Facets(topic="t", outcome=outcome))
+        self.st.commit()
+        for outcome in enrich.OUTCOMES:
+            with self.subTest(outcome=outcome):
+                hits = self.st.search("zeta", filters=cli.Filters(outcome=outcome))
+                self.assertEqual(len(hits), 1, f"{outcome} unreachable")
+
     def test_a_policy_refusal_ends_the_run_rather_than_each_session(self) -> None:
         for _ in range(3):
             self.add(words=5000)
