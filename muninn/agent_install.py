@@ -74,11 +74,25 @@ where login sessions see it (``launchctl setenv``, a systemd user environment
 drop-in) — which is a statement about their machine rather than about this
 install. Recorded in ``docs/specs/010-daemon.md`` so it is discoverable before
 someone spends an afternoon on it.
+
+**What changed after that was written** (tohuw/muninn#7): documenting the
+property was not enough, because the failure is silent and points at the wrong
+data. An install run under a redirected environment produced a daemon that came
+up at every login and ingested the *real* 73 MB archive, behaving correctly by
+its own lights while the operator's expectation was wrong. So the environment is
+now compared rather than only described — see :func:`environment_mismatch`.
+Install refuses on a divergence (``--force`` proceeds, printing what the service
+will actually use), and `doctor` reports one for an already-installed agent,
+which is the case a refusal at install time cannot catch: an environment changed
+*after* a correct install.
 """
 from __future__ import annotations
 
+import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
 from corvidae.login_agent import (
     RUN_KEY,
@@ -89,7 +103,7 @@ from corvidae.login_agent import (
 )
 from corvidae.login_agent import get_login_agent as _select_backend
 
-from . import daemon, paths
+from . import daemon, paths, raven
 
 #: Muninn's launchd label, and the plist filename corvidae derives from it.
 #: Reverse-DNS in the same style as Huginn's ``is.tohuw.huginn`` and **distinct
@@ -269,22 +283,189 @@ def conflicting_ingest_loop(agent: LoginAgent) -> tuple[int | None, str] | None:
     return pid, holder
 
 
+# ── What the service will actually see (tohuw/muninn#7) ──────────────────────
+
+#: Variables that move Muninn's state and that a **login session does not
+#: inherit from the installing shell**. launchd, a systemd user unit and the Run
+#: key all start from the OS's environment, so each of these is present while you
+#: type `muninn install-agent` and absent at 09:00 the next morning.
+#:
+#: ``LOCALAPPDATA`` and ``USERPROFILE`` are deliberately NOT here even though
+#: ``paths.state_dir`` reads the first: Windows sets both for every login
+#: session, so they are not something the service is blind to, and scrubbing
+#: them would manufacture a divergence out of a correctly relocated profile.
+#: The distinction this list encodes is "exported by a shell" versus "provided by
+#: the OS", not "affects a path".
+BLIND_VARS = ("XDG_STATE_HOME", "RAVENS_STATE_DIR", "CODEX_HOME")
+
+
+@dataclass(frozen=True)
+class PathDivergence:
+    """One path the installing shell and a login session disagree about."""
+
+    what: str
+    here: Path
+    at_login: Path
+
+
+@dataclass(frozen=True)
+class EnvironmentMismatch:
+    """Why, and how, an installed agent would read and write somewhere else.
+
+    ``variables`` names the cause and ``paths`` the consequence, kept apart for
+    the reason ``receipt.SourceFacts`` and ``receipt.Delta`` are: a message that
+    blends "you have ``XDG_STATE_HOME`` set" with "the service will write to
+    ``~/.local/state/muninn``" invites the reader to conclude the first caused
+    exactly one of the second, when a single variable moves several paths and a
+    redirected ``$HOME`` moves all of them.
+
+    Falsy when nothing diverges, so callers read as a question.
+    """
+
+    variables: tuple[str, ...] = ()
+    paths: tuple[PathDivergence, ...] = ()
+
+    def __bool__(self) -> bool:
+        return bool(self.paths)
+
+
+def _account_home() -> Path | None:
+    """The home directory a login session gets, independent of ``$HOME``.
+
+    ``$HOME`` is what a shell says; the passwd entry is what the OS will hand
+    launchd. A test harness (and ``HOME=/tmp/x muninn ...``) moves the first and
+    cannot move the second, which is exactly the redirection this needs to see.
+
+    ``None`` when the account cannot be resolved — a container with no passwd
+    entry, say. Callers then fall back to ``$HOME`` and simply never flag a
+    redirected home, which is the right direction to fail: a missed warning is
+    recoverable, a refusal nobody can clear is not.
+    """
+    if sys.platform == "win32":
+        # No passwd database. %USERPROFILE% is itself an environment variable,
+        # so this cannot distinguish a redirected home there — it only avoids
+        # reporting a false one.
+        profile = (os.environ.get("USERPROFILE") or "").strip()
+        return Path(profile) if profile else None
+    try:
+        import pwd
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError):
+        return None
+
+
+def environment_mismatch(env: Mapping[str, str] | None = None,
+                         db: str | Path | None = None) -> EnvironmentMismatch:
+    """Compare the paths this shell resolves against the ones a login session will.
+
+    The comparison is on **resolved paths, not on set variables**, and the
+    difference matters: ``XDG_STATE_HOME=~/.local/state`` is set, blind, and
+    completely harmless, because it names the default. Refusing on the variable
+    would make Muninn uninstallable for anyone whose shell exports XDG paths
+    explicitly — a common and correct thing to do — while catching nothing a
+    path comparison misses.
+
+    ``db`` is the archive `install-agent` was invoked with. The installed unit
+    runs a bare ``muninn serve``, so a ``--db`` given here reaches nothing; that
+    is the same silent mismatch as a redirected variable and is reported the same
+    way rather than ignored because it arrived by a different route.
+    """
+    env = os.environ if env is None else env
+    here_home = Path(env.get("HOME") or Path.home())
+    login_home = _account_home() or here_home
+    login_env = {k: v for k, v in env.items() if k not in BLIND_VARS}
+
+    causes = [name for name in BLIND_VARS if (env.get(name) or "").strip()]
+    if login_home != here_home:
+        causes.append("HOME")
+
+    here_roots = paths.default_roots(env, here_home)
+    login_roots = paths.default_roots(login_env, login_home)
+    candidates = [
+        PathDivergence("archive and queue", paths.state_dir(env, here_home),
+                       paths.state_dir(login_env, login_home)),
+        PathDivergence("raven descriptor", raven.state_dir(env, here_home),
+                       raven.state_dir(login_env, login_home)),
+        *(PathDivergence(f"{source} transcripts", here_roots[source], login_roots[source])
+          for source in sorted(here_roots)),
+    ]
+    if db is not None:
+        # Compared against the login-side archive rather than against this
+        # shell's, so `--db` pointing at the default is not reported as a
+        # divergence merely because some *other* variable moved the default.
+        given = Path(db)
+        at_login = paths.state_dir(login_env, login_home) / "muninn.db"
+        if given != at_login:
+            causes.append("--db")
+            candidates.append(PathDivergence("archive named by --db", given, at_login))
+
+    return EnvironmentMismatch(
+        variables=tuple(dict.fromkeys(causes)),
+        paths=tuple(p for p in candidates if p.here != p.at_login),
+    )
+
+
+def format_mismatch(mismatch: EnvironmentMismatch, indent: str = "        ") -> list[str]:
+    """Render a mismatch as lines: the cause, then each path, here versus at login.
+
+    Returns lines rather than printing them so the install refusal (stderr) and
+    `doctor` (stdout) share one rendering instead of each growing its own. The
+    two facts stay visually separate for the reason the dataclass keeps them
+    apart, and every path is shown as a pair — "your archive is elsewhere" is not
+    actionable without both halves of the comparison.
+    """
+    named = ", ".join(mismatch.variables) or "(nothing this can name)"
+    lines = [f"{indent}set here, unseen at login: {named}"]
+    for div in mismatch.paths:
+        lines.append(f"{indent}{div.what}")
+        lines.append(f"{indent}  here     {div.here}")
+        lines.append(f"{indent}  at login {div.at_login}")
+    return lines
+
+
 def _unsupported() -> int:
     print(f"muninn: start-at-login is not supported on {sys.platform}", file=sys.stderr)
     return 2
 
 
-def install() -> int:
+def install(*, force: bool = False, db: str | Path | None = None) -> int:
     """Install the login agent for this host. Returns a process exit code.
 
     Exit codes are the contract, not the wording — corvidae states outright that
     each backend's printed text may change within a CalVer year, so nothing here
     or in the tests parses a message. 0 installed, 1 refused or the OS mechanism
     failed, 2 no mechanism on this platform.
+
+    ``force`` proceeds through an :func:`environment_mismatch` refusal, and it
+    exists because Muninn cannot tell the two reasons a variable is set apart.
+    Someone who followed the advice above and ran ``launchctl setenv
+    XDG_STATE_HOME ...`` has a login session that *does* see it — and also a
+    shell that inherited it, so it looks identical from here. Refusing them
+    permanently would punish the one user who did the correct thing. The flag
+    still prints the divergence rather than suppressing it: the claim being
+    forced is "I know, and I have arranged for login to agree", which is only
+    meaningful if the reader saw what they were agreeing to.
     """
     agent = get_login_agent()
     if agent is None:
         return _unsupported()
+
+    mismatch = environment_mismatch(db=db)
+    if mismatch:
+        verb = "WARNING: installing anyway" if force else "muninn: refusing to install"
+        print(f"{verb} — this shell's paths are not the ones the service will use.",
+              file=sys.stderr)
+        for line in format_mismatch(mismatch):
+            print(line, file=sys.stderr)
+        if not force:
+            print("        launchd/systemd/the Run key start from the OS's environment, "
+                  "not from here, so the installed daemon would silently ingest the "
+                  "paths on the right.", file=sys.stderr)
+            print("        set them where login sessions see them (`launchctl setenv`, a "
+                  "systemd user environment drop-in), or re-run with --force if you "
+                  "already have.", file=sys.stderr)
+            return 1
 
     conflict = conflicting_ingest_loop(agent)
     if conflict is not None:
@@ -313,14 +494,19 @@ def uninstall() -> int:
 
 
 __all__ = [
+    "BLIND_VARS",
     "DAEMON_RUN_VALUE",
     "LABEL",
     "NAME",
     "REPO_ROOT",
     "RUN_KEY",
     "UNIT_NAME",
+    "EnvironmentMismatch",
+    "PathDivergence",
     "config_location",
     "conflicting_ingest_loop",
+    "environment_mismatch",
+    "format_mismatch",
     "get_login_agent",
     "install",
     "log_path",

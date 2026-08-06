@@ -142,6 +142,14 @@ environment, **not** the shell you installed from, so `XDG_STATE_HOME` and
 `RAVENS_STATE_DIR` exported in a terminal have no effect at login. Set them
 somewhere login sessions see (`launchctl setenv`, a systemd user drop-in).
 
+`install-agent` checks this rather than leaving you to find out from a log file.
+If the paths your shell resolves are not the ones a login session will, it
+refuses and prints both sides — because the failure mode is not an error, it is a
+daemon that comes up every morning ingesting a different archive than you think.
+Pass `--force` if you have already set them where login sees them. `muninn
+doctor` reports the same divergence for an agent that is already installed, which
+catches an environment that changed afterwards.
+
 ## How it works
 
 ### Raw transcripts are the source of truth

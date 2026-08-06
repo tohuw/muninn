@@ -114,6 +114,16 @@ class _TempState(unittest.TestCase):
         self.prior_state_dir = paths.STATE_DIR
         paths.STATE_DIR = self.tmp / "state"
         self.addCleanup(setattr, paths, "STATE_DIR", self.prior_state_dir)
+        # Pin the environment check to "agrees" for every test that is not about
+        # it. ``install()`` and `doctor` both consult the *live* environment, so
+        # a developer or CI runner who exports XDG_STATE_HOME would otherwise
+        # turn every install-reaches-the-backend test red for a reason none of
+        # them are testing. EnvironmentMismatchTest below patches nothing and
+        # drives the real function with synthetic environments instead.
+        clean = patch.object(agent_install, "environment_mismatch",
+                             return_value=agent_install.EnvironmentMismatch())
+        clean.start()
+        self.addCleanup(clean.stop)
 
     def _cleanup(self) -> None:
         import shutil
@@ -872,6 +882,221 @@ class CliTest(unittest.TestCase):
         help_text = cli.build_parser().format_help()
         self.assertIn("install-agent", help_text)
         self.assertIn("uninstall-agent", help_text)
+
+
+# ── The environment the service will not inherit (tohuw/muninn#7) ─────────────
+
+class EnvironmentMismatchTest(unittest.TestCase):
+    """What this shell resolves versus what a login session will.
+
+    Deliberately NOT a ``_TempState`` subclass: that base pins
+    ``environment_mismatch`` to "agrees" so the rest of the suite is not hostage
+    to the developer's exported variables, and inheriting it here would test the
+    stub. These drive the real function with synthetic environments instead,
+    which is also the only way to exercise a redirected ``$HOME`` without
+    redirecting the one running the tests.
+    """
+
+    def setUp(self) -> None:
+        # The home a login session gets. Every "clean" environment below states
+        # it explicitly, because an env dict with no HOME at all falls back to
+        # Path.home() and would quietly agree for the wrong reason.
+        self.home = agent_install._account_home() or Path.home()
+
+    def _clean(self, **extra: str) -> dict[str, str]:
+        return {"HOME": str(self.home), **extra}
+
+    def test_a_clean_environment_diverges_about_nothing(self) -> None:
+        # The other half of every assertion below: a check that reported a
+        # mismatch always would refuse every install on every machine.
+        self.assertFalse(agent_install.environment_mismatch(self._clean()))
+
+    def test_a_redirected_state_home_moves_the_archive_and_the_descriptor(self) -> None:
+        mismatch = agent_install.environment_mismatch(
+            self._clean(XDG_STATE_HOME="/tmp/muninn-elsewhere"))
+        self.assertTrue(mismatch)
+        self.assertIn("XDG_STATE_HOME", mismatch.variables)
+        moved = {d.what for d in mismatch.paths}
+        self.assertIn("archive and queue", moved)
+        # Both, because raven.state_dir reads XDG_STATE_HOME too. A report naming
+        # only the archive would leave the user to discover the descriptor half
+        # by finding Muninn missing from the menubar.
+        self.assertIn("raven descriptor", moved)
+
+    @unittest.skipIf(sys.platform == "win32", "XDG_STATE_HOME is POSIX-only in paths.py")
+    def test_a_variable_set_to_the_default_is_not_a_divergence(self) -> None:
+        # The precision that makes this usable. Exporting XDG paths explicitly is
+        # common and correct; refusing on the *variable* rather than on the
+        # resolved *path* would make Muninn uninstallable for those users while
+        # catching nothing this misses.
+        self.assertFalse(agent_install.environment_mismatch(
+            self._clean(XDG_STATE_HOME=str(self.home / ".local/state"))))
+
+    def test_the_ravens_dir_moves_the_descriptor_alone(self) -> None:
+        # Scoped, not blanket: RAVENS_STATE_DIR does not move the archive, and a
+        # warning that said it did would send someone looking for a database
+        # that never moved.
+        mismatch = agent_install.environment_mismatch(
+            self._clean(RAVENS_STATE_DIR="/tmp/ravens-elsewhere"))
+        self.assertEqual([d.what for d in mismatch.paths], ["raven descriptor"])
+        self.assertEqual(mismatch.variables, ("RAVENS_STATE_DIR",))
+
+    def test_codex_home_moves_only_the_codex_transcripts(self) -> None:
+        mismatch = agent_install.environment_mismatch(
+            self._clean(CODEX_HOME="/tmp/codex-elsewhere"))
+        self.assertEqual([d.what for d in mismatch.paths], ["codex transcripts"])
+
+    def test_a_redirected_home_moves_everything_and_is_named(self) -> None:
+        # The case the sandboxed trial in the issue actually hit. $HOME is not in
+        # BLIND_VARS — it is always set — so it has to be caught by comparing
+        # against the account's real home rather than by looking for a variable.
+        mismatch = agent_install.environment_mismatch({"HOME": "/tmp/not-my-home"})
+        self.assertIn("HOME", mismatch.variables)
+        moved = {d.what for d in mismatch.paths}
+        self.assertEqual(moved, {"archive and queue", "raven descriptor",
+                                 "claude transcripts", "codex transcripts"})
+
+    def test_an_unresolvable_account_never_flags_a_redirected_home(self) -> None:
+        # Failing towards a missed warning rather than towards a refusal nobody
+        # can clear: a container with no passwd entry must still be installable.
+        with patch.object(agent_install, "_account_home", return_value=None):
+            self.assertFalse(agent_install.environment_mismatch({"HOME": "/tmp/anywhere"}))
+
+    def test_a_db_the_service_will_never_open_is_reported(self) -> None:
+        # `muninn --db X install-agent` installs a unit that runs a bare
+        # `muninn serve`, so X reaches nothing. Same silent mismatch, different
+        # route in.
+        mismatch = agent_install.environment_mismatch(self._clean(), db="/tmp/other.db")
+        self.assertIn("--db", mismatch.variables)
+        self.assertIn("archive named by --db", {d.what for d in mismatch.paths})
+
+    def test_the_db_the_service_will_actually_open_is_not_reported(self) -> None:
+        default = agent_install.paths.state_dir(self._clean(), self.home) / "muninn.db"
+        self.assertFalse(agent_install.environment_mismatch(self._clean(), db=default))
+
+    def test_os_provided_variables_are_not_treated_as_blind(self) -> None:
+        # LOCALAPPDATA and USERPROFILE are set by Windows for every login session,
+        # so scrubbing them would manufacture a divergence out of a correctly
+        # relocated profile. The list encodes "exported by a shell" versus
+        # "provided by the OS", not "affects a path".
+        self.assertNotIn("LOCALAPPDATA", agent_install.BLIND_VARS)
+        self.assertNotIn("USERPROFILE", agent_install.BLIND_VARS)
+
+    def test_the_rendering_shows_both_sides_of_every_path(self) -> None:
+        # "Your archive is elsewhere" is not actionable without both halves.
+        mismatch = agent_install.environment_mismatch(
+            self._clean(XDG_STATE_HOME="/tmp/muninn-elsewhere"))
+        text = "\n".join(agent_install.format_mismatch(mismatch))
+        self.assertIn("XDG_STATE_HOME", text)
+        self.assertIn("/tmp/muninn-elsewhere", text)
+        self.assertIn(str(agent_install.paths.state_dir(self._clean(), self.home)), text)
+
+
+class InstallEnvironmentTest(_TempState):
+    """Install refuses a divergence, and ``--force`` proceeds through it."""
+
+    def _diverging(self):
+        return agent_install.EnvironmentMismatch(
+            variables=("XDG_STATE_HOME",),
+            paths=(agent_install.PathDivergence(
+                "archive and queue", Path("/tmp/sandbox/muninn"),
+                Path("/home/real/.local/state/muninn")),))
+
+    def test_install_refuses_and_writes_nothing(self) -> None:
+        # The failure this exists to stop is not an error — it is a daemon that
+        # comes up every login and ingests the real archive while behaving
+        # correctly by its own lights. So the refusal must land before anything
+        # is published, exactly like the lock refusal.
+        agent = self.redirect_agent()
+        with patch.object(agent_install, "environment_mismatch",
+                          return_value=self._diverging()), _quiet() as (_o, err):
+            self.assertEqual(agent_install.install(), 1)
+        self.assertFalse(agent.installed())
+        self.assertEqual(agent.calls, [], "the refusal still shelled out to launchctl")
+        self.assertIn("/tmp/sandbox/muninn", err.getvalue())
+        self.assertIn("/home/real/.local/state/muninn", err.getvalue())
+
+    def test_force_installs_and_still_prints_the_divergence(self) -> None:
+        # The claim being forced is "I know, and I have arranged for login to
+        # agree" — only meaningful if the reader saw what they agreed to.
+        agent = self.redirect_agent()
+        with patch.object(agent_install, "environment_mismatch",
+                          return_value=self._diverging()), _quiet() as (_o, err):
+            self.assertEqual(agent_install.install(force=True), 0)
+        self.assertTrue(agent.installed())
+        self.assertIn("/home/real/.local/state/muninn", err.getvalue())
+
+    def test_force_is_not_needed_when_the_environment_agrees(self) -> None:
+        agent = self.redirect_agent()
+        with _quiet():
+            self.assertEqual(agent_install.install(), 0)
+        self.assertTrue(agent.installed())
+
+    def test_the_cli_passes_force_and_the_archive_through(self) -> None:
+        # A `--force` the parser accepts but the handler drops is worse than no
+        # flag: the user believes they overrode a refusal that is still active.
+        with patch.object(agent_install, "install", return_value=0) as installed:
+            cli.main(["--db", "/tmp/named.db", "install-agent", "--force"])
+        installed.assert_called_once_with(force=True, db="/tmp/named.db")
+
+    def test_the_environment_check_runs_before_the_lock_check(self) -> None:
+        # Both refuse with 1, so order is only observable in the message. The
+        # environment is the more surprising of the two and the one the user
+        # cannot see for themselves, so it leads.
+        self.redirect_agent()
+        lock = daemon.SingleInstance(daemon.lock_path(), holder=daemon.HOLDER_WATCH)
+        self.assertTrue(lock.acquire())
+        self.addCleanup(lock.release)
+        with patch.object(agent_install, "environment_mismatch",
+                          return_value=self._diverging()), _quiet() as (_o, err):
+            self.assertEqual(agent_install.install(), 1)
+        self.assertIn("at login", err.getvalue())
+        self.assertNotIn("already running", err.getvalue())
+
+
+class DoctorEnvironmentTest(_TempState):
+    """`doctor` catches the case a refusal cannot: an environment changed later."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.agent = self.redirect_agent()
+
+    def _report(self) -> str:
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            cli._print_daemon_section()
+        return buffer.getvalue()
+
+    def _install(self) -> None:
+        self.agent.spec.plist.parent.mkdir(parents=True, exist_ok=True)
+        self.agent.spec.plist.write_text("<plist/>")
+
+    def _diverging(self):
+        return agent_install.EnvironmentMismatch(
+            variables=("RAVENS_STATE_DIR",),
+            paths=(agent_install.PathDivergence(
+                "raven descriptor", Path("/tmp/sandbox/ravens"),
+                Path("/home/real/.local/state/ravens")),))
+
+    def test_an_installed_agent_with_a_diverging_environment_warns(self) -> None:
+        self._install()
+        with patch.object(agent_install, "environment_mismatch",
+                          return_value=self._diverging()):
+            report = self._report()
+        self.assertIn("WARNING", report)
+        self.assertIn("/home/real/.local/state/ravens", report)
+
+    def test_no_warning_when_nothing_is_installed(self) -> None:
+        # With no agent there is no second environment to disagree with, and a
+        # redirected shell is then simply a redirected shell — which is what the
+        # rest of this suite runs in.
+        with patch.object(agent_install, "environment_mismatch",
+                          return_value=self._diverging()):
+            self.assertNotIn("WARNING", self._report())
+
+    def test_no_warning_when_the_environment_agrees(self) -> None:
+        self._install()
+        self.assertNotIn("WARNING", self._report())
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

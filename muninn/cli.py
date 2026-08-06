@@ -448,8 +448,14 @@ def cmd_install_agent(args: argparse.Namespace) -> int:
     The exit code is the contract and the printed wording is not — corvidae says
     so explicitly about its own backends' output, which may change within a CalVer
     year. 0 installed, 1 refused or the OS mechanism failed, 2 no mechanism here.
+
+    ``args.db`` is passed down so a ``muninn --db X install-agent`` is reported as
+    the mismatch it is. The installed unit runs a bare ``muninn serve``, so that
+    flag reaches nothing — accepting it silently would install an agent that
+    ingests a different archive than the one the operator just named, which is
+    the same failure as a redirected variable arriving by a different route.
     """
-    return agent_install.install()
+    return agent_install.install(force=args.force, db=args.db)
 
 
 def cmd_uninstall_agent(args: argparse.Namespace) -> int:
@@ -643,8 +649,31 @@ def _print_login_agent_line() -> None:
         # $XDG_CONFIG_HOME, say) is the same invisible-mismatch failure the
         # descriptor line exists to prevent.
         print(f"  at login    installed · {agent.label} · {agent_install.config_location(agent)}")
+        _print_environment_divergence()
     else:
         print(f"  at login    not installed — `muninn install-agent` adds a {agent.label}")
+
+
+def _print_environment_divergence() -> None:
+    """Warn when the installed agent reads and writes somewhere this shell does not.
+
+    Reported only for an *installed* agent, because with none installed there is
+    no second environment for this one to disagree with — a redirected shell is
+    then simply a redirected shell, which is a normal thing to run tests in.
+
+    This is the half of tohuw/muninn#7 that the install-time refusal cannot
+    cover. A refusal answers "is this install about to be wrong"; it says nothing
+    about an environment that changed afterwards, or an agent installed by an
+    earlier version that had no check at all. Both surface here, at the moment
+    someone is already asking what state Muninn is in.
+    """
+    mismatch = agent_install.environment_mismatch()
+    if not mismatch:
+        return
+    print("  WARNING: the installed agent does not inherit this shell's environment, so "
+          "it uses different paths")
+    for line in agent_install.format_mismatch(mismatch, indent="           "):
+        print(line)
 
 
 def _epoch_to_iso(value: object) -> str:
@@ -843,7 +872,14 @@ def build_parser() -> argparse.ArgumentParser:
                     "entry (start only; it is not a supervisor). Refuses while "
                     "another ingest loop holds the single-instance lock, because "
                     "supervising a process that exits immediately is a restart "
-                    "loop rather than a service.")
+                    "loop rather than a service. Refuses too when this shell's "
+                    "paths are not the ones a login session resolves, since the "
+                    "service does not inherit your environment.")
+    p_install_agent.add_argument(
+        "--force", action="store_true",
+        help="install even though this shell's paths differ from the ones the "
+             "service will use — for when you have already set them where login "
+             "sessions see them. The divergence is still printed.")
     p_install_agent.set_defaults(func=cmd_install_agent)
 
     p_uninstall_agent = sub.add_parser(
