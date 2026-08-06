@@ -62,7 +62,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 # ── Protocol version ──────────────────────────────────────────────────────────
 
@@ -159,7 +159,7 @@ def safe_label(value: object, limit: int = MAX_LABEL) -> str:
 
 # ── Where the descriptor goes ─────────────────────────────────────────────────
 
-def state_dir() -> Path:
+def state_dir(env: Mapping[str, str] | None = None, home: Path | None = None) -> Path:
     """Return the *shared* raven descriptor directory.
 
     Resolution order, which every participant must implement identically:
@@ -178,16 +178,23 @@ def state_dir() -> Path:
 
     The rule mirrors Appistry's ``paths``/``ravens`` resolution byte for byte,
     and that identity is the contract rather than either project's preference.
+
+    ``env``/``home`` default to the live process and exist for one caller:
+    ``agent_install`` asks where this resolves for a login session that does not
+    inherit the installing shell. The resolution order above is unaffected —
+    only *which* environment it reads.
     """
-    override = os.environ.get(STATE_DIR_ENV, "").strip()
+    env = os.environ if env is None else env
+    home = Path.home() if home is None else home
+    override = (env.get(STATE_DIR_ENV) or "").strip()
     if override:
         return Path(override).expanduser()
     if sys.platform == "win32":
-        local = os.environ.get("LOCALAPPDATA", "").strip()
-        base = Path(local) if local else Path.home() / "AppData" / "Local"
+        local = (env.get("LOCALAPPDATA") or "").strip()
+        base = Path(local) if local else home / "AppData" / "Local"
         return base / "Ravens"
-    xdg = os.environ.get("XDG_STATE_HOME", "").strip()
-    base = Path(xdg) if xdg else Path.home() / ".local" / "state"
+    xdg = (env.get("XDG_STATE_HOME") or "").strip()
+    base = Path(xdg) if xdg else home / ".local" / "state"
     return base / "ravens"
 
 

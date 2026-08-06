@@ -21,14 +21,19 @@ this run" can never be misread as "nothing new in this source". See
 from __future__ import annotations
 
 import datetime as dt
+import enum
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import sources
 from .digest import digest_file, digest_tree
 from .receipt import Attribution, Delta, ImportReceipt, Outcome, Skip, SkipReason, SourceFacts
 from .store import Store
+
+if TYPE_CHECKING:  # annotations only — muninn.plugins is the socket, not a dependency
+    from . import plugins
 
 # Ledger source_kind vocabulary is broader than the "claude"/"codex" identifiers
 # used elsewhere in this module (which predate the ledger and are also the
@@ -613,6 +618,105 @@ def _reconcile_missing(st: Store, source: str, now: str, *, windowed: bool = Fal
             st.mark_source_missing(row["session_id"])
             marked += 1
     return marked
+
+
+# ── Contributed history: absence, decided by core (tohuw/muninn#1) ───────────
+
+class ReconcileOutcome(str, enum.Enum):
+    """Why a reconciliation pass did what it did. Closed, like every other enum here.
+
+    A caller branches on this instead of inferring from a count, for the reason
+    ``receipt.Outcome`` exists: "0 marked" is produced by a healthy remote that
+    lost nothing, by a source that declined to enumerate, and by a windowed
+    source that is not allowed to — three facts that need three different
+    responses and are indistinguishable as an integer.
+    """
+
+    RECONCILED = "reconciled"          # the source enumerated; the diff was applied
+    ABSTAINED = "abstained"            # None, no method, or a raise: nothing flagged
+    REFUSED_WINDOWED = "refused-windowed"  # absence from a window proves nothing
+
+
+@dataclass(frozen=True)
+class ReconcileResult:
+    """What one pass over a contributed source concluded.
+
+    ``marked`` is the session ids themselves, not a tally. "Enumerate, don't
+    count" applies with more force here than anywhere: every silent skip in the
+    predecessor tools was a data-loss path nobody noticed, and this is the one
+    operation in the codebase that changes a row's meaning on the strength of a
+    third party's say-so.
+    """
+
+    outcome: ReconcileOutcome
+    vouched: int = 0
+    marked: tuple[str, ...] = ()
+
+
+def reconcile_history_source(st: Store, source: "plugins.HistorySource",
+                             context: "plugins.SourceContext") -> ReconcileResult:
+    """Ask a contributed source what it still sees; record the rest as gone.
+
+    The archive-safety half of ``HistorySource``. The plugin says *what it
+    sees*; this function decides *what absence means* — and it means
+    ``source_present = 0``, never a delete, because the archived prose may be
+    the only surviving copy (.valholl/articles/archive-of-record.md). Keeping
+    that decision here rather than in the protocol is the entire reason
+    ``reconcile()`` returns keys instead of taking a ``Store``: a plugin author
+    cannot get the rule wrong if they are never handed the means to.
+
+    Three refusals, each a different kind of "not enough information":
+
+    - **Windowed source** — invariant 6, the same one ``_reconcile_missing``
+      enforces for export importers. A source that only ever sees 30 days cannot
+      distinguish "deleted upstream" from "older than my window".
+    - **``None``, or no ``reconcile`` at all** — the source declined. An older
+      plugin written before this method existed lands here, which is why adding
+      it needed no ``API_VERSION`` bump.
+    - **A raised exception** — treated as ``None``. An unreachable remote must
+      cost a pass, never a mass reclassification of everything it contributed.
+      The exception is not stored or rendered, per the no-exception-messages
+      rule; the outcome enum carries everything a caller may act on.
+
+    Scoped to ``context.namespace_prefix()``, so one source can only ever speak
+    for the id space it was given. The prefix is escaped for ``LIKE`` because
+    ``source`` is a plugin-supplied string and ``_`` is a single-character
+    wildcard there — an unescaped ``plugin:a_c.x:`` would also match
+    ``plugin:abc.x:``, which is one plugin flagging another's sessions.
+    """
+    if getattr(source, "windowed", False):
+        return ReconcileResult(ReconcileOutcome.REFUSED_WINDOWED)
+
+    reconcile = getattr(source, "reconcile", None)
+    if reconcile is None:
+        return ReconcileResult(ReconcileOutcome.ABSTAINED)
+    try:
+        vouched_ids = reconcile(context)
+        if vouched_ids is None:
+            return ReconcileResult(ReconcileOutcome.ABSTAINED)
+        vouched = {context.namespaced_id(str(key)) for key in vouched_ids}
+    except Exception:  # noqa: BLE001 - a third-party client; see docstring
+        return ReconcileResult(ReconcileOutcome.ABSTAINED)
+
+    prefix = context.namespace_prefix()
+    rows = st.conn.execute(
+        "SELECT session_id FROM sessions "
+        r"WHERE session_id LIKE ? ESCAPE '\' AND source_present = 1",
+        (_like_prefix(prefix),),
+    ).fetchall()
+    marked = tuple(row["session_id"] for row in rows if row["session_id"] not in vouched)
+    for session_id in marked:
+        st.mark_source_missing(session_id)
+    if marked:
+        st.commit()
+    return ReconcileResult(ReconcileOutcome.RECONCILED, vouched=len(vouched), marked=marked)
+
+
+def _like_prefix(prefix: str) -> str:
+    r"""``prefix`` as a ``LIKE`` pattern with ``\`` as the escape character."""
+    for char in ("\\", "%", "_"):
+        prefix = prefix.replace(char, "\\" + char)
+    return prefix + "%"
 
 
 def index_lag(st: Store, roots: dict[str, Path]) -> dict[str, dict[str, object]]:

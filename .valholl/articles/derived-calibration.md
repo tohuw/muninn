@@ -79,16 +79,54 @@ Rule: **calibrate from the source of truth, never from a derived artifact** —
 and report index lag so staleness is visible rather than silently biasing the
 result. See [[continuous-ingest-not-periodic]].
 
+### The rule is about staleness, not indirection
+
+`muninn survey` as implemented surveys **the archive**, which is itself derived,
+and that is not a violation. The prose-index failure above was not caused by
+indirection: it was caused by the index being seven days behind while 149 newer
+transcripts sat unindexed. Muninn's archive is ingested *from* raw transcripts,
+holds sessions whose raw files have since been swept, and is already
+provenance-classified and deduplicated — a better input than a re-walk, and a far
+faster one.
+
+What it can still be is behind. So index lag is measured on every survey and
+recorded **inside `calibration.json`**, raised as an anomaly there. Staleness
+travels attached to the number it invalidates rather than filed in a separate
+report nobody reads at the same moment.
+
 ## Re-survey on drift
 
 The survey is not one-shot. `muninn doctor` recommends re-running when:
 
-- p95 query latency regresses past a threshold
+- p95 query latency regresses past a threshold — **not implemented**; it needs a
+  benchmark harness rather than a query, and a silently missing check would be
+  worse than an admitted one
 - corpus has grown ≥2x since the last calibration
 - source mix shifts materially (e.g. a user moves from Claude to Codex)
 - the gate now selects a materially different fraction than its coverage intent
 - **provenance mix changes** — a new tool starts making `claude -p` calls
 - index lag exceeds its threshold (see [[continuous-ingest-not-periodic]])
+
+### Compare drift against what the gate *did*, never against its target
+
+Worth recording because the implementation got it wrong first. The gate is the
+*smallest* set of conversations reaching the target, so **it always overshoots**:
+a lone 5,000-word conversation covers 100% of an 85% target. Checking achieved
+coverage against the target therefore reports a correct, freshly written
+calibration as already drifted — and does it worst on exactly the small corpora
+where a survey is most tentative and its output most likely to be doubted.
+
+The stored calibration records what the gate achieved when it was derived, and
+drift is the distance from *that*. Two axes, because they fail independently:
+
+| axis | catches |
+|---|---|
+| coverage % | the gate no longer covers the text it was derived to cover |
+| share of conversations % | coverage is unmoved (~99% either way) while selection went 60% → 97%, so the enrichment cost bound is gone |
+
+A single axis would have missed the second case entirely, which is the more
+likely one: adding long conversations barely moves coverage and changes what
+enrichment costs completely.
 
 ## Validation that this works
 

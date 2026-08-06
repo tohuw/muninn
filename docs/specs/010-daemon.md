@@ -502,6 +502,42 @@ not from #41's own scope, which was the model-policy chokepoint. A user who genu
 where login sessions see it (`launchctl setenv`, a systemd user environment
 drop-in), which is a statement about their machine rather than about this install.
 
+**Amended (tohuw/muninn#7): documented is not enough — the divergence is now
+detected.** Recording the property left the failure exactly as silent as before,
+and silent is the whole problem: the daemon comes up at every login, ingests the
+real archive, and is behaving correctly by its own lights while only the
+operator's expectation is wrong. So `install-agent` now *compares* the paths this
+shell resolves against the ones a login session will, refuses on a difference,
+and prints both sides. The `EnvironmentVariables` prohibition below is unchanged
+and is what makes comparison the only available fix.
+
+Three properties are load-bearing:
+
+- **Compare resolved paths, never set variables.** `XDG_STATE_HOME` pointing at
+  its own default is set, blind, and harmless. Refusing on the variable would
+  make Muninn uninstallable for anyone whose shell exports XDG paths explicitly
+  — common, correct, and catching nothing the path comparison misses.
+- **`--force` exists, and still prints.** Muninn cannot distinguish "exported in
+  this terminal" from "set machine-wide with `launchctl setenv`, and therefore
+  inherited by this terminal". Refusing permanently would punish precisely the
+  user who followed the advice above. The flag claims "I know, and login agrees";
+  it does not suppress the evidence.
+- **`doctor` reports it too**, for an *installed* agent. That is the half a
+  refusal cannot cover: an environment changed after a correct install, or an
+  agent installed by a version that had no check.
+
+`$HOME` is not on the blind list — it is always set — so a redirected home is
+caught by comparing against the account's passwd entry instead. `LOCALAPPDATA`
+and `USERPROFILE` are deliberately *off* the list: Windows provides both to every
+login session, so scrubbing them would manufacture a divergence out of a
+correctly relocated profile. The distinction is "exported by a shell" versus
+"provided by the OS", not "affects a path".
+
+A `muninn --db X install-agent` is reported the same way. The unit runs a bare
+`muninn serve`, so `X` reaches nothing — the same silent mismatch arriving by a
+different route, and accepting it quietly would install an agent that ingests a
+different archive than the one just named.
+
 ### `doctor`
 
 The existing `daemon` section gains a fourth fact rather than a competing section

@@ -1,10 +1,17 @@
 # Spec 005 — Index-time enrichment
 
-**Status:** ready to implement after 001 and 004
+**Status:** ready to implement after 001, 004 and **011**
 **Owner of design:** planned by Opus, implemented by Sonnet
 **Read first:** `.valholl/articles/derived-calibration.md` (the gate must be
 derived, not chosen) and `.valholl/articles/provenance-classification.md` (what
 must never be enriched).
+
+> **Unblocked by spec 011.** This spec's gate reads `calibration.json`, and until
+> [011](011-survey-calibration.md) landed nothing wrote that file — so 005 could
+> not be implemented as written, only approximated with a constant, which is the
+> one thing it must not do. `muninn.survey` now provides the per-source
+> threshold, its `share_of_conversations_pct` (the cost bound), and a `doctor`
+> drift check for when it stops describing the corpus.
 
 ## Why
 
