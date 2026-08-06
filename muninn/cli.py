@@ -12,7 +12,19 @@ import json
 import sys
 from pathlib import Path
 
-from . import __version__, agent_install, daemon, exports, ingest, queue, raven, store, survey
+from . import (
+    __version__,
+    agent_install,
+    daemon,
+    exports,
+    ingest,
+    prose_index,
+    queue,
+    raven,
+    resume,
+    store,
+    survey,
+)
 from .hooks import install as hooks_install
 from .paths import DB_PATH, QUEUE_DIR, STATE_DIR, default_roots
 from .plugins import discover_plugins
@@ -285,6 +297,59 @@ def _print_export_result(receipt) -> None:
         print("note: absence from a windowed export does not indicate upstream deletion.")
 
 
+def cmd_backfill(args: argparse.Namespace) -> int:
+    """Ingest a claudex/codexdex prose index (tohuw/muninn#6).
+
+    A separate verb from `import` on purpose. `import` takes a vendor export —
+    something you downloaded, which the vendor still has. This takes a
+    predecessor's *archive*, which for much of its span is the only surviving
+    copy of the transcripts it covers, and it is a one-time migration rather
+    than a recurring operation. Naming it separately keeps "I am moving the old
+    tool's data in" from reading like "I am re-importing a download".
+
+    With no path, the known predecessor locations are used — but only those that
+    actually hold prose files, so an empty `~/.codexdex` (a real state: codexdex
+    was never run on the development machine before Muninn existed) is reported
+    as "not found" rather than as a source with nothing in it.
+    """
+    if args.path:
+        candidates = [prose_index.ProseIndexCandidate(
+            Path(p).expanduser(), args.source or "claude") for p in args.path]
+    else:
+        candidates = prose_index.find_prose_indexes()
+        if not candidates:
+            print("no prose index found — looked for "
+                  + ", ".join(f"~/{name}" for name, _ in prose_index.KNOWN_ROOTS))
+            return 1
+
+    st = store.open_store(args.db)
+    receipts = []
+    for candidate in candidates:
+        files = prose_index.discover(candidate.path)
+        if not files:
+            if not args.json:
+                print(f"{candidate.path}: no prose files under index/ or cloud/index/")
+            continue
+        receipt = prose_index.import_prose_index(
+            st, candidate.path, default_source=candidate.default_source, actor=args.actor)
+        receipts.append(receipt)
+        if not args.json:
+            print(f"\n{candidate.path}")
+            _print_export_result(receipt)
+    st.close()
+
+    if args.json:
+        print(json.dumps([r.to_dict() for r in receipts]))
+    elif receipts:
+        # The reason this command exists, said plainly. Someone runs it in order
+        # to decide whether the predecessors can be retired, and that decision
+        # needs the archive-of-record framing rather than a count.
+        print("\nThese sessions are recorded as having no surviving raw transcript. "
+              "Keep the predecessor indexes until you have verified the archive holds "
+              "what they did.")
+    return 0
+
+
 def cmd_survey(args: argparse.Namespace) -> int:
     """Measure the corpus and derive thresholds from it.
 
@@ -471,6 +536,76 @@ def cmd_show(args: argparse.Namespace) -> int:
     print(st.session_text(sid))
     st.close()
     return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    """Reopen a past session in the tool that created it, or say why not.
+
+    Prints by default and executes only under ``--exec``. Printing is safer and
+    composable — the line can be read, edited, or piped — and executing hands
+    the terminal to another interactive program, which is a bigger thing to do
+    on a prefix match than on an explicit request.
+
+    Exit codes carry the answer, because an agent runs this: 0 resumable, 1 no
+    session matched, 3 matched but not resumable. The third is separate from the
+    second on purpose — "I could not find it" and "I found it and its transcript
+    is gone" lead to completely different next moves, and the second is the
+    common case as the archive outlives its sources.
+    """
+    st = store.open_store(args.db)
+    rows = st.conn.execute(
+        "SELECT session_id FROM sessions WHERE session_id LIKE ? ORDER BY session_id",
+        (args.session_id + "%",)).fetchall()
+    if not rows:
+        print(f"no session matching {args.session_id!r}", file=sys.stderr)
+        st.close()
+        return 1
+    if len(rows) > 1:
+        print(f"{len(rows)} sessions match {args.session_id!r}:", file=sys.stderr)
+        for row in rows[:20]:
+            print(f"  {row['session_id']}", file=sys.stderr)
+        st.close()
+        return 1
+
+    rec = st.get_session(rows[0]["session_id"]) or {}
+    plan = resume.plan(rec)
+    st.close()
+
+    if args.json:
+        print(json.dumps({
+            "session_id": plan.session_id, "source": plan.source, "cwd": plan.cwd,
+            "resumable": plan.command is not None, "command": plan.command,
+            "shell": plan.shell(), "refusal": plan.refusal,
+        }))
+        return 0 if plan.command is not None else 3
+
+    when = (rec.get("started_at") or "")[:10] or "?"
+    print(f"{plan.session_id}  {plan.source}  {when}  {plan.cwd or '-'}")
+    if plan.refusal is not None:
+        # Never emit a command that will fail with the vendor's own error, which
+        # says nothing about why. See muninn/resume.py.
+        print(f"\nnot resumable: {plan.refusal}.", file=sys.stderr)
+        print(f"The archived transcript is still here: "
+              f"`muninn show {plan.session_id[:8]}`", file=sys.stderr)
+        return 3
+
+    print(f"\n{plan.shell()}")
+    if not args.exec_:
+        return 0
+
+    if plan.cwd and not Path(plan.cwd).is_dir():
+        # The session's directory can be gone while its transcript survives.
+        # Refusing beats letting the tool start in whatever directory this
+        # happens to be, which would resume the right session in the wrong repo.
+        print(f"\nrefusing to run: {plan.cwd} no longer exists", file=sys.stderr)
+        return 3
+    import subprocess
+
+    try:
+        return subprocess.call(plan.command, cwd=plan.cwd)
+    except OSError as exc:
+        print(f"\ncould not run {plan.command[0]!r}: {type(exc).__name__}", file=sys.stderr)
+        return 3
 
 
 def cmd_install_hooks(args: argparse.Namespace) -> int:
@@ -1009,6 +1144,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_show.add_argument("session_id")
     p_show.set_defaults(func=cmd_show)
 
+    p_resume = sub.add_parser(
+        "resume", help="reopen a past session in the tool that created it",
+        description="Print the invocation that reopens a session, from the "
+                    "directory it ran in. Refuses rather than emitting a "
+                    "command that will fail: most of what this archive holds "
+                    "cannot be resumed, because the vendor swept the transcript "
+                    "after 30 days and the archive is now the only copy. Exit 0 "
+                    "resumable, 1 no match, 3 matched but not resumable.")
+    p_resume.add_argument("session_id", help="full id or a prefix")
+    p_resume.add_argument("--exec", dest="exec_", action="store_true",
+                          help="run the command instead of printing it")
+    p_resume.add_argument("--json", action="store_true")
+    p_resume.set_defaults(func=cmd_resume)
+
     p_doctor = sub.add_parser("doctor", help="report archive health and index lag")
     p_doctor.set_defaults(func=cmd_doctor)
 
@@ -1031,6 +1180,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_survey.add_argument("--json", action="store_true",
                           help="print the calibration document instead of a report")
     p_survey.set_defaults(func=cmd_survey)
+
+    p_backfill = sub.add_parser(
+        "backfill", help="ingest a claudex/codexdex prose index (one-time migration)",
+        description="Backfill the predecessors' prose indexes. Muninn supersedes "
+                    "claudex and codexdex, but their indexes are archives too: "
+                    "they cover sessions whose raw transcripts the vendor swept "
+                    "months ago, and that data exists nowhere else. Backfilled "
+                    "sessions are recorded with origin='prose-index' and never "
+                    "overwrite a richer raw-derived session — that decision is "
+                    "recorded per item as `superseded-by-richer-origin`, not "
+                    "silently taken. Defaults to ~/.claudex and ~/.codexdex.")
+    p_backfill.add_argument("path", nargs="*",
+                            help="index root(s) (default: the known predecessors)")
+    p_backfill.add_argument("--source", help="source to attribute files that do not "
+                                             "name one (default: claude)")
+    p_backfill.add_argument("--actor", default="cli")
+    p_backfill.add_argument("--json", action="store_true",
+                            help="print only the machine-readable import receipt(s)")
+    p_backfill.set_defaults(func=cmd_backfill)
 
     p_log = sub.add_parser(
         "log", help='reverse-chronological "what did I do last week" view')

@@ -20,6 +20,8 @@ wiki wins and the contradiction is a bug worth reporting.
 | [009 — Raven descriptor and `/api/menu`](009-raven-descriptor-menu.md) | implemented | 003 |
 | [010 — The daemon](010-daemon.md) | implemented | 003, 009 |
 | [011 — Survey and calibration](011-survey-calibration.md) | implemented | 001, 003 |
+| [012 — Prose-index backfill](012-prose-index-backfill.md) | implemented | 001 |
+| [013 — `muninn resume`](013-resume.md) | implemented | 004 |
 
 Specs 002 and 003 both modify `muninn/cli.py`, as do 004, 005, 010 and 011. Run
 overlapping specs sequentially, or in separate git worktrees, so they cannot
