@@ -1,9 +1,9 @@
 # muninn
 
 A local-only console for **agent history** — what your AI agents did, across
-Claude Code, Codex, and vendor data exports. Fast hybrid search, correlation of
-similar conversations, quick resume, and context briefs that read equally well
-to humans and agents.
+Claude Code, Codex, and vendor data exports. Fast search, quick resume, and — as
+they land — correlation of similar conversations and context briefs that read
+equally well to humans and agents.
 
 _Developed with AI assistance. See the git history for which agents contributed._
 
@@ -13,9 +13,10 @@ decide, and learn." They are complementary and share a single menubar surface �
 [Roost](https://github.com/tohuw/roost) — because nobody wants two ravens up
 there.
 
-> **Status: early.** The storage and ingest foundation works and is covered by
-> tests. Search is minimal, enrichment and the console are not built yet. See
-> [Roadmap](#roadmap).
+> **Status: early.** Storage, ingest, the daemon, search with structured
+> filters, and corpus calibration all work and are covered by tests. Enrichment,
+> semantic retrieval and the console are not built yet — so `--outcome` matches
+> nothing and there is no `--semantic`. See [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -57,14 +58,29 @@ uv run muninn index
 
 # Search the archive.
 uv run muninn search "extension point"
-uv run muninn search "auth redirect" --since 2026-06
+uv run muninn search "auth redirect" --since 2026-06 --repo muninn
+
+# What did I do last week, in order.
+uv run muninn log --since 2026-07
+
+# Read one session in full (id prefixes are fine).
+uv run muninn show a7efca23
+
+# Reopen a session in the tool that created it — if its transcript still exists.
+uv run muninn resume a7efca23
+
+# Import a claude.ai or ChatGPT data export.
+uv run muninn import ~/Downloads/data-2026-08-01.zip
 
 # Survey your corpus and derive calibration (see below).
 uv run muninn survey
 
-# Health, including whether the daemon is running and on what port.
+# Health: index lag, queue, calibration drift, daemon and login-agent state.
 uv run muninn doctor
 ```
+
+Coming from `claudex` or `codexdex`? `uv run muninn backfill` ingests their prose
+indexes — see [Superseding the predecessors](#superseding-the-predecessors).
 
 ### Run the daemon
 
@@ -87,6 +103,14 @@ Only one ingest loop may run at a time — a second is refused, naming the first
 because two loops would drain one queue twice and fight over one descriptor.
 `muninn index --watch` is still the foreground/debug path: the same ingest loop
 with no port and no state file, for watching ingest happen on a console.
+
+```sh
+uv run muninn install-hooks          # a SessionEnd hook, so a session is queued
+uv run muninn install-hooks --check  # the moment it ends. --check never writes.
+```
+
+The hook only ever *enqueues*: it shares a 1.5 s budget with every other
+`SessionEnd` hook, so it must not open the archive. The daemon drains the queue.
 
 See [`docs/specs/010-daemon.md`](docs/specs/010-daemon.md).
 
@@ -185,17 +209,23 @@ tool's call volume.
 ### Thresholds are derived, never hard-coded
 
 `muninn survey` measures your *present* corpus and writes an inspectable
-`calibration.json`. Everything downstream reads it.
+`calibration.json` beside the archive.
 
 A fixed threshold encodes one person's habits as everyone's defaults. A proposed
 "enrich sessions ≥300 words" rule selected 37% of Claude sessions but 91% of
 Codex sessions — the same constant meaning two different policies depending on
 which agent you favor. Derived gates on the same corpus landed at 4,046 and
-2,480 words respectively, both hitting ~85% text coverage.
+2,480 words respectively, both hitting ~85% text coverage. What is held fixed is
+the **coverage**; the word count is whatever your corpus needs to reach it.
 
-`muninn doctor` recommends re-surveying when the corpus shape drifts: query
-latency regresses, the corpus doubles, the source or provenance mix shifts, or
-index lag exceeds its threshold.
+Every statistic is scoped to a provenance class, and the survey's first act is to
+report what is strange about your data — a tool-invoked majority, a source with
+no human sessions, sessions whose only copy is the archive.
+
+`muninn doctor` recommends re-surveying when the corpus shape drifts: the corpus
+doubles, a source appears, the source mix shifts, or the stored gate stops doing
+what it was derived to do. (Query-latency regression is named in the design notes
+and is **not** measured — it needs a benchmark harness.)
 
 ### Search
 
@@ -204,9 +234,12 @@ SQLite FTS5 over prose chunks. Measured on a real corpus: **0.8 s to index, 33 M
 while broad `OR` queries degraded linearly to 45 ms — which is why query
 expansion is capped rather than unbounded.
 
-Semantic recall is optional and pluggable via an `EmbeddingProvider` protocol.
-Brute-force numpy cosine is ~2 ms at 60k chunks × 1024 dims, so **no vector
-database is ever needed**; the only real cost is generating embeddings once.
+Semantic recall is designed to be optional and pluggable via an
+`EmbeddingProvider` protocol. **The protocol exists; no provider ships in this
+package**, so there is no `--semantic` flag yet — search today is lexical.
+Measured for when it lands: brute-force numpy cosine is ~2 ms at 60k chunks ×
+1024 dims, so **no vector database is ever needed**; the only real cost is
+generating the embeddings once.
 
 ## Roadmap
 
@@ -215,17 +248,34 @@ database is ever needed**; the only real cost is generating embeddings once.
 - [x] Background indexer: `SessionEnd` hook + watcher + reconciling sweep
 - [x] Daemon (`muninn serve`) owning ingest, the menubar raven, and clean shutdown
 - [x] Login-agent installer (launchd / systemd / Windows), via the shared `corvidae` package
-- [ ] Structured filters: `--repo --branch --file --tool --model --outcome`
-- [ ] `muninn doctor` — index lag, parse health, calibration drift
+- [x] Structured filters: `--repo --branch --file --tool --model --provenance --source --since --until`, plus `muninn log`
+- [x] `muninn doctor` — index lag, parse health, queue depth, ledger tail, calibration drift
+- [x] `muninn survey` — derived thresholds in an inspectable `calibration.json`
+- [x] Prose-index backfill (`muninn backfill`) from `claudex` / `codexdex`
+- [x] `muninn resume` — reopen a session, or say honestly why it cannot be
 - [ ] Index-time enrichment: topic, outcome, decisions, artifacts
-- [ ] Hybrid retrieval with optional embeddings
+- [ ] Hybrid retrieval with optional embeddings — no `EmbeddingProvider` ships yet
+- [ ] `muninn brief` (needs enrichment) and `muninn correlate` (needs embeddings)
 - [x] Shared-menubar raven: descriptor and `/api/menu`, rendered by [Roost](https://github.com/tohuw/roost)
 - [ ] Console
 - [ ] Agent skill
 
+### Superseding the predecessors
+
 Muninn supersedes [`claudex`](https://github.com/tohuw/claudex) and
 [`codexdex`](https://github.com/tohuw/codexdex), folding their prose-index
 approach into one archive with per-source adapters.
+
+Their indexes are archives too, and that matters more than it sounds: they cover
+sessions whose raw transcripts were swept months ago. `muninn backfill` ingests
+them, recording each session with `origin = 'prose-index'` and never overwriting
+a richer raw-derived one. Run against the development machine's real corpus it
+moved 3,730 sessions and 26,420,905 words with zero differences, and reported the
+8 files it skipped along with the reason for each.
+
+**Keep the predecessors' indexes until you have verified your own archive holds
+what they did.** Archiving the repositories is harmless; deleting `~/.claudex`
+is not.
 
 ## Design notes
 
