@@ -17,11 +17,27 @@ plugin discovery would be a hang with no explanation.
 """
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from . import policy
+
+# Set at *module* scope, before anything imports huggingface_hub, because that
+# library reads this once at import and ignores later changes. Setting it inside
+# the load function was too late: ``available()`` imports ``mlx_embeddings``
+# first, which locks the setting in, and the "Fetching 10 files" bar printed on
+# every single semantic search.
+#
+# Cosmetic rather than a correctness fix — the bar goes to stderr, so `--json`
+# on stdout stays parseable, which was checked because that is the agent-facing
+# contract and would have been a silent break. It is a progress bar for a fetch
+# that is a no-op once the weights are cached.
+#
+# Safe here specifically because this module is imported lazily and only when
+# MLX is about to be used; muninn's other modules never reach it.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 #: A small, fast, well-understood sentence embedding model. Named here rather
 #: than configured because the model id is part of the *identity* of the vectors

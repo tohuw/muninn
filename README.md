@@ -246,10 +246,12 @@ results by reciprocal rank, and `muninn correlate` answers "conversations like
 this one". Without a provider installed, `--semantic` **exits non-zero and says
 so** — it never returns lexical results labelled as semantic.
 
-Measured on a real 83,745-chunk archive: **0.68 ms for a cosine top-20**. So
-**no vector database is ever needed** — a matrix multiply and an `argpartition`
-are enough well past any plausible corpus. The only real cost is generating the
-embeddings once, which is why `embed` is a separate, resumable command.
+Measured on a real archive of **112,193 chunks** (384-dim vectors from the local
+MLX provider, 172 MB in memory): **0.99 ms for a cosine top-20**, and 1.3 s for a
+`correlate` including model load. So **no vector database is ever needed** — a
+matrix multiply and an `argpartition` are enough well past any plausible corpus.
+The only real cost is generating the embeddings once, which is why `embed` is a
+separate, resumable command.
 
 ```sh
 uv sync --extra semantic        # the local Apple-silicon provider, plus numpy

@@ -3,11 +3,16 @@
 **Status: implemented.** After 004 and 005.
 **Owner of design:** planned by Opus, implemented by Sonnet
 
-> **As built.** The central measurement held on real data: **0.68 ms for a
-> cosine top-20 over 83,745 vectors** (128 dims, the backfilled corpus, warm),
-> and 28 ms for a `correlate` over the same. That is the number that removes ANN
-> indexing from this project permanently — anyone proposing one has still not
-> measured it.
+> **As built, and now run against the real corpus with a real model.** 112,193
+> chunks embedded by the local MLX provider (bge-small, 384 dims, 172 MB in
+> memory): **0.99 ms for a cosine top-20**, 1.3 s for a `correlate` including
+> model load. That is the number that removes ANN indexing from this project
+> permanently — anyone proposing one has still not measured it.
+>
+> `correlate` on a 35,115-word session about a serialized drama returned its five
+> nearest neighbours at 0.999 / 0.999 / 0.978 / 0.977 / 0.977, every one of them
+> another session about the same series, with the query session excluded. That is
+> the acceptance criterion met on real data rather than on a planted twin.
 >
 > Two things worth knowing before touching this code:
 >
