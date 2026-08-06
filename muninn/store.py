@@ -18,6 +18,7 @@ See .valholl/articles/archive-of-record.md.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import re
 import sqlite3
@@ -317,6 +318,36 @@ class Store:
                               (row["session_id"],))
         self.conn.commit()
         return len(rows)
+
+    def set_facets(self, session_id: str, facets) -> None:
+        """Write one session's enrichment. Never touches ``text``.
+
+        The columns already existed (nullable by design since schema v1) so this
+        needs no migration. What it must not do is participate in
+        ``upsert_session``'s never-blank-a-value merge: enrichment is *derived*
+        data and re-deriving it must be able to replace a previous answer,
+        including with a shorter one. A model that correctly narrows a
+        five-item decision list to two is improving the row, and a merge rule
+        written to protect irreplaceable prose would read that as data loss and
+        keep the stale three.
+        """
+        self.conn.execute(
+            "UPDATE sessions SET topic = ?, outcome = ?, summary = ?, facets_json = ? "
+            "WHERE session_id = ?",
+            (facets.topic, facets.outcome, facets.summary, facets.to_json(), session_id),
+        )
+
+    def get_facets(self, session_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT facets_json FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+        if row is None or not row["facets_json"]:
+            return None
+        try:
+            return json.loads(row["facets_json"])
+        except ValueError:
+            # A row written by a future schema, or corrupted. Absent beats
+            # raising out of a read path.
+            return None
 
     def mark_source_missing(self, session_id: str) -> None:
         """The raw file is gone. Keep the archived prose; just record the fact."""

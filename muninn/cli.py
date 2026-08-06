@@ -16,9 +16,11 @@ from . import (
     __version__,
     agent_install,
     daemon,
+    enrich,
     exports,
     ingest,
     prose_index,
+    providers,
     queue,
     raven,
     resume,
@@ -28,6 +30,7 @@ from . import (
 from .hooks import install as hooks_install
 from .paths import DB_PATH, QUEUE_DIR, STATE_DIR, default_roots
 from .plugins import discover_plugins
+from .policy import PolicyRefused
 from .policy import resolve as resolve_policies
 from .policy import shadowed_distribution_names as shadowed_policy_distributions
 from .query import Filters
@@ -295,6 +298,99 @@ def _print_export_result(receipt) -> None:
 
     if src.windowed:
         print("note: absence from a windowed export does not indicate upstream deletion.")
+
+
+def cmd_enrich(args: argparse.Namespace) -> int:
+    """Extract queryable facets from substantive sessions (spec 005).
+
+    ``--dry-run`` is not a courtesy: this is the one expensive operation in the
+    tool — a full corpus pass is thousands of model calls — so "what would this
+    cost" has to be answerable without spending it.
+
+    An un-surveyed archive is refused rather than defaulted. The gate exists
+    precisely because it was derived from this corpus, and quietly substituting
+    a constant would reintroduce the hard-coded threshold spec 011 removed.
+    """
+    st = store.open_store(args.db)
+    calibration = enrich.load_calibration(args.db)
+    plan = enrich.plan(st, calibration, session_id=args.session_id,
+                       source=args.source, limit=args.limit, force=args.force)
+
+    if not plan.calibrated:
+        st.close()
+        print("no calibration.json beside this archive — the enrichment gate is "
+              "derived, not assumed.", file=sys.stderr)
+        print(f"  run `muninn survey` first ({survey.calibration_path(args.db)})",
+              file=sys.stderr)
+        return 2
+
+    if args.dry_run or args.json:
+        payload = {
+            "planned": len(plan.candidates),
+            "estimated_calls": plan.estimated_calls,
+            "thresholds": plan.thresholds,
+            "skipped": plan.skipped,
+            "sessions": [c.session_id for c in plan.candidates],
+        }
+        st.close()
+        if args.json:
+            print(json.dumps(payload))
+        else:
+            _print_enrich_plan(plan)
+        return 0
+
+    if not plan.candidates:
+        _print_enrich_plan(plan)
+        st.close()
+        return 0
+
+    try:
+        provider = providers.resolve_provider(args.model, args.provider)
+    except providers.ProviderError as exc:
+        st.close()
+        print(f"muninn: {exc}", file=sys.stderr)
+        return 2
+    reason = provider.available()
+    if reason is not None:
+        st.close()
+        print(f"muninn: provider unavailable — {reason}", file=sys.stderr)
+        return 2
+
+    print(f"enriching {len(plan.candidates):,} session(s) with "
+          f"{getattr(provider, 'model', '?')} "
+          f"(~{plan.estimated_calls:,} model calls)")
+    try:
+        result = enrich.enrich_sessions(st, plan.candidates, provider)
+    except PolicyRefused as exc:
+        # A refused model is a statement about the run's configuration, not
+        # about one session — retrying it per session would produce thousands of
+        # identical refusals.
+        st.close()
+        print(f"muninn: {exc}", file=sys.stderr)
+        return 2
+    st.close()
+
+    print(f"enriched {result.enriched:,} · failed {result.failed:,}")
+    if result.redactions:
+        # Reported by kind and count, never by value: the point of naming them
+        # is that the user learns their transcripts contain credentials.
+        named = ", ".join(f"{k} ×{v}" for k, v in sorted(result.redactions.items()))
+        print(f"redacted before sending: {named}")
+    for category, count in sorted(result.failures.items()):
+        print(f"  {category:20} {count:,}")
+    return 0
+
+
+def _print_enrich_plan(plan) -> None:
+    print(f"planned  {len(plan.candidates):,} session(s) · "
+          f"~{plan.estimated_calls:,} model calls")
+    if plan.thresholds:
+        gates = ", ".join(f"{s} >= {t:,}w" for s, t in sorted(plan.thresholds.items()))
+        print(f"gate     {gates}  (derived; `muninn survey` re-derives)")
+    if plan.skipped:
+        print("skipped")
+        for reason, count in sorted(plan.skipped.items()):
+            print(f"  {reason:22} {count:,}")
 
 
 def cmd_backfill(args: argparse.Namespace) -> int:
@@ -1199,6 +1295,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_backfill.add_argument("--json", action="store_true",
                             help="print only the machine-readable import receipt(s)")
     p_backfill.set_defaults(func=cmd_backfill)
+
+    p_enrich = sub.add_parser(
+        "enrich", help="extract topic, outcome and decisions from substantive sessions",
+        description="Run one model pass per substantive session to extract "
+                    "queryable facets. This is the one expensive operation in "
+                    "Muninn — a full pass is thousands of model calls — so "
+                    "--dry-run reports the plan and the estimated call count "
+                    "without spending any. Tool-invoked sessions are never "
+                    "enriched, the length gate is read from calibration.json "
+                    "rather than assumed, and transcript text is redacted "
+                    "before it reaches a provider. See docs/specs/005.")
+    p_enrich.add_argument("session_id", nargs="?",
+                          help="enrich one session (id or prefix), ignoring the length gate")
+    p_enrich.add_argument("--source", help="only this source")
+    p_enrich.add_argument("--limit", type=int, help="stop after this many sessions")
+    p_enrich.add_argument("--force", action="store_true",
+                          help="re-enrich sessions that already have facets")
+    p_enrich.add_argument("--dry-run", action="store_true",
+                          help="report the plan and estimated call count; make no calls")
+    p_enrich.add_argument("--model", help=f"model id (default: {providers.DEFAULT_MODEL})")
+    p_enrich.add_argument("--provider",
+                          help="name of a plugin-contributed text provider "
+                               "(default: the built-in `claude -p`)")
+    p_enrich.add_argument("--json", action="store_true",
+                          help="print the plan as JSON and make no calls")
+    p_enrich.set_defaults(func=cmd_enrich)
 
     p_log = sub.add_parser(
         "log", help='reverse-chronological "what did I do last week" view')
