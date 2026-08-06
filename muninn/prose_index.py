@@ -59,8 +59,10 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from . import sources
 from .digest import digest_items, digest_tree
@@ -92,6 +94,78 @@ KNOWN_ROOTS: tuple[tuple[str, str], ...] = (
 )
 
 _CLOUD_SOURCE = "claude-cloud"
+
+#: Every directory a predecessor wrote prose into, relative to its root.
+#:
+#: This list is the whole lesson of tohuw/muninn#6. The first implementation
+#: walked ``index`` and ``cloud/index`` and looked complete — it recovered 3,738
+#: files and verified 26.4 M words byte-for-byte, which is exactly the kind of
+#: result that stops anyone looking further. It was still missing four
+#: directories, because a prose index is not one directory: it is one per *kind
+#: of thing the tool learned to archive*, added over time, and nothing announces
+#: a new one.
+#:
+#: ``cloud/projects/index-deleted`` is the reason this is not a nice-to-have.
+#: Those files are project memory **cleared upstream** — the manifest says so in
+#: as many words — so they exist in exactly one place on earth, which is the
+#: directory a two-entry list did not walk.
+INDEX_DIRS: tuple[str, ...] = (
+    "index",                        # local Claude Code sessions and subagents
+    "cloud/index",                  # claude.ai conversations
+    "cloud/projects/index",         # project definitions, with memory inlined
+    "cloud/projects/index-deleted",  # project memory the vendor deleted
+    "cloud/memory/index",           # user memory documents
+)
+
+#: ``# kind:`` header -> the ``source`` a row gets. Kinds absent here (``session``,
+#: ``subagent``) keep the root's default source, because they *are* the thing the
+#: root is about; these are the ones that are not conversations at all and would
+#: be indistinguishable in a search result if they shared a source with them.
+KIND_SOURCE: dict[str, str] = {
+    "cloud": _CLOUD_SOURCE,
+    "project": "claude-project",
+    "project-memory": "claude-project",
+    "memory": "claude-memory",
+}
+
+#: Kinds that are not conversations and must not be run through the turn-count
+#: classifier. See :func:`parse_prose_file` for what happens when they are.
+NON_CONVERSATION_KINDS = frozenset({"project", "project-memory", "memory"})
+
+#: claudex's outcome vocabulary -> Muninn's closed one. ``reference`` maps to
+#: ``exploratory`` rather than ``fixed``: a lookup that answered a question
+#: resolved nothing, and calling it ``fixed`` would make `--outcome fixed`
+#: return 258 timezone conversions on this corpus.
+_OUTCOME_MAP = {
+    "resolved": "fixed",
+    "reference": "exploratory",
+    "ongoing": "ongoing",
+    "abandoned": "abandoned",
+    "exploratory": "exploratory",
+    "fixed": "fixed",
+}
+
+
+@dataclass(frozen=True)
+class BackfillResult:
+    """What one backfill did: an import receipt, plus facets harvested.
+
+    A wrapper rather than two extra fields on ``ImportReceipt``, because that
+    type is the ledger's closed shape (``muninn.import-receipt/1``) and it is
+    frozen for the same reason it is closed — an agent parses it, and a field
+    that appears on some receipts and not others is a field nobody can rely on.
+    Harvesting a predecessor's summaries is a *second* thing this importer does,
+    not a property of the import, so it is reported alongside rather than inside.
+
+    Attribute access falls through to the receipt so every existing caller and
+    test reads unchanged.
+    """
+
+    receipt: ImportReceipt
+    facets_harvested: int = 0
+
+    def __getattr__(self, name: str):
+        return getattr(self.receipt, name)
 
 
 @dataclass(frozen=True)
@@ -128,17 +202,15 @@ def find_prose_indexes(home: Path | None = None) -> list[ProseIndexCandidate]:
 
 
 def discover(root: Path) -> list[Path]:
-    """Prose files under ``root``, sorted for determinism.
+    """Prose files under ``root``, across every index directory, sorted.
 
-    Both ``index/`` and ``cloud/index/`` are walked. The cloud sub-index is easy
-    to miss — it is a second directory holding a different session class — and
-    missing it would silently drop every claude.ai conversation the predecessor
-    archived, which is the older and less replaceable half.
+    See :data:`INDEX_DIRS` for why this is a list rather than one path, and for
+    which omission made it a list.
     """
     if not root.is_dir():
         return []
     out: list[Path] = []
-    for sub in ("index", "cloud/index"):
+    for sub in INDEX_DIRS:
         directory = root / sub
         if directory.is_dir():
             out.extend(p for p in sorted(directory.glob("*.txt")) if p.is_file())
@@ -199,14 +271,23 @@ def parse_prose_file(path: Path, default_source: str) -> ParsedSession | Skip:
     if not headers:
         return Skip(item_id=path.stem, reason=SkipReason.UNKNOWN_SCHEMA)
 
-    session_id = headers.get("session") or path.stem
+    kind = headers.get("kind", "")
+
+    # Sessions keep their bare id, because that id is the one the vendor's own
+    # tooling uses and `muninn resume` prints. Everything else is namespaced by
+    # kind: a project and a project's deleted memory are both keyed on the
+    # project uuid, so an un-namespaced id would silently collapse the two —
+    # and the surviving one would be whichever was walked last.
+    session_id = headers.get("session") or ""
+    if not session_id:
+        stem = headers.get("project") or path.stem
+        session_id = f"{kind}:{stem}" if kind else stem
     if not session_id:
         return Skip(item_id=path.stem, reason=SkipReason.MISSING_ITEM_ID)
     if not body.strip():
         return Skip(item_id=session_id, reason=SkipReason.NO_CONTENT)
 
-    kind = headers.get("kind", "")
-    source = headers.get("source") or (_CLOUD_SOURCE if kind == "cloud" else default_source)
+    source = headers.get("source") or KIND_SOURCE.get(kind) or default_source
     turns = headers.get("turns", "")
 
     sess = ParsedSession(
@@ -224,12 +305,145 @@ def parse_prose_file(path: Path, default_source: str) -> ParsedSession | Skip:
         assistant_turns=_int_after(turns, "assistant"),
     )
     sess.duration_s = _duration(sess.started_at, sess.ended_at)
-    # Provenance stays structural, exactly as for raw transcripts: the same
-    # classifier, fed the cwd and turn counts the header preserved. Deciding it
-    # from the prose length here would reintroduce the length-based
-    # classification that skewed every measurement by ~40x.
-    sess.provenance = sources.classify(sess, is_subagent=(kind == "subagent"))
+    if kind in NON_CONVERSATION_KINDS:
+        # A project definition or a memory document is a human-authored
+        # artifact, not a conversation — it has no turns at all, which is a
+        # different fact from "it had zero user turns".
+        #
+        # Running the ordinary classifier on one gets this exactly backwards.
+        # ``sources.classify`` reads ``user_turns == 0`` as the signature of a
+        # programmatic ``claude -p`` call, so every project and every memory
+        # file lands in ``tool-invoked`` — and that class is excluded from
+        # default search, from every survey statistic, and from enrichment. The
+        # real survey caught it: 44 projects holding 586,186 words and 18 memory
+        # documents, all silently filed as machine byproducts and unreachable
+        # from `muninn search`.
+        #
+        # This is the length-based-classification trap wearing a different
+        # coat: the rule is that provenance is *structural*, and the structure
+        # here is the ``kind`` header, not a turn count that was never written.
+        sess.provenance = sources.HUMAN
+    else:
+        # Structural, exactly as for raw transcripts: the same classifier, fed
+        # the cwd and turn counts the header preserved.
+        sess.provenance = sources.classify(sess, is_subagent=(kind == "subagent"))
     return sess
+
+
+# ── The predecessor's own enrichment ──────────────────────────────────────────
+
+#: Where claudex wrote its per-session summaries, alongside the index they
+#: describe. These are *facets*, in Muninn's sense: YAML frontmatter carrying
+#: topic / outcome / keywords, then a prose summary.
+SUMMARY_DIRS: tuple[str, ...] = ("summaries", "cloud/summaries")
+
+
+def find_summaries(root: Path) -> dict[str, Any]:
+    """``session_id -> Facets`` for every summary the predecessor already wrote.
+
+    Worth harvesting for two independent reasons, and the second is the one that
+    matters more.
+
+    The cheap reason: these were paid for once already. On this corpus there are
+    811 of them, so importing them is 811 model calls `muninn enrich` does not
+    have to make.
+
+    The real reason: **a summary is prose too.** It was generated from a
+    transcript that may no longer exist, by a model that is no longer the
+    default, and nothing else in the world has a copy. Regenerating it later is
+    not the same artifact, and discarding it because Muninn can produce its own
+    would be the archive-of-record mistake wearing a different hat.
+
+    Never raises: a malformed summary is skipped, because losing one summary
+    must not cost the backfill the sessions it was attached to.
+    """
+    from .enrich import Facets, UNCLEAR_OUTCOME
+
+    found: dict[str, Any] = {}
+    for sub in SUMMARY_DIRS:
+        directory = root / sub
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.md")):
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            meta, body = _split_frontmatter(text)
+            topic = meta.get("topic", "").strip()
+            if not topic:
+                continue
+            # claudex's vocabulary is wider than Muninn's and occasionally
+            # freeform ("ongoing (collection design articulated)"). Take the
+            # first recognised token rather than rejecting the summary — the
+            # topic and prose are the valuable parts, and an unmappable outcome
+            # is worth less than losing them.
+            outcome = UNCLEAR_OUTCOME
+            for token in re.split(r"[^a-z]+", meta.get("outcome", "").lower()):
+                if token in _OUTCOME_MAP:
+                    outcome = _OUTCOME_MAP[token]
+                    break
+            found[path.stem] = Facets(
+                topic=topic[:500],
+                outcome=outcome,
+                summary=body.strip()[:4000],
+                entities=tuple(_split_keywords(meta.get("keywords", ""))),
+            )
+    return found
+
+
+#: The three keys a summary carries, tolerating markdown emphasis around them.
+#:
+#: A strict ``---``-delimited YAML reader looked right and silently dropped 13
+#: of 811 summaries on the real corpus, because the model that wrote them
+#: drifted between four shapes over time: plain ``topic:``, bold
+#: ``**topic:**``, a ``**SUMMARY**`` banner *before* the frontmatter, and bold
+#: keys with no delimiters at all. Every one of those is a real summary of a
+#: conversation that may no longer exist, and none of them is worth losing to a
+#: parser being principled about YAML.
+#:
+#: This is the same fail-soft rule the transcript adapters follow, applied to a
+#: format that is even less of a contract: nobody was maintaining it, and the
+#: thing that produced it was itself a language model.
+_META_RE = re.compile(
+    r"^[ \t>*_]*(topic|outcome|keywords)[*_]*[ \t]*:[ \t]*(.*)$",
+    re.IGNORECASE | re.MULTILINE)
+
+#: How far into a file to look for metadata. Past this it is prose that happens
+#: to contain the word "topic:", not a header.
+_META_SCAN_CHARS = 2000
+
+
+def _split_frontmatter(text: str) -> tuple[dict[str, str], str]:
+    """``(metadata, body)`` from a predecessor summary, however it was written.
+
+    Scans the head of the document for the three known keys rather than
+    requiring a delimiter block, then treats everything after the last one as
+    the summary prose.
+    """
+    head = text[:_META_SCAN_CHARS]
+    meta: dict[str, str] = {}
+    end = 0
+    for match in _META_RE.finditer(head):
+        # Strip whitespace, then emphasis, then whitespace again: `**topic:** T`
+        # captures `** T`, so a single pass leaves the value with a leading
+        # space and `[a, b]` never loses its bracket.
+        meta.setdefault(match.group(1).lower(),
+                        match.group(2).strip().strip("*_").strip())
+        end = match.end()
+    if not meta:
+        return {}, text
+    # Drop a trailing `---` delimiter and blank lines between the metadata and
+    # the prose, so the stored summary starts at the first real sentence.
+    body = text[end:].lstrip("\n")
+    while body.startswith("---"):
+        body = body[3:].lstrip("\n")
+    return meta, body
+
+
+def _split_keywords(raw: str) -> list[str]:
+    """``[a, b, c]`` or ``a, b, c`` -> a list, capped."""
+    return [k.strip() for k in raw.strip("[]").split(",") if k.strip()][:12]
 
 
 def _iso_or_none(value: str | None) -> str | None:
@@ -313,6 +527,8 @@ def import_prose_index(st: Store, root: Path, *, default_source: str = "claude",
     now = _now()
     added = updated = unchanged = 0
     item_receipts: list[tuple[str, str, str | None]] = []
+    summaries = find_summaries(root)
+    facets_written = 0
 
     for sess in parsed:
         existing = st.get_session(sess.session_id)
@@ -367,6 +583,27 @@ def import_prose_index(st: Store, root: Path, *, default_source: str = "claude",
             updated += 1
             item_receipts.append((sess.session_id, "updated", None))
 
+    # Summaries are applied to **every** session the archive holds, not only to
+    # the ones this pass added — and that distinction was a real bug, caught by
+    # running it for real.
+    #
+    # A summary and a transcript are different artifacts. When the vendor export
+    # supplies a richer copy of a conversation, its 2,649 prose entries are
+    # correctly skipped as `superseded-by-richer-origin` — but claudex's
+    # *summary* of that conversation is not superseded by anything, because the
+    # export contains no summaries at all. Scoping the harvest to added rows
+    # dropped 705 of 811 on this corpus: exactly the ones whose transcripts were
+    # best covered.
+    #
+    # The `topic` guard still holds: a session Muninn has already enriched keeps
+    # its own richer facets.
+    for session_id, facets in summaries.items():
+        existing = st.get_session(session_id)
+        if existing is None or existing.get("topic"):
+            continue
+        st.set_facets(session_id, facets)
+        facets_written += 1
+
     for skip in skips:
         item_receipts.append((skip.item_id, "skipped", skip.reason.value))
 
@@ -396,5 +633,9 @@ def import_prose_index(st: Store, root: Path, *, default_source: str = "claude",
                                   finished_at=prior_completed["finished_at"])
 
     st.commit()
-    return ImportReceipt(ledger_id=ledger_id, outcome=outcome, source=facts, delta=delta,
-                         skips=skips, duplicate_of=duplicate_of, attribution=attribution)
+    return BackfillResult(
+        receipt=ImportReceipt(ledger_id=ledger_id, outcome=outcome, source=facts,
+                              delta=delta, skips=skips, duplicate_of=duplicate_of,
+                              attribution=attribution),
+        facets_harvested=facets_written,
+    )

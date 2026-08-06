@@ -390,6 +390,235 @@ class DiscoveryTest(unittest.TestCase):
         self.assertEqual(prose_index.discover(self.tmp / "nope"), [])
         self.assertEqual(prose_index.find_prose_indexes(self.tmp), [])
 
+    def test_every_known_index_directory_is_walked(self) -> None:
+        # The lesson of the first implementation: it walked two directories,
+        # recovered 3,738 files, verified 26.4M words byte-for-byte — and was
+        # still missing four. A prose index is one directory *per kind of thing
+        # the tool learned to archive*, and nothing announces a new one.
+        root = self.tmp / ".claudex"
+        for sub in prose_index.INDEX_DIRS:
+            (root / sub).mkdir(parents=True, exist_ok=True)
+            (root / sub / "a.txt").write_text(
+                f"# session: {sub.replace('/', '-')}\n\nbody\n")
+        found = {p.parent.relative_to(root).as_posix() for p in prose_index.discover(root)}
+        self.assertEqual(found, set(prose_index.INDEX_DIRS))
+
+    def test_deleted_project_memory_is_walked(self) -> None:
+        # The one that makes this not a nice-to-have: those files are project
+        # memory cleared upstream, so they exist in exactly one place.
+        self.assertIn("cloud/projects/index-deleted", prose_index.INDEX_DIRS)
+
+
+class KindTest(_Index):
+    """Non-conversation kinds get their own source and a namespaced id."""
+
+    def test_each_kind_lands_on_its_own_source(self) -> None:
+        cases = {
+            "cloud": "claude-cloud",
+            "project": "claude-project",
+            "project-memory": "claude-project",
+            "memory": "claude-memory",
+        }
+        for kind, expected in cases.items():
+            with self.subTest(kind=kind):
+                self.assertEqual(prose_index.KIND_SOURCE[kind], expected)
+
+    def test_a_project_and_its_deleted_memory_do_not_collide(self) -> None:
+        # Both are keyed on the project uuid. An un-namespaced id would collapse
+        # them, and the survivor would be whichever was walked last.
+        uid = "01995f9c-daea-7732-80c2-35bc3722e746"
+        self.write("p.txt", f"# project: {uid}\n# kind: project\n# name: Cyberwise\n\n[NAME]\nCyberwise\n",
+                   sub="cloud/projects/index")
+        self.write(f"{uid}.memory.txt",
+                   f"# project: {uid}\n# kind: project-memory\n"
+                   f"# name:  (project memory — cleared upstream)\n\n[MEMORY]\nthe only copy\n",
+                   sub="cloud/projects/index-deleted")
+        receipt = self.backfill()
+        self.assertEqual(receipt.delta.added, 2)
+        ids = {r["session_id"] for r in
+               self.st.conn.execute("SELECT session_id FROM sessions")}
+        self.assertEqual(ids, {f"project:{uid}", f"project-memory:{uid}"})
+        self.assertIn("the only copy", self.st.session_text(f"project-memory:{uid}"))
+
+    def test_a_project_is_human_not_tool_invoked(self) -> None:
+        # Found by a real survey, which reported claude-project as 100%
+        # tool-invoked. A project has no turns at all — a different fact from
+        # "zero user turns" — but sources.classify reads user_turns == 0 as the
+        # signature of a programmatic `claude -p` call. That class is excluded
+        # from default search, from every survey statistic, and from
+        # enrichment, so 44 projects holding 586,186 words were unreachable.
+        self.write("p.txt", "# project: p1\n# kind: project\n# name: Cyberwise\n\n"
+                            "[DESCRIPTION]\nA long human-authored project brief.\n",
+                   sub="cloud/projects/index")
+        self.backfill()
+        self.assertEqual(self.st.get_session("project:p1")["provenance"], "human")
+
+    def test_a_memory_document_is_human_too(self) -> None:
+        self.write("m.txt", "# kind: memory\n# name: /areas/10tdb.md\n# scope: file\n\n"
+                            "notes the user wrote\n", sub="cloud/memory/index")
+        self.backfill()
+        got = self.st.conn.execute(
+            "SELECT provenance FROM sessions WHERE source = 'claude-memory'").fetchone()
+        self.assertEqual(got["provenance"], "human")
+
+    def test_a_real_session_still_gets_the_structural_classifier(self) -> None:
+        # The other half: the exemption is scoped to kinds that are not
+        # conversations. A tool-invoked session must still be caught.
+        self.session("ddd", "one line", cwd="/Users/x/.local/state/huginn/cache")
+        self.backfill()
+        self.assertEqual(self.st.get_session("ddd")["provenance"], "tool-invoked")
+
+    def test_a_session_keeps_its_bare_id(self) -> None:
+        # It is the id the vendor's own tooling uses and `muninn resume` prints.
+        self.session("aaa", "hello")
+        self.backfill()
+        self.assertIsNotNone(self.st.get_session("aaa"))
+
+
+class SummaryHarvestTest(_Index):
+    """The predecessor's own enrichment is prose too, and it was paid for once."""
+
+    def _summary(self, name: str, body: str, *, sub: str = "summaries",
+                 topic: str = "a topic", outcome: str = "resolved",
+                 keywords: str = "[alpha, beta]") -> None:
+        path = self.root / sub / f"{name}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"---\ntopic: {topic}\noutcome: {outcome}\n"
+                        f"keywords: {keywords}\n---\n\n{body}\n")
+
+    def test_a_summary_arrives_as_facets(self) -> None:
+        self.session("aaa", "the transcript")
+        self._summary("aaa", "What happened, in prose.")
+        receipt = self.backfill()
+        row = self.st.get_session("aaa")
+        self.assertEqual(row["topic"], "a topic")
+        self.assertEqual(row["outcome"], "fixed")          # resolved -> fixed
+        self.assertIn("What happened", row["summary"])
+        self.assertEqual(self.st.get_facets("aaa")["entities"], ["alpha", "beta"])
+        self.assertEqual(getattr(receipt, "facets_harvested", 0), 1)
+
+    def test_the_outcome_vocabulary_is_mapped_not_dropped(self) -> None:
+        # `reference` is the interesting one: 258 of them on the real corpus,
+        # and calling them "fixed" would make `--outcome fixed` mostly timezone
+        # lookups.
+        for name, claudex, muninn in (("a", "resolved", "fixed"),
+                                      ("b", "reference", "exploratory"),
+                                      ("c", "ongoing", "ongoing"),
+                                      ("d", "abandoned", "abandoned")):
+            self.session(name, f"transcript {name}")
+            self._summary(name, "body", outcome=claudex)
+        self.backfill()
+        for name, expected in (("a", "fixed"), ("b", "exploratory"),
+                               ("c", "ongoing"), ("d", "abandoned")):
+            with self.subTest(name=name):
+                self.assertEqual(self.st.get_session(name)["outcome"], expected)
+
+    def test_a_freeform_outcome_takes_its_first_recognised_token(self) -> None:
+        # Real values from the corpus: "resolved, ongoing" and
+        # "ongoing (collection design articulated, work incomplete)".
+        self.session("aaa", "t")
+        self._summary("aaa", "body", outcome="ongoing (work incomplete)")
+        self.backfill()
+        self.assertEqual(self.st.get_session("aaa")["outcome"], "ongoing")
+
+    def test_cloud_summaries_are_found_too(self) -> None:
+        self.write("bbb.txt", CLAUDEX_CLOUD.format(sid="bbb", prose="cloud talk"),
+                   sub="cloud/index")
+        self._summary("bbb", "cloud summary", sub="cloud/summaries")
+        self.backfill()
+        self.assertEqual(self.st.get_session("bbb")["topic"], "a topic")
+
+    def test_a_summary_never_overwrites_muninns_own_enrichment(self) -> None:
+        # A later `muninn enrich` pass extracts decisions, errors and artifacts,
+        # which claudex never did. Re-running the backfill must not replace the
+        # richer answer with the thinner one.
+        from muninn.enrich import Facets
+
+        self.session("aaa", "the transcript")
+        self._summary("aaa", "the thin claudex summary")
+        self.backfill()
+        self.st.set_facets("aaa", Facets(topic="muninn's own", outcome="fixed",
+                                         decisions=("something decided",)))
+        self.st.commit()
+        self.backfill()
+        self.assertEqual(self.st.get_session("aaa")["topic"], "muninn's own")
+        self.assertEqual(self.st.get_facets("aaa")["decisions"], ["something decided"])
+
+    def test_every_shape_the_predecessor_actually_wrote_parses(self) -> None:
+        # All four are real, taken from the corpus. A strict YAML reader looked
+        # right and silently dropped 13 of 811 — every one a summary of a
+        # conversation that may no longer exist.
+        shapes = {
+            "plain": "---\ntopic: T\noutcome: resolved\nkeywords: [a, b]\n---\n\nprose here",
+            "bold": "---\n**topic:** T\n\n**outcome:** resolved\n\n"
+                    "**keywords:** [a, b]\n\n---\n\nprose here",
+            "banner-first": "---\n\n**SUMMARY**\n\n---\n\ntopic: T\noutcome: resolved\n"
+                            "keywords: [a, b]\n\n---\n\nprose here",
+            "bold-no-delims": "---\n**topic:** T\n**outcome:** resolved\n"
+                              "**keywords:** [a, b]\n\n---\n\nprose here",
+        }
+        for name, text in shapes.items():
+            with self.subTest(shape=name):
+                self.session(name, f"transcript {name}")
+                (self.root / "summaries").mkdir(parents=True, exist_ok=True)
+                (self.root / "summaries" / f"{name}.md").write_text(text)
+        self.backfill()
+        for name in shapes:
+            with self.subTest(shape=name):
+                row = self.st.get_session(name)
+                self.assertEqual(row["topic"], "T")
+                self.assertEqual(row["outcome"], "fixed")
+                self.assertEqual(self.st.get_facets(name)["entities"], ["a", "b"])
+                self.assertTrue(row["summary"].startswith("prose here"), row["summary"])
+
+    def test_the_word_topic_deep_in_prose_is_not_a_header(self) -> None:
+        self.session("aaa", "t")
+        (self.root / "summaries").mkdir(parents=True, exist_ok=True)
+        (self.root / "summaries" / "aaa.md").write_text(
+            "---\ntopic: real\n---\n\n" + ("filler " * 800) + "\ntopic: not a header\n")
+        self.backfill()
+        self.assertEqual(self.st.get_session("aaa")["topic"], "real")
+
+    def test_a_summary_with_no_topic_is_skipped_not_fatal(self) -> None:
+        self.session("aaa", "t")
+        (self.root / "summaries").mkdir(parents=True, exist_ok=True)
+        (self.root / "summaries" / "aaa.md").write_text("---\noutcome: resolved\n---\nbody")
+        receipt = self.backfill()
+        self.assertEqual(receipt.delta.added, 1)
+        self.assertIsNone(self.st.get_session("aaa")["topic"])
+
+    def test_a_summary_for_an_unknown_session_is_simply_unused(self) -> None:
+        self.session("aaa", "t")
+        self._summary("zzz", "orphan summary")
+        self.backfill()
+        self.assertEqual(getattr(self.backfill(), "facets_harvested", 0), 0)
+
+    def test_a_summary_is_harvested_even_when_its_prose_was_superseded(self) -> None:
+        # The bug a real run caught. When a vendor export supplies a richer copy
+        # of a conversation, that session's prose entry is correctly skipped as
+        # superseded — but claudex's *summary* of it is not superseded by
+        # anything, because the export contains no summaries at all. Scoping the
+        # harvest to added rows dropped 705 of 811 summaries on the real corpus:
+        # precisely the ones whose transcripts were best covered.
+        self.st.upsert_session({
+            "session_id": "aaa", "source": "claude-cloud", "provenance": "human",
+            "text": "the richer export copy", "words": 4, "user_turns": 1,
+            "assistant_turns": 1, "tool_uses": 0, "tool_results": 0,
+            "origin": "raw", "source_present": 1,
+        })
+        self.st.commit()
+        self.session("aaa", "the thinner prose copy")     # will be superseded
+        self._summary("aaa", "the only summary that exists")
+
+        result = self.backfill()
+        self.assertEqual([s.reason for s in result.skips],
+                         [SkipReason.SUPERSEDED_BY_RICHER_ORIGIN])
+        self.assertEqual(result.facets_harvested, 1)
+        row = self.st.get_session("aaa")
+        self.assertEqual(row["topic"], "a topic")
+        # The richer prose is still the prose.
+        self.assertEqual(self.st.session_text("aaa"), "the richer export copy")
+
 
 class HeaderParsingTest(unittest.TestCase):
     def test_headers_end_at_the_first_non_comment_line(self) -> None:

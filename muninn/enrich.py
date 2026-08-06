@@ -494,6 +494,13 @@ def enrich_sessions(st: Store, candidates: Iterable[Candidate],
             st.record_parse_failure("enrich", exc.category)
             continue
         st.set_facets(candidate.session_id, facets)
+        # Committed per session, not per run. A corpus pass is thousands of
+        # model calls over hours; committing once at the end means a Ctrl-C, a
+        # rate limit, or a laptop lid closing throws away every call already
+        # paid for. Per-session commits are what make "run it again, it skips
+        # what is done" true rather than aspirational — the gate's
+        # already-enriched check reads committed rows.
+        st.commit()
         result.enriched += 1
         for name, count in redactions.items():
             result.redactions[name] = result.redactions.get(name, 0) + count

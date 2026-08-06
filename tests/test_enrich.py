@@ -551,6 +551,31 @@ class CliTest(_Archive):
         self.assertIn("nothing permitted", err)
         ran.assert_not_called()
 
+    def test_progress_survives_an_interrupted_run(self) -> None:
+        # A corpus pass is thousands of calls over hours. Committing once at the
+        # end means a Ctrl-C or a rate limit throws away every call already
+        # paid for, and makes "run it again, it skips what is done" false.
+        for _ in range(3):
+            self.add(words=5000)
+        calibration = self.calibrate(claude=1000)
+        plan = enrich.plan(self.st, calibration)
+
+        class DiesOnTheThird(FakeProvider):
+            def generate(self, prompt, **kw):
+                if len(self.prompts) >= 2:
+                    raise KeyboardInterrupt("laptop lid")
+                return super().generate(prompt, **kw)
+
+        with self.assertRaises(KeyboardInterrupt):
+            enrich.enrich_sessions(self.st, plan.candidates, DiesOnTheThird())
+
+        # Two sessions were paid for and kept; the third is still pending, so a
+        # re-run costs one call rather than three.
+        done = self.st.conn.execute(
+            "SELECT COUNT(*) n FROM sessions WHERE topic IS NOT NULL").fetchone()["n"]
+        self.assertEqual(done, 2)
+        self.assertEqual(len(enrich.plan(self.st, calibration).candidates), 1)
+
     def test_an_unavailable_provider_exits_two_before_planning_work(self) -> None:
         self.add(words=5000)
         self._write_calibration(claude=1000)

@@ -429,12 +429,17 @@ def cmd_backfill(args: argparse.Namespace) -> int:
             if not args.json:
                 print(f"{candidate.path}: no prose files under index/ or cloud/index/")
             continue
-        receipt = prose_index.import_prose_index(
+        result = prose_index.import_prose_index(
             st, candidate.path, default_source=candidate.default_source, actor=args.actor)
+        receipt = result.receipt
         receipts.append(receipt)
         if not args.json:
             print(f"\n{candidate.path}")
             _print_export_result(receipt)
+            harvested = result.facets_harvested
+            if harvested:
+                print(f"facets   {harvested:,} summaries harvested from the predecessor "
+                      f"(that many enrichment calls not needed)")
     st.close()
 
     if args.json:
