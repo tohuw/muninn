@@ -8,7 +8,7 @@ category: "durability"
 status: "current"
 updated: "2026-07-30"
 summary: "Claude Code sweeps session JSONLs older than cleanupPeriodDays (default 30) on startup. Muninn's index therefore holds data that exists nowhere else, which makes losslessness and continuous ingest hard requirements."
-related: ["what-muninn-is", "continuous-ingest-not-periodic", "unstable-jsonl-format"]
+related: ["what-muninn-is", "continuous-ingest-not-periodic", "unstable-jsonl-format", "superseding-a-predecessor"]
 ---
 
 # The index is an archive of record
