@@ -1,7 +1,29 @@
 # Spec 006 — Hybrid retrieval
 
-**Status:** ready to implement after 004 and 005
+**Status: implemented.** After 004 and 005.
 **Owner of design:** planned by Opus, implemented by Sonnet
+
+> **As built.** The central measurement held on real data: **0.68 ms for a
+> cosine top-20 over 83,745 vectors** (128 dims, the backfilled corpus, warm),
+> and 28 ms for a `correlate` over the same. That is the number that removes ANN
+> indexing from this project permanently — anyone proposing one has still not
+> measured it.
+>
+> Two things worth knowing before touching this code:
+>
+> - **The matrix cache is stamped on the `-wal` file, not just the database.**
+>   The archive runs in WAL mode, so a committed write leaves `muninn.db`
+>   untouched until a checkpoint — the obvious cache key (stat the db) served a
+>   stale matrix after `muninn embed` in any process that outlived the write.
+>   The stamp is now db stat + `-wal` stat + `PRAGMA data_version`. Caught by a
+>   test, not by inspection; see `embed._stamp`.
+> - **`--semantic`/`--deep` with no provider exit 2 and print nothing.** Not a
+>   downgrade to lexical, and asserted with a query that *does* match lexically
+>   so a silent fallback would show up as output.
+>
+> `--deep` reranking landed in `muninn/rerank.py`, redacting through the same
+> gate enrichment uses. The MLX provider is written and behind `[semantic]`, but
+> **has not been run against real weights** — see Verification below.
 **Read first:** `.valholl/articles/corpus-measurements.md`. It contains the
 measurement that removes a whole category of work from this spec.
 
@@ -181,6 +203,22 @@ uv run muninn doctor                                 # reports vector count + me
 ```
 
 Commit; do not push.
+
+### What was actually verified, and what was not
+
+Verified: the default install passes with numpy absent (13 semantic tests skip
+cleanly); the same suite passes with numpy present; the storage, cosine,
+correlation and fusion paths run end to end over the real 83,745-chunk archive
+with a deterministic hashing embedder standing in for a model.
+
+**Not verified: `muninn/embed_mlx.py` against real weights.** It has never
+downloaded a model or produced a real embedding — the local provider is written
+to the protocol and reviewed, not exercised. What that leaves open is narrow but
+real: the shape and dtype of `mlx_embeddings.generate(...).text_embeds`, and
+whether `DEFAULT_DIM` matches the model named in `DEFAULT_MODEL`. Everything
+downstream of the provider boundary is covered, because a `FakeEmbedder`
+produces the same shapes. Run it on an Apple-silicon machine before trusting
+`--semantic` end to end.
 
 ## Guardrails
 

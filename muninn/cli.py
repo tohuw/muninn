@@ -16,13 +16,16 @@ from . import (
     __version__,
     agent_install,
     daemon,
+    embed,
     enrich,
     exports,
+    fuse,
     ingest,
     prose_index,
     providers,
     queue,
     raven,
+    rerank,
     resume,
     store,
     survey,
@@ -513,14 +516,154 @@ def _print_survey(doc: dict, path: Path, *, wrote: bool) -> None:
     print(f"\n{'wrote' if wrote else 'would write'}  {path}")
 
 
+def cmd_embed(args: argparse.Namespace) -> int:
+    """Generate chunk embeddings (spec 006).
+
+    The entire cost of "semantic" is here rather than at query time — 1.9 ms to
+    search 60k vectors, but real money to make them — which is why this is a
+    separate resumable command with a `--dry-run`, and search is not.
+    """
+    st = store.open_store(args.db)
+    try:
+        provider = embed.resolve_provider(args.provider)
+    except embed.EmbeddingUnavailable as exc:
+        st.close()
+        print(f"muninn: {exc}", file=sys.stderr)
+        return 2
+
+    rows = st.conn.execute(
+        "SELECT c.session_id, c.ordinal, c.body FROM chunks c "
+        "LEFT JOIN chunk_vectors v "
+        "  ON v.session_id = c.session_id AND v.ordinal = c.ordinal AND v.model = ? "
+        "WHERE v.session_id IS NULL " + ("" if not args.source else
+                                         "AND c.session_id IN "
+                                         "(SELECT session_id FROM sessions WHERE source = ?) ")
+        + "ORDER BY c.session_id, c.ordinal"
+        + (" LIMIT ?" if args.limit else ""),
+        tuple(x for x in (provider.model, args.source, args.limit) if x is not None),
+    ).fetchall()
+
+    if args.dry_run:
+        st.close()
+        print(f"model    {provider.model} (dim {provider.dim})")
+        print(f"planned  {len(rows):,} chunk(s) to embed")
+        print(f"present  {embed.vector_count(st, provider.model):,} already embedded")
+        return 0
+    if not rows:
+        print(f"nothing to embed — every chunk already has a {provider.model} vector")
+        st.close()
+        return 0
+
+    print(f"embedding {len(rows):,} chunk(s) with {provider.model}")
+    written = 0
+    batch = args.batch
+    try:
+        for start in range(0, len(rows), batch):
+            window = rows[start:start + batch]
+            vectors = provider.embed([r["body"] for r in window])
+            for row, vector in zip(window, vectors):
+                written += embed.store_vectors(
+                    st, row["session_id"], provider.model, provider.dim,
+                    [list(vector)], start_ordinal=row["ordinal"])
+            st.commit()   # resumable: a killed run keeps everything it paid for
+    except embed.EmbeddingUnavailable as exc:
+        st.close()
+        print(f"muninn: {exc}", file=sys.stderr)
+        return 2
+    except PolicyRefused as exc:
+        st.close()
+        print(f"muninn: {exc}", file=sys.stderr)
+        return 2
+    embed.clear_cache()
+    st.close()
+    print(f"wrote {written:,} vector(s)")
+    return 0
+
+
+def cmd_correlate(args: argparse.Namespace) -> int:
+    """Sessions like this one, by mean vector (spec 006).
+
+    Uses the *mean* of a session's chunks rather than its best chunk, because
+    the question is "is this about the same thing", which is a property of the
+    whole conversation. Best-chunk-to-best-chunk would make every pair of
+    sessions that once printed a stack trace look like neighbours.
+    """
+    st = store.open_store(args.db)
+    try:
+        provider = embed.resolve_provider(args.provider)
+    except embed.EmbeddingUnavailable as exc:
+        st.close()
+        print(f"muninn: {exc}", file=sys.stderr)
+        return 2
+
+    rows = st.conn.execute(
+        "SELECT session_id FROM sessions WHERE session_id LIKE ? ORDER BY session_id",
+        (args.session_id + "%",)).fetchall()
+    if len(rows) != 1:
+        print(f"{'no' if not rows else len(rows)} sessions match {args.session_id!r}",
+              file=sys.stderr)
+        st.close()
+        return 1
+
+    neighbours = embed.correlate(st, provider.model, rows[0]["session_id"],
+                                 limit=args.limit)
+    if args.json:
+        print(json.dumps([{"session_id": s, "similarity": round(v, 4)}
+                          for s, v in neighbours]))
+        st.close()
+        return 0
+    if not neighbours:
+        print("no neighbours — has this archive been embedded? (`muninn embed`)")
+        st.close()
+        return 1
+    for session_id, score in neighbours:
+        rec = st.get_session(session_id) or {}
+        when = (rec.get("started_at") or "")[:10]
+        where = Path(rec["cwd"]).name if rec.get("cwd") else "-"
+        topic = f"  {rec['topic']}" if rec.get("topic") else ""
+        print(f"{score:5.3f}  {session_id[:8]}  {rec.get('source','?'):6} {when}  "
+              f"{where}{topic}")
+    st.close()
+    return 0
+
+
+def _semantic_ids(st: store.Store, args: argparse.Namespace) -> list[str] | None:
+    """Session ids from semantic search, or ``None`` if it was not requested.
+
+    Raises ``EmbeddingUnavailable`` rather than returning empty when a provider
+    is missing: "no provider" and "no matches" are different answers, and
+    quietly returning lexical results labelled as semantic is what spec 006
+    forbids in as many words.
+    """
+    if not (args.semantic or args.deep):
+        return None
+    provider = embed.resolve_provider(args.provider)
+    return [sid for sid, _score in embed.search_sessions(
+        st, provider, args.query, limit=max(args.limit * 3, 30))]
+
+
 def cmd_search(args: argparse.Namespace) -> int:
     st = store.open_store(args.db)
+    try:
+        semantic_ids = _semantic_ids(st, args)
+    except embed.EmbeddingUnavailable as exc:
+        st.close()
+        print(f"muninn: {exc}", file=sys.stderr)
+        return 2
+    except PolicyRefused as exc:
+        st.close()
+        print(f"muninn: {exc}", file=sys.stderr)
+        return 2
+
     try:
         hits = st.search(args.query, limit=args.limit, filters=_filters_from_args(args))
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         st.close()
         return 2
+
+    if semantic_ids is not None:
+        hits = _fuse_hits(st, hits, semantic_ids, args)
     if not hits:
         if args.json:
             print(json.dumps([]))
@@ -567,6 +710,43 @@ def cmd_search(args: argparse.Namespace) -> int:
             print(f"    {excerpt}")
     st.close()
     return 0
+
+
+def _fuse_hits(st: store.Store, hits: list, semantic_ids: list[str],
+               args: argparse.Namespace) -> list:
+    """Reciprocal-rank fusion over the lexical and semantic orderings.
+
+    RRF rather than score normalisation: bm25 and cosine are not commensurable,
+    and scaling one into the other invents a weighting nobody can defend. See
+    muninn/fuse.py.
+
+    A semantic-only hit has no lexical row to render, so it is materialised from
+    the archive with an excerpt taken from its first chunk. Dropping such hits
+    would make fusion pointless — finding what lexical search *missed* is the
+    entire reason to run both.
+    """
+    lexical_ids = [h["session_id"] for h in hits]
+    ordered = fuse.fuse_ids([lexical_ids, semantic_ids], limit=args.limit)
+
+    by_id = {h["session_id"]: h for h in hits}
+    fused = []
+    for session_id in ordered:
+        hit = by_id.get(session_id)
+        if hit is None:
+            row = st.conn.execute(
+                "SELECT body FROM chunks WHERE session_id = ? ORDER BY ordinal LIMIT 1",
+                (session_id,)).fetchone()
+            hit = {"session_id": session_id, "score": 0.0, "chunk_hits": 0,
+                   "excerpt": (row["body"][:300] if row else "")}
+        fused.append(hit)
+
+    if args.deep and len(fused) > 1:
+        provider = providers.resolve_provider(args.rerank_model)
+        pairs = [(h["session_id"], h.get("excerpt") or "") for h in fused]
+        order = rerank.rerank(args.query, pairs, provider)
+        rank = {sid: i for i, sid in enumerate(order)}
+        fused.sort(key=lambda h: rank.get(h["session_id"], len(rank)))
+    return fused
 
 
 def cmd_log(args: argparse.Namespace) -> int:
@@ -839,6 +1019,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print(f"\nimport lock held by actor {lock['actor']} (pid {lock['pid']}) "
                   f"since {lock['acquired_at']}")
 
+    _print_embeddings_section(st)
     _print_calibration_section(st, args.db)
     _print_plugins_section()
     _print_policy_section()
@@ -847,6 +1028,30 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     st.close()
     return 0
+
+
+def _print_embeddings_section(st: store.Store) -> None:
+    """Vector count and memory per model (spec 006: report it so growth is visible).
+
+    Two models present is the line worth reading. It means a half-finished
+    re-embed — search uses one space at a time, so the older set is dead weight
+    that still costs the memory printed next to it, and nothing else in the tool
+    will ever mention it.
+    """
+    print("\nembeddings")
+    models = embed.models_present(st)
+    if not models:
+        print("  none — semantic search is unavailable until `muninn embed` runs")
+        return
+    chunks = st.count_chunks()
+    for model, dim, rows in models:
+        # float32: dim * 4 bytes per vector, which is what load_matrix holds.
+        mb = rows * dim * 4 / (1024 * 1024)
+        coverage = f"{rows / chunks * 100:.0f}% of chunks" if chunks else "no chunks"
+        print(f"  {model:44} dim {dim:<5} {rows:>8,} vectors  {mb:6.1f} MB  {coverage}")
+    if len(models) > 1:
+        print("  WARNING: more than one embedding model is present. Search uses one at "
+              "a time, so the others are dead weight — finish the re-embed or delete them")
 
 
 def _print_calibration_section(st: store.Store, db: str) -> None:
@@ -1233,8 +1438,48 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--limit", type=int, default=20)
     p_search.add_argument("--json", action="store_true",
                           help="print a JSON array of result objects instead of text")
+    p_search.add_argument("--semantic", action="store_true",
+                          help="fuse semantic results with lexical ones (needs "
+                               "an embedding provider; errors rather than "
+                               "silently returning lexical-only results)")
+    p_search.add_argument("--deep", action="store_true",
+                          help="--semantic, plus an LLM rerank over the top "
+                               "candidates. Slower and costs a model call")
+    p_search.add_argument("--provider", help="embedding provider name")
+    # Not `--model`: that is already a *filter* (substring match on the model a
+    # session was recorded with), and one flag cannot mean both "search for
+    # sessions that used X" and "rerank using X".
+    p_search.add_argument("--rerank-model", dest="rerank_model",
+                          help="text model for --deep reranking")
     _add_filter_args(p_search)
     p_search.set_defaults(func=cmd_search)
+
+    p_embed = sub.add_parser(
+        "embed", help="generate chunk embeddings for semantic search",
+        description="Embed chunks that do not yet have a vector for the "
+                    "provider's model. Resumable: progress is committed per "
+                    "batch, so a killed run keeps everything it paid for. "
+                    "Vectors from different models are never mixed — the model "
+                    "id is part of the key, because two embedding spaces "
+                    "compared together return confident nonsense rather than "
+                    "an error. See docs/specs/006.")
+    p_embed.add_argument("--provider", help="embedding provider name")
+    p_embed.add_argument("--source", help="only this source")
+    p_embed.add_argument("--limit", type=int, help="stop after this many chunks")
+    p_embed.add_argument("--batch", type=int, default=64)
+    p_embed.add_argument("--dry-run", action="store_true",
+                         help="report what would be embedded; generate nothing")
+    p_embed.set_defaults(func=cmd_embed)
+
+    p_correlate = sub.add_parser(
+        "correlate", help='"conversations like this one", by mean vector',
+        description="Nearest neighbours of a session's mean embedding vector, "
+                    "excluding itself. Needs `muninn embed` to have run.")
+    p_correlate.add_argument("session_id", help="full id or a prefix")
+    p_correlate.add_argument("--limit", type=int, default=10)
+    p_correlate.add_argument("--provider", help="embedding provider name")
+    p_correlate.add_argument("--json", action="store_true")
+    p_correlate.set_defaults(func=cmd_correlate)
 
     p_show = sub.add_parser("show", help="print one session (id prefixes are fine)")
     p_show.add_argument("session_id")
