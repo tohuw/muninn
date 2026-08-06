@@ -68,8 +68,11 @@ class TextProvider(Protocol):
 class HistorySource(Protocol):
     """Contributes sessions Muninn cannot discover locally."""
     name: str
+    windowed: bool                                   # absence proves nothing if True
     def available(self) -> str | None: ...
     def fetch(self, context: "SourceContext") -> Iterable["ParsedSession"]: ...
+    # Optional. Ids still seen upstream, or None to abstain. See "Absence" below.
+    def reconcile(self, context: "SourceContext") -> Iterable[str] | None: ...
 
 
 @dataclass(frozen=True)
@@ -227,23 +230,63 @@ uv run muninn --db /tmp/muninn-008.db index    # real-corpus regression
 
 Commit; do not push.
 
-## Known limitation (found by the first real implementation)
+## Absence, added after the first real implementation (#1, resolved)
 
-`HistorySource.fetch()` is synchronous and receives only a `SourceContext`, so a
-source has **no route to record that a session it previously contributed has
-vanished upstream**. Contributing is expressible; absence is not.
+`HistorySource.fetch()` was synchronous and received only a `SourceContext`, so
+a source had **no route to record that a session it previously contributed had
+vanished upstream**. Contributing was expressible; absence was not. The first
+real implementation had to put eviction in a non-protocol `poll(store, context)`
+method — working, tested, and unreachable through the contract.
 
-That matters because the correct response to a vanished remote session is not
-deletion — the archived prose may be the only surviving copy — but
-`source_present = 0`, exactly as the local sweep does. See
-`.valholl/articles/archive-of-record.md`.
+Resolved as option 2 of [#1](https://github.com/tohuw/muninn/issues/1):
 
-The first real implementation had to put eviction in a non-protocol
-`poll(store, context)` method, which works and is tested but which nothing in
-core calls. Tracked as [#1](https://github.com/tohuw/muninn/issues/1); the
-likely fix is a `reconcile()` method returning the keys a source still vouches
-for, so core decides what absence means rather than trusting each plugin author
-to know the rule.
+```python
+class HistorySource(Protocol):
+    windowed: bool                                   # absence proves nothing if True
+    def reconcile(self, context) -> Iterable[str] | None: ...   # optional
+```
+
+A source reports **what it still sees**. It never reports what should happen
+about what it does not, and it is never handed a `Store` — that is the design,
+not an omission. The correct response to a vanished remote session is
+`source_present = 0` and never a delete, because the archived prose may be the
+only surviving copy (`.valholl/articles/archive-of-record.md`), and a plugin
+author who is not given the means to delete cannot get that rule wrong. Core's
+half is `ingest.reconcile_history_source(st, source, context)`, which is where
+the never-delete rule already lives.
+
+Three return values, three different statements — the distinction the design
+rests on:
+
+| return | meaning | core does |
+|---|---|---|
+| iterable of ids | the complete set vouched for now | flags everything else in this namespace |
+| empty iterable | "upstream holds nothing" | honours it literally |
+| `None` | "I cannot enumerate right now" | flags nothing |
+
+An unreachable remote returns `None`; returning `[]` there would report the
+entire namespace as vanished. **A raised exception is treated as `None`** for
+the same reason — a network blip must cost a pass, not a mass
+reclassification. A `windowed` source is refused before it is even asked
+(invariant 6, as for export importers).
+
+`reconcile()` is **optional**, which is why this needed no `API_VERSION` bump: a
+plugin written against version 1 keeps loading and simply never has absence
+recorded on its behalf.
+
+Reconciliation is scoped by `SourceContext.namespace_prefix()`, so a source can
+only speak for the id space it was given. The prefix is `LIKE`-escaped because
+`source` is a plugin-supplied string and `_` is a single-character wildcard
+there — an unescaped `plugin:acme.a_c:` would also match `plugin:acme.abc:`,
+which is one plugin flagging another's sessions.
+
+**Still open, deliberately:** *who calls* `fetch()` and `reconcile()`, and under
+what ledger row a contributed session enters the archive. #1 was a contract gap
+and this closes the contract; a core-side scheduler is the issue's option 3,
+which it explicitly did not favour, and it needs a `source_kind` decision the
+closed ledger vocabulary does not yet have. Until then a plugin drives its own
+poll and calls `reconcile_history_source` for the archive-safety half, which is
+exactly what the downstream implementation needed.
 
 ## Guardrails
 

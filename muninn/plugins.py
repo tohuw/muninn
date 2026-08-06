@@ -67,9 +67,53 @@ class HistorySource(Protocol):
 
     name: str
 
+    #: ``True`` when this source only ever sees a recent window of its own
+    #: history — a feed that keeps 30 days, say. Absence from a windowed source
+    #: proves nothing about upstream deletion, so :meth:`reconcile` is refused
+    #: for one. Same invariant the export importers already carry (invariant 6);
+    #: declared here rather than re-derived so a plugin author states the fact
+    #: once instead of remembering the rule at every call site.
+    windowed: bool
+
     def available(self) -> str | None: ...
 
     def fetch(self, context: "SourceContext") -> Iterable[ParsedSession]: ...
+
+    def reconcile(self, context: "SourceContext") -> Iterable[str] | None:
+        """External ids this source **still sees**, or ``None`` to abstain.
+
+        The other half of the contract, and the one that was missing until
+        tohuw/muninn#1: ``fetch()`` can say "here is a session", and nothing
+        could say "the one I gave you last week is gone from upstream".
+
+        A source reports **what it sees**; it never reports what should happen
+        about what it does not. That split is the whole point. The correct
+        response to a vanished remote session is not deletion — the archived
+        prose may be the only surviving copy — but ``source_present = 0``, and
+        that rule lives in core (``ingest.reconcile_history_source``) rather
+        than in each plugin author's memory. Three options were considered; this
+        is option 2 from the issue, chosen because it keeps the never-delete
+        decision in one place instead of trusting every implementer to know it.
+
+        Return values, all three of which mean something different:
+
+        - **An iterable of external ids** — the *complete* set this source
+          vouches for right now. Core namespaces each one and flags every
+          archived session in this namespace that is not among them.
+        - **An empty iterable** — "I enumerated upstream and it holds nothing."
+          Honoured literally, because it is a real state.
+        - **``None``** — "I cannot enumerate right now." Nothing is flagged.
+          This is what an unreachable remote must return, and returning an empty
+          iterable there instead would report the entire namespace as vanished.
+          An exception is treated as ``None`` for the same reason, so a raising
+          client is a missed pass rather than a mass reclassification.
+
+        Optional: a source that only contributes may leave this out entirely,
+        and core treats its absence as a permanent ``None``. That is why adding
+        it needs no ``API_VERSION`` bump — an existing plugin keeps working
+        unchanged, it simply never has absence recorded on its behalf.
+        """
+        return None
 
 
 @dataclass(frozen=True)
@@ -89,7 +133,19 @@ class SourceContext:
     source: str
 
     def namespaced_id(self, external_id: str) -> str:
-        return f"plugin:{self.plugin}.{self.source}:{external_id}"
+        return f"{self.namespace_prefix()}{external_id}"
+
+    def namespace_prefix(self) -> str:
+        """The shared prefix of every id this source contributes.
+
+        Exists so core can ask "which archived sessions came from this source"
+        structurally, by the id space it was given, rather than by trusting a
+        ``sessions.source`` value the plugin itself wrote. Reconciliation reads
+        it (see ``ingest.reconcile_history_source``): the set core compares
+        against has to be exactly the set this source is entitled to speak for,
+        or one plugin's absence claim could flag another's sessions.
+        """
+        return f"plugin:{self.plugin}.{self.source}:"
 
 
 @dataclass(frozen=True)

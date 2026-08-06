@@ -16,6 +16,7 @@ import unittest
 from unittest import mock
 
 from muninn.plugins import (
+    HistorySource,
     PluginLoadError,
     PluginSpec,
     SourceContext,
@@ -240,6 +241,51 @@ class NamespacingTest(unittest.TestCase):
         self.assertEqual(len(sessions), 1)
         self.assertEqual(sessions[0].session_id, "plugin:acme.tickets:12345")
         self.assertTrue(sessions[0].session_id.startswith("plugin:"))
+
+    def test_the_namespace_prefix_is_the_id_scheme_minus_the_key(self) -> None:
+        # Core scopes reconciliation by this, so the two must not drift: a prefix
+        # that did not match what namespaced_id() writes would either flag
+        # nothing or flag another source's sessions.
+        ctx = SourceContext(plugin="acme", source="tickets")
+        self.assertTrue(ctx.namespaced_id("12345").startswith(ctx.namespace_prefix()))
+        self.assertEqual(ctx.namespaced_id("12345")[len(ctx.namespace_prefix()):], "12345")
+
+
+class ReconcileContractTest(unittest.TestCase):
+    """`reconcile()` — the route a source uses to say "this key vanished" (#1).
+
+    The store-side behaviour — what core decides absence *means* — lives in
+    tests/test_history_sources.py. What belongs here is the *vocabulary*: that
+    the method is optional, and that its three return values stay three distinct
+    statements rather than collapsing into a truthiness check somewhere.
+    """
+
+    def test_a_source_that_only_contributes_needs_no_reconcile(self) -> None:
+        # Adding a required method would have been an API_VERSION break. It is
+        # optional instead, so a plugin written against version 1 keeps loading
+        # and simply never has absence recorded on its behalf.
+        class ContributeOnly:
+            name = "tickets"
+
+            def available(self) -> str | None:
+                return None
+
+            def fetch(self, context: SourceContext):
+                return []
+
+        spec = PluginSpec(name="acme", version="1.0.0",
+                          history_sources=(ContributeOnly(),))
+        result = _discover_with(_fake_entry_point("acme", spec))
+        self.assertEqual(result.errors, ())
+        self.assertFalse(hasattr(result.specs[0].history_sources[0], "reconcile"))
+
+    def test_none_and_empty_are_different_statements(self) -> None:
+        # The distinction the whole design rests on: "I cannot enumerate" versus
+        # "I enumerated and upstream holds nothing". An unreachable remote must
+        # return the first, and a source that conflated them would report its
+        # entire namespace as vanished on every network blip.
+        self.assertIsNone(HistorySource.reconcile(object(), SourceContext("a", "b")))
+        self.assertIsNotNone([])
 
 
 if __name__ == "__main__":
