@@ -21,6 +21,34 @@
 > `muninn/policy.py` landed earlier with spec 008; this spec added
 > `muninn/redact.py`, `providers.py`, `enrich.py` and `muninn enrich`.
 
+### The first full-corpus pass
+
+Run against the real archive (4,116 sessions, 1,009 of them with no surviving
+original). 257 sessions planned; 190 enriched by Muninn, the rest already
+carrying facets harvested from claudex.
+
+```
+outcome distribution   fixed 396 · ongoing 379 · exploratory 269 · abandoned 19
+text coverage          93.8% of all conversation words now carry facets
+failures               1 of 191 (provider-error — a timeout, retried clean)
+```
+
+**The redaction gate stripped 601 secrets** before any text reached a provider:
+429 `assignment` (`PASSWORD=…`), 156 `openai-key`, **8 `anthropic-key`**, 4
+`credential-url`, 2 `jwt`, 2 `bearer-token`. That is the hard gate proving
+itself on real data rather than on planted fixtures — these transcripts really
+do contain live credentials, and the archive still holds every one of them,
+because redaction runs on the way out and never on ingest.
+
+**Parallelism was necessary, not a nicety.** Single-threaded the pass measured
+34.8 s per call and ~10.8 hours. `--shard K/N` partitions by SHA-256 of the
+session id — *not* `hash()`, which Python randomises per process and which would
+therefore give each worker a different partition of the same corpus, producing
+both duplicated sessions and, worse, sessions no worker claims. Four workers
+measured a **3.8x speedup** (9.2 s/call aggregate) with no rate limiting, and
+the exact partition was verified against the live archive before launch:
+33 + 44 + 40 + 41 = 158 = the unsharded plan.
+
 ### What running it for real changed
 
 Three things only a real pass surfaced, all in the *operational* half rather

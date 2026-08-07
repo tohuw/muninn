@@ -217,6 +217,18 @@ class NoProviderTest(_Archive):
         self.assertEqual(code, 2)
         self.assertEqual(out.strip(), "")
 
+    def test_embed_dry_run_actually_runs(self) -> None:
+        # It didn't: the first version closed the store and then read from it,
+        # so the one path whose entire job is to be safe to run was the only one
+        # that raised. Caught by running it, because every unit test that
+        # exercised the planning query held its own open store.
+        with patch.object(embed, "resolve_provider", return_value=FakeEmbedder()):
+            code, out, err = self._run("embed", "--dry-run")
+        self.assertEqual(code, 0, err)
+        self.assertIn("planned", out)
+        self.assertIn("already embedded", out)
+        self.assertNotIn("Traceback", err)
+
     def test_plain_search_is_unaffected(self) -> None:
         # The other half: the refusal must not have broken the default path.
         with self.unavailable:

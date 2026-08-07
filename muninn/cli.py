@@ -569,10 +569,15 @@ def cmd_embed(args: argparse.Namespace) -> int:
     ).fetchall()
 
     if args.dry_run:
+        # Every read finishes before the close. The first version closed the
+        # store and then called vector_count() on it, so `--dry-run` — the one
+        # path whose entire job is to be safe to run — was the only path that
+        # raised.
+        present = embed.vector_count(st, provider.model)
         st.close()
         print(f"model    {provider.model} (dim {provider.dim})")
         print(f"planned  {len(rows):,} chunk(s) to embed")
-        print(f"present  {embed.vector_count(st, provider.model):,} already embedded")
+        print(f"present  {present:,} already embedded")
         return 0
     if not rows:
         print(f"nothing to embed — every chunk already has a {provider.model} vector")
