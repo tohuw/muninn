@@ -34,6 +34,7 @@ mattered" is a judgement, and a union produces a list nobody reads.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Sequence
@@ -390,9 +391,28 @@ class Plan:
         return total
 
 
+def shard_of(session_id: str, count: int) -> int:
+    """Which shard a session belongs to. **Stable across processes.**
+
+    SHA-256 rather than ``hash()``, and this is the whole reason the function
+    exists instead of being inlined. Python randomises string hashing per
+    process (PEP 456, ``PYTHONHASHSEED``), so four workers started from one
+    shell would each compute a *different* partition of the same corpus —
+    producing both overlaps (two workers enriching one session, paying twice)
+    and gaps (sessions no worker claims, silently never enriched). The gap is
+    the dangerous half: it looks exactly like a completed run.
+
+    Only the first 8 bytes are used, which is ample for partitioning and keeps
+    the arithmetic in a machine word.
+    """
+    digest = hashlib.sha256(session_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % count
+
+
 def plan(st: Store, calibration: dict[str, Any] | None, *,
          session_id: str | None = None, source: str | None = None,
-         limit: int | None = None, force: bool = False) -> Plan:
+         limit: int | None = None, force: bool = False,
+         shard: tuple[int, int] | None = None) -> Plan:
     """Which sessions to enrich, and why the rest were left out.
 
     **An un-surveyed archive produces an empty plan, not a defaulted one.** The
@@ -457,6 +477,12 @@ def plan(st: Store, calibration: dict[str, Any] | None, *,
             continue
         if row["topic"] and not force:
             skip("already-enriched")
+            continue
+        if shard is not None and shard_of(row["session_id"], shard[1]) != shard[0]:
+            # Counted, not silent: a worker reporting "0 planned" should be able
+            # to show that the other shards hold the work, rather than looking
+            # like an empty corpus.
+            skip("other-shard")
             continue
         candidates.append(Candidate(session_id=row["session_id"], source=row["source"],
                                     words=words, already_enriched=bool(row["topic"])))

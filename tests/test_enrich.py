@@ -15,6 +15,7 @@ import contextlib
 import io
 import json
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -181,6 +182,95 @@ class GateTest(_Archive):
 
 
 # ── Criterion 5: redaction is a hard gate ─────────────────────────────────────
+
+class ShardTest(_Archive):
+    """Splitting a corpus pass across workers. Two ways to get it wrong.
+
+    A corpus pass measured 34.8s per model call and ~11 hours single-threaded,
+    and the bottleneck is per-call latency rather than the machine — so the work
+    is worth partitioning. The partition has to be *identical* in every worker,
+    which is the whole risk.
+    """
+
+    def _ids(self, n: int = 40) -> list[str]:
+        for _ in range(n):
+            self.add(words=5000)
+        return [r["session_id"] for r in
+                self.st.conn.execute("SELECT session_id FROM sessions")]
+
+    def test_the_shards_partition_the_corpus_exactly(self) -> None:
+        # Every session in exactly one shard: no overlap (paying twice) and no
+        # gap (a session no worker claims, which looks just like a finished run).
+        ids = self._ids()
+        calibration = self.calibrate(claude=1000)
+        seen: list[str] = []
+        for k in range(4):
+            plan = enrich.plan(self.st, calibration, shard=(k, 4))
+            seen.extend(c.session_id for c in plan.candidates)
+        self.assertEqual(sorted(seen), sorted(ids))
+        self.assertEqual(len(seen), len(set(seen)))
+
+    def test_the_partition_is_stable_across_processes(self) -> None:
+        # The bug this guards. Python randomises string hashing per process
+        # (PEP 456), so `hash()` would give each worker a *different* partition
+        # of the same corpus — overlaps and, worse, silent gaps. A subprocess
+        # with a different PYTHONHASHSEED must agree exactly.
+        import os
+        import subprocess
+
+        ids = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta"]
+        mine = [enrich.shard_of(i, 4) for i in ids]
+        code = ("import sys; from muninn.enrich import shard_of; "
+                f"print([shard_of(i, 4) for i in {ids!r}])")
+        env = {**os.environ, "PYTHONHASHSEED": "12345"}
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                             text=True, env=env, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(eval(out.stdout.strip()), mine)
+
+    def test_shards_are_roughly_even(self) -> None:
+        # Not a correctness property, but a lopsided partition wastes the
+        # parallelism it was added for.
+        counts = [0, 0, 0, 0]
+        for i in range(400):
+            counts[enrich.shard_of(f"session-{i}", 4)] += 1
+        self.assertTrue(all(70 <= c <= 130 for c in counts), counts)
+
+    def test_one_shard_is_the_whole_corpus(self) -> None:
+        ids = self._ids(10)
+        plan = enrich.plan(self.st, self.calibrate(claude=1000), shard=(0, 1))
+        self.assertEqual(len(plan.candidates), len(ids))
+
+    def test_other_shards_are_counted_not_silent(self) -> None:
+        # A worker reporting "0 planned" should be able to show the work exists
+        # elsewhere, rather than looking like an empty corpus.
+        self._ids(20)
+        plan = enrich.plan(self.st, self.calibrate(claude=1000), shard=(0, 4))
+        self.assertGreater(plan.skipped.get("other-shard", 0), 0)
+
+    def test_a_malformed_or_out_of_range_shard_is_refused(self) -> None:
+        # Exit 2 either way, by two different routes: `-1/4` never reaches the
+        # handler because argparse reads a leading dash as an option and exits
+        # itself. What matters is that no bad value is silently accepted — a
+        # shard quietly out of range would leave part of the corpus unclaimed.
+        for bad in ("4/4", "-1/4", "0/0", "abc", "1", "1/"):
+            with self.subTest(shard=bad):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    try:
+                        code = cli.main(["--db", str(self.db), "enrich", "--shard", bad])
+                    except SystemExit as exit_:
+                        code = exit_.code
+                self.assertEqual(code, 2, f"{bad!r} was accepted")
+
+    def test_sharding_composes_with_the_other_skips(self) -> None:
+        # Sharding must not smuggle a tool-invoked session past the gate.
+        for _ in range(20):
+            self.add(words=50_000, provenance="tool-invoked")
+        for k in range(4):
+            plan = enrich.plan(self.st, self.calibrate(claude=1000), shard=(k, 4))
+            self.assertEqual(plan.candidates, ())
+
 
 class RedactionTest(_Archive):
     PLANTED = {
