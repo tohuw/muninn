@@ -13,6 +13,42 @@
 > nearest neighbours at 0.999 / 0.999 / 0.978 / 0.977 / 0.977, every one of them
 > another session about the same series, with the query session excluded. That is
 > the acceptance criterion met on real data rather than on a planted twin.
+
+### Measured limitation: mean-pooling washes out long sessions
+
+`correlate` compares each session's **mean** chunk vector, and that choice
+degrades with length in a way worth quantifying before anyone trusts a raw
+score. Measured across 4,942 sessions in the real archive — mean pairwise cosine
+between sessions in each length bucket:
+
+| session length | mean pairwise cosine | p95 | sessions |
+|---|---|---|---|
+| < 5k words | 0.630 | 0.824 | 3,567 |
+| 5–30k | 0.749 | 0.890 | 1,035 |
+| 30–100k | 0.818 | 0.952 | 286 |
+| **> 100k** | **0.861** | **0.966** | 54 |
+
+Averaging hundreds of chunks pulls every long session toward the centroid of the
+embedding space, so **the similarity floor rises with length**. A 0.998 between
+two 100k-word sessions sits barely above that bucket's p95; the same number
+between two 20k-word sessions is genuinely strong. This is why `correlate`
+looked excellent on a 35k-word session and returned an unrelated top hit on a
+long one — not a bug, and not fixed by a better model, because it is a property
+of mean pooling.
+
+Three candidate fixes, none implemented, in rough order of preference:
+
+1. **Report a percentile, not a raw cosine.** Cheap, honest, and it makes the
+   number mean the same thing at every length.
+2. **Score by best-chunk-pair** for sessions above some length, the way query
+   search already does — a session is "about" what its strongest passage is
+   about.
+3. **Centre the vectors** (subtract the corpus mean) before comparing, which
+   removes the shared component that causes the floor.
+
+Recorded rather than fixed because picking between them wants an evaluation set,
+and inventing one from this corpus would tune the metric to the data it was
+derived from.
 >
 > Two things worth knowing before touching this code:
 >

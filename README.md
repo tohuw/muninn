@@ -243,7 +243,9 @@ expansion is capped rather than unbounded.
 Semantic recall is optional and pluggable via an `EmbeddingProvider` protocol.
 `muninn embed` generates vectors; `search --semantic` fuses them with the lexical
 results by reciprocal rank, and `muninn correlate` answers "conversations like
-this one". Without a provider installed, `--semantic` **exits non-zero and says
+this one" — best on short and medium sessions; see
+[spec 006](docs/specs/006-hybrid-retrieval.md) for a measured caveat about very
+long ones. Without a provider installed, `--semantic` **exits non-zero and says
 so** — it never returns lexical results labelled as semantic.
 
 Measured on a real archive of **112,193 chunks** (384-dim vectors from the local
