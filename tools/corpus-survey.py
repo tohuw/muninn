@@ -142,6 +142,30 @@ ENRICH_OUTPUT_TOKENS_PER_CALL = 1048
 ENRICH_CHUNK_WORDS = 12_000
 ENRICH_CHUNK_OVERLAP_WORDS = 400
 
+# Query-time costs. A semantic search embeds only the query — the corpus vectors
+# were paid for once, at embed time — which is why it is orders of magnitude
+# cheaper than anything else here. `--deep` adds one text-model call per search
+# and is the only query-time path that sends archived prose anywhere.
+QUERY_TOKENS_PER_SEARCH = 20
+RERANK_INPUT_TOKENS_PER_SEARCH = 3500
+RERANK_OUTPUT_TOKENS_PER_SEARCH = 120
+
+# Assumed query volume for the recurring figure. A guess, labelled as one in the
+# output: this script can measure a corpus but cannot know how often someone will
+# search it.
+# Mirrors muninn/cost.py's free_stages(). Named for the drift test, which asserts
+# the two files agree on what costs nothing — a stage listed free here while the
+# library meters it is the failure that would actually mislead someone.
+FREE_OPERATIONS = [
+    "ingest (hook, watcher, sweep, ledger)",
+    "search (lexical), log, show, resume",
+    "correlate (compares stored vectors; no model call)",
+    "doctor, survey, and this report",
+]
+
+ASSUMED_SEARCHES_PER_MONTH = 100
+ASSUMED_DEEP_SHARE = 0.10
+
 # USD per 1M tokens. `confidence: low` marks a rate nobody here has verified
 # against an invoice; a projection that uses one says so in its output, because a
 # cost figure whose inputs cannot be ranked by trustworthiness gets quoted as
@@ -984,6 +1008,11 @@ class Aggregator:
         self.max_age_days: dict[str, float] = {}
         self.min_age_days: dict[str, float] = {}
         self.human_words: dict[str, list[int]] = {}
+        # Words per calendar month, human sessions only. Needed for the ongoing
+        # cost estimate: a one-time backfill figure answers "what does it cost to
+        # start", and the question after it is always "what does it cost to keep
+        # running", which needs an observed rate rather than a total.
+        self.human_month_words: dict[str, dict[str, list[int]]] = {}
 
     def add(self, stat: SessionStat) -> None:
         source = stat.source
@@ -1042,6 +1071,9 @@ class Aggregator:
 
         if stat.provenance_class == "human":
             self.human_words.setdefault(source, []).append(stat.prose_words)
+            if stat.start_month:
+                by_month = self.human_month_words.setdefault(source, {})
+                by_month.setdefault(stat.start_month, []).append(stat.prose_words)
 
     # -- derived views ----------------------------------------------------- #
 
@@ -1191,7 +1223,7 @@ class Aggregator:
             }
         return out
 
-    def cost_projection(self) -> dict[str, Any]:
+    def cost_projection(self, started_utc: dt.datetime | None = None) -> dict[str, Any]:
         """What a full Muninn pass over this corpus would cost, per scenario.
 
         Answerable **before installing anything**, which is the point of putting it
@@ -1237,21 +1269,83 @@ class Aggregator:
         enrich_in = above_words * ENRICH_INPUT_TOKENS_PER_WORD
         enrich_out = above_calls * ENRICH_OUTPUT_TOKENS_PER_CALL
 
+        # -- Ongoing rate, from months that actually completed ---------------- #
+        # The current month is excluded: a survey run on the 3rd would otherwise
+        # report a month's cost as a third of itself and make growth look like
+        # decline. Median rather than mean, because one heavy month should not set
+        # the expectation for every month after it.
+        this_month = started_utc.strftime("%Y-%m") if started_utc else None
+        # Grouped by calendar month across sources, not per (source, month): a month
+        # in which both Claude and Codex were busy costs the sum of the two, and
+        # pooling the pairs would report the median of the halves instead.
+        per_calendar_month: dict[str, list[int]] = {}
+        for source in self.sources_seen():
+            words_all = self.human_words.get(source, [])
+            if not words_all:
+                continue
+            threshold_words = derive_enrichment_gate(words_all)["threshold_words"]
+            for month, counts in self.human_month_words.get(source, {}).items():
+                if this_month and month >= this_month:
+                    continue
+                eligible = [c for c in counts if c >= threshold_words]
+                per_calendar_month.setdefault(month, []).extend(eligible)
+        monthly_words = [sum(v) for _, v in sorted(per_calendar_month.items())]
+        monthly_sessions = [len(v) for _, v in sorted(per_calendar_month.items())]
+        complete_months = len(monthly_words)
+        median_words = int(percentile(sorted(monthly_words), 50.0) or 0)
+        median_sessions = int(percentile(sorted(monthly_sessions), 50.0) or 0)
+        median_calls = sum(enrich_calls(w) for w in [median_words]) if median_words else 0
+        # New chunks per month, from the same median session volume.
+        median_chunks = (estimate_chunks(median_words) if median_words else 0)
+
+        searches = ASSUMED_SEARCHES_PER_MONTH
+        deep_searches = int(searches * ASSUMED_DEEP_SHARE)
+
         free = COST_RATES["local-or-seat-licensed"]
         titan = COST_RATES["titan-embed"]
         haiku = COST_RATES["claude-haiku-4-5"]
+        sonnet = COST_RATES["claude-sonnet-5"]
 
         def scenario(embed_rate: dict, text_rate: dict) -> dict[str, Any]:
             embed_usd = _tokens_usd(embed_rate, embed_tokens)
             enrich_usd = _tokens_usd(text_rate, enrich_in, enrich_out)
+
+            # Ongoing: new sessions each month, plus query-time costs.
+            m_embed = _tokens_usd(embed_rate,
+                                  median_chunks * CHUNK_TARGET_WORDS
+                                  * EMBED_TOKENS_PER_WORD)
+            m_enrich = _tokens_usd(text_rate,
+                                   median_words * ENRICH_INPUT_TOKENS_PER_WORD,
+                                   median_calls * ENRICH_OUTPUT_TOKENS_PER_CALL)
+            m_semantic = _tokens_usd(embed_rate, searches * QUERY_TOKENS_PER_SEARCH)
+            m_deep = _tokens_usd(text_rate,
+                                 deep_searches * RERANK_INPUT_TOKENS_PER_SEARCH,
+                                 deep_searches * RERANK_OUTPUT_TOKENS_PER_SEARCH)
             return {
-                "embed_usd": round(embed_usd, 4),
-                "enrich_usd": round(enrich_usd, 4),
-                "one_time_total_usd": round(embed_usd + enrich_usd, 4),
-                "usd_per_1000_sessions_enriched": round(
-                    (enrich_usd / above_sessions * 1000) if above_sessions else 0.0, 4),
-                "usd_per_1m_words_embedded": round(
-                    (embed_usd / total_words * 1_000_000) if total_words else 0.0, 4),
+                "one_time": {
+                    "embed_usd": round(embed_usd, 4),
+                    "enrich_usd": round(enrich_usd, 4),
+                    "total_usd": round(embed_usd + enrich_usd, 4),
+                },
+                "ongoing_monthly": {
+                    "embed_new_sessions_usd": round(m_embed, 4),
+                    "enrich_new_sessions_usd": round(m_enrich, 4),
+                    "semantic_search_usd": round(m_semantic, 4),
+                    "deep_search_usd": round(m_deep, 4),
+                    "total_usd": round(m_embed + m_enrich + m_semantic + m_deep, 4),
+                },
+                "per_unit": {
+                    "usd_per_1000_sessions_enriched": round(
+                        (enrich_usd / above_sessions * 1000) if above_sessions else 0.0, 4),
+                    "usd_per_1m_words_embedded": round(
+                        (embed_usd / total_words * 1_000_000) if total_words else 0.0, 4),
+                    "usd_per_1000_semantic_searches": round(
+                        _tokens_usd(embed_rate, 1000 * QUERY_TOKENS_PER_SEARCH), 6),
+                    "usd_per_1000_deep_searches": round(
+                        _tokens_usd(text_rate,
+                                    1000 * RERANK_INPUT_TOKENS_PER_SEARCH,
+                                    1000 * RERANK_OUTPUT_TOKENS_PER_SEARCH), 4),
+                },
             }
 
         return {
@@ -1281,9 +1375,22 @@ class Aggregator:
             },
             "rates_used": {"titan-embed": titan, "claude-haiku-4-5": haiku,
                            "local-or-seat-licensed": free},
+            "free_operations": list(FREE_OPERATIONS),
+            "ongoing_basis": {
+                "complete_months_observed": complete_months,
+                "median_enrichable_sessions_per_month": median_sessions,
+                "median_enrichable_words_per_month": median_words,
+                "assumed_searches_per_month": searches,
+                "assumed_deep_share": ASSUMED_DEEP_SHARE,
+                "note": "Session volume is measured from complete months only — the "
+                        "current partial month is excluded, and the median is used so "
+                        "one heavy month does not set the expectation. Search volume "
+                        "is a guess; this script cannot know how often you will search.",
+            },
             "scenarios": {
                 "local_or_seat_licensed": scenario(free, free),
                 "metered_titan_and_haiku": scenario(titan, haiku),
+                "metered_titan_and_sonnet": scenario(titan, sonnet),
             },
             "low_confidence_rates": sorted(
                 name for name, rate in COST_RATES.items()
@@ -1506,7 +1613,7 @@ def run_survey(claude_override: Path | None, codex_override: Path | None,
                            for name, data in source_reports.items()},
         "retention": aggregator.retention(),
         "derived_calibration": aggregator.derived_calibration(),
-        "cost_projection": aggregator.cost_projection(),
+        "cost_projection": aggregator.cost_projection(started),
     }
     report["anomalies"] = build_anomalies(aggregator, source_reports)
     return report
@@ -1629,14 +1736,52 @@ def render_summary(report: dict[str, Any], out_path: Path | None) -> str:
         add("  Scope is human-provenance sessions only, so these counts are lower "
             "than `muninn survey`'s,")
         add("  which also enriches subagent sessions. Same rates, wider corpus.")
+        add("")
+        add("  one-time backfill (embed the corpus, enrich what clears the gate)")
         for name, scenario in cost["scenarios"].items():
             mark = "~" if cost["low_confidence_rates"] and "metered" in name else " "
-            add(f"  {name:26} {mark}${scenario['one_time_total_usd']:>8,.2f}   "
-                f"embed {mark}${scenario['embed_usd']:.2f} + "
-                f"enrich {mark}${scenario['enrich_usd']:.2f}")
-            add(f"  {'':26}  ${scenario['usd_per_1000_sessions_enriched']:>8,.2f} "
+            one = scenario["one_time"]
+            add(f"  {name:27}{mark}${one['total_usd']:>9,.2f}   "
+                f"embed {mark}${one['embed_usd']:.2f} + "
+                f"enrich {mark}${one['enrich_usd']:.2f}")
+
+        basis = cost["ongoing_basis"]
+        add("")
+        if basis["complete_months_observed"]:
+            add(f"  ongoing, per month — {basis['median_enrichable_sessions_per_month']:,} "
+                f"new enrichable sessions/month "
+                f"(median of {basis['complete_months_observed']:,} complete months),")
+            add(f"  plus an assumed {basis['assumed_searches_per_month']:,} searches/month, "
+                f"{basis['assumed_deep_share']:.0%} of them `--deep`")
+            for name, scenario in cost["scenarios"].items():
+                mark = "~" if cost["low_confidence_rates"] and "metered" in name else " "
+                ongoing = scenario["ongoing_monthly"]
+                add(f"  {name:27}{mark}${ongoing['total_usd']:>9,.2f}   "
+                    f"embed {mark}${ongoing['embed_new_sessions_usd']:.2f} + "
+                    f"enrich {mark}${ongoing['enrich_new_sessions_usd']:.2f} + "
+                    f"search {mark}${ongoing['semantic_search_usd'] + ongoing['deep_search_usd']:.2f}")
+        else:
+            add("  ongoing, per month: not estimated — no complete calendar month of "
+                "history yet.")
+
+        add("")
+        add("  per unit, so you can rescale any of this yourself")
+        for name, scenario in cost["scenarios"].items():
+            mark = "~" if cost["low_confidence_rates"] and "metered" in name else " "
+            unit = scenario["per_unit"]
+            add(f"  {name:27}{mark}${unit['usd_per_1000_sessions_enriched']:>9,.2f} "
                 f"per 1,000 sessions enriched")
-        add("  Ingest, lexical search, correlate and these reports are free — no model.")
+            add(f"  {'':27}{mark}${unit['usd_per_1m_words_embedded']:>9,.2f} "
+                f"per 1M words embedded")
+            add(f"  {'':27}{mark}${unit['usd_per_1000_deep_searches']:>9,.2f} "
+                f"per 1,000 `--deep` searches "
+                f"({mark}${unit['usd_per_1000_semantic_searches']:.4f} per 1,000 plain "
+                f"`--semantic`)")
+
+        add("")
+        add("  free — no model call, any volume:")
+        for item in cost["free_operations"]:
+            add(f"    {item}")
         if cost["low_confidence_rates"]:
             add(f"  [~] depends on an unverified rate: "
                 f"{', '.join(cost['low_confidence_rates'])}")

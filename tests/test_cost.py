@@ -249,6 +249,26 @@ class StandaloneScriptDriftTest(unittest.TestCase):
         self.assertEqual(self.values["ENRICH_OUTPUT_TOKENS_PER_CALL"],
                          cost.TOKEN_RATIOS["enrich_output_tokens_per_call"])
 
+    def test_the_query_time_ratios_match(self) -> None:
+        # Added when the script grew search and ongoing-monthly estimates. Without
+        # this, the standalone copy can price `--deep` at a stale rerank size and
+        # nothing would catch it — the script has no other test that knows the
+        # library's numbers.
+        self.assertEqual(self.values["QUERY_TOKENS_PER_SEARCH"],
+                         cost.TOKEN_RATIOS["query_tokens_per_search"])
+        self.assertEqual(self.values["RERANK_INPUT_TOKENS_PER_SEARCH"],
+                         cost.TOKEN_RATIOS["rerank_input_tokens_per_search"])
+        self.assertEqual(self.values["RERANK_OUTPUT_TOKENS_PER_SEARCH"],
+                         cost.TOKEN_RATIOS["rerank_output_tokens_per_search"])
+
+    def test_the_free_operations_agree_on_what_costs_nothing(self) -> None:
+        """A stage listed free in one and metered in the other is the bad case."""
+        listed = " ".join(self.values["FREE_OPERATIONS"]).lower()
+        for stage in cost.free_stages():
+            head = stage.stage.split()[0].lower()
+            self.assertIn(head, listed,
+                          f"{stage.stage} is free in muninn.cost but unlisted in the script")
+
     def test_the_enrichment_chunking_matches(self) -> None:
         self.assertEqual(self.values["ENRICH_CHUNK_WORDS"], cost.ENRICH_CHUNK_WORDS)
         self.assertEqual(self.values["ENRICH_CHUNK_OVERLAP_WORDS"],
