@@ -27,6 +27,12 @@ Preserve an existing Roost checkout and its user settings. Never add Roost as a
 dependency or submodule, and never put Cisco-specific material in this public
 repository.
 
+## Agent skills
+
+Ensure the `muninn` skill is installed for the active agent runtime; its source
+is `.agents/skills/muninn`. Install it when absent. For the companion Huginn
+skill, offer installation rather than installing it automatically.
+
 ## The one thing to internalize
 
 **This archive is a system of record for data that no longer exists anywhere
