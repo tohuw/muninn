@@ -62,6 +62,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from . import cost as cost_model
 from . import ingest, store
 from .store import Store
 
@@ -280,8 +281,84 @@ def survey(st: Store, *, db: str | Path | None = None,
         "sources": sources,
     }
     doc["index_lag"] = _index_lag(st, roots)
+    # Cost is additive: everything above is unchanged, and this answers the one
+    # question the rest of the survey implies but never states — what a full pass
+    # over this corpus would cost. Only the model-side stages have a price; the
+    # free ones are listed rather than omitted, because "not mentioned" reads as
+    # "not measured". See muninn/cost.py for which inputs are measured and which
+    # are declared rates you should override for your account.
+    doc["cost"] = _cost_section(doc, st)
     doc["anomalies"] = anomalies(doc)
     return doc
+
+
+def _cost_section(doc: dict[str, Any], st: Store) -> dict[str, Any]:
+    """Project every stage's cost from what the survey already measured.
+
+    Above-gate words and call counts come from the same per-source gate the rest
+    of this document derives, so the estimate moves with the corpus rather than
+    being pinned to a number someone measured once.
+    """
+    above_words = 0
+    above_sessions = 0
+    above_calls = 0
+    for source, block in doc["sources"].items():
+        threshold = block["enrichment_gate"]["threshold_words"]
+        rows = st.conn.execute(
+            "SELECT words FROM sessions WHERE source = ? AND provenance != ? "
+            "AND words >= ?", (source, "tool-invoked", threshold)).fetchall()
+        for row in rows:
+            words = row["words"] or 0
+            above_words += words
+            above_sessions += 1
+            above_calls += cost_model.enrich_calls(words)
+
+    return cost_model.project(
+        words=sum(b["conversation_words"] for b in doc["sources"].values()),
+        chunks=doc["archive"]["chunks"],
+        enrich_words=above_words,
+        enrich_calls=above_calls,
+        enrich_sessions=above_sessions,
+        embed_model=_embed_model_or_default(),
+        text_model=_text_model_or_default(),
+    )
+
+
+def _text_model_or_default() -> str:
+    """The model enrichment would *actually* use here, if it can be determined.
+
+    An estimate that prices the built-in default while the installed
+    distribution enriches through something else is worse than no estimate: it is
+    wrong in the direction of whichever model happens to be cheaper, silently.
+    So the resolved provider is asked, and its answer is used.
+
+    Every failure falls back to the built-in default rather than propagating —
+    `survey` reads the archive and must not acquire a way to fail because a
+    plugin is misconfigured. That is also why nothing here calls ``available()``:
+    resolution is local by contract, and a provider probe is not.
+    """
+    from . import providers
+
+    try:
+        return getattr(providers.resolve_provider(), "model", providers.DEFAULT_MODEL)
+    except Exception:      # noqa: BLE001 - a cost estimate must not break survey
+        return providers.DEFAULT_MODEL
+
+
+def _embed_model_or_default() -> str:
+    """The embedding model in use, preferring one already present in the archive.
+
+    Reads the *installed* provider rather than the archive's existing vectors,
+    because the question this answers is "what would a pass cost now", and a
+    stale model in ``chunk_vectors`` is exactly the case where those differ.
+    """
+    from . import embed
+
+    try:
+        return embed.resolve_provider().model
+    except Exception:      # noqa: BLE001 - see above
+        # The public build's default embedder, which is local and free.
+        return "mlx-community/bge-small-en-v1.5-bf16"
 
 
 def estimate_chunks(words: int, target: int | None = None, stride: int | None = None) -> int:

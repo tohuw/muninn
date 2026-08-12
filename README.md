@@ -286,6 +286,15 @@ Every statistic is scoped to a provenance class, and the survey's first act is t
 report what is strange about your data — a tool-invoked majority, a source with
 no human sessions, sessions whose only copy is the archive.
 
+`muninn survey` also projects **what a full pass would cost**, per stage — see
+[spec 016](docs/specs/016-cost-estimation.md). Volumes are measured from your
+corpus; rates are declared with a source and a confidence, and any figure
+depending on an unverified rate is marked. Measured on a real 680-session
+archive: **1.76 tokens per word** for embedding and **2.02** for enrichment —
+well above the ~1.3 that describes English prose, because agent transcripts are
+dense with code and identifiers. Ingest, lexical search and `correlate` are
+listed at zero rather than omitted, because most of the tool costs nothing.
+
 `muninn doctor` recommends re-surveying when the corpus shape drifts: the corpus
 doubles, a source appears, the source mix shifts, or the stored gate stops doing
 what it was derived to do. (Query-latency regression is named in the design notes

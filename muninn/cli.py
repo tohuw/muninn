@@ -589,12 +589,50 @@ def _print_survey(doc: dict, path: Path, *, wrote: bool) -> None:
         else:
             print("  enrich gate  none derived (no conversation text yet)")
 
+    _print_cost(doc.get("cost"))
+
     if doc["anomalies"]:
         print("\nanomalies")
         for note in doc["anomalies"]:
             print(f"  [!] {note}")
 
     print(f"\n{'wrote' if wrote else 'would write'}  {path}")
+
+
+def _print_cost(cost: dict | None) -> None:
+    """What a full pass over this corpus would cost, per stage.
+
+    Free stages are printed rather than filtered out. A cost table that lists only
+    the priced operations reads as "these are the operations", and the most useful
+    fact here is how few of them cost anything at all.
+
+    Rates are printed with their confidence, and a ``~`` marks any figure that
+    depends on an unverified one. A projection whose inputs a reader cannot rank
+    by trustworthiness will be quoted as though all of it were measured.
+    """
+    if not cost:
+        return
+    print("\ncost estimate (model-side only; override rates for your account)")
+    priced = [s for s in cost["stages"] if s["usd"] or s["model"]]
+    free = [s for s in cost["stages"] if not s["model"]]
+    for stage in priced:
+        mark = "~" if stage["confidence"] == "low" else " "
+        seat = " (seat-licensed: no marginal cost)" if (
+            stage["usd"] == 0 and stage["model"] and "seat" in stage["note"]) else ""
+        print(f"  {stage['stage']:20} {mark}${stage['usd']:>9,.2f}  "
+              f"{stage['model'] or ''}{seat}")
+        print(f"  {'':20}  {mark}${stage['per_unit_usd']:>9,.2f} per {stage['unit']}")
+    for stage in free:
+        print(f"  {stage['stage']:20}  {'$0.00':>10}  {stage['note']}")
+    print(f"  {'one-time total':20} {'~' if cost['low_confidence_models'] else ' '}"
+          f"${cost['one_time_usd']:>9,.2f}  embed + enrich, once per session")
+    print(f"  {'recurring':20} {'~' if cost['low_confidence_models'] else ' '}"
+          f"${cost['recurring_monthly_usd']:>9,.2f}/month  at "
+          f"{cost['assumptions']['searches_per_month']:,} searches, "
+          f"{cost['assumptions']['deep_share']:.0%} deep (a guess — yours will differ)")
+    if cost["low_confidence_models"]:
+        print(f"  [~] depends on an unverified rate: "
+              f"{', '.join(cost['low_confidence_models'])}")
 
 
 def cmd_embed(args: argparse.Namespace) -> int:
