@@ -58,6 +58,7 @@ The module is still `muninn/daemon.py`, because that is what the subsystem is.
 | Termination | `daemon.install_termination_handlers()` | SIGTERM + SIGHUP. |
 | Reporting | `cli._print_daemon_section()` | New `doctor` section. |
 | Start-at-login | `corvidae.login_agent` via `muninn/agent_install.py` | The follow-up seam, now filled. **The daemon itself needed no change.** |
+| Background embedding | `embedder.BackgroundEmbedder` | Added by docs/specs/014-automatic-embedding.md. Own thread, own connection, gated on a provider being installed. |
 
 **`muninn index --watch` stays** and is now the *foreground/debug* path: the same
 ingest loop, publishing nothing — no port, no descriptor, no state file. It is

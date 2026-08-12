@@ -68,6 +68,13 @@ derived from.
 **Read first:** `.valholl/articles/corpus-measurements.md`. It contains the
 measurement that removes a whole category of work from this spec.
 
+> **Superseded on one point by [spec 014](014-automatic-embedding.md):**
+> `muninn embed` is no longer the only way vectors appear. `muninn serve` now
+> owns a background worker that embeds continuously whenever a provider is
+> installed. Everything this spec says about storage, the provider protocol,
+> cosine search, fusion and `correlate` is unchanged — 014 changes *when* the
+> vectors are generated and nothing else.
+
 ## Why
 
 Lexical search fails on the most common recall pattern: **you do not remember your

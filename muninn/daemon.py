@@ -18,12 +18,13 @@ question". The owner decided: *Muninn needs a daemon to be grabbing sessions.*
 So the division of labour is now:
 
 - ``muninn serve`` — **the service.** Sweeps, drains the queue, watches for file
-  changes, publishes the raven descriptor, serves ``/api/menu``, writes a state
-  file an external supervisor can read, and tears all of it down on a signal.
+  changes, embeds new chunks in the background (spec 014), publishes the raven
+  descriptor, serves ``/api/menu``, writes a state file an external supervisor
+  can read, and tears all of it down on a signal.
 - ``muninn index --watch`` — **the foreground/debug path.** The same ingest loop
-  and nothing else: no port, no descriptor, no state file. It is how someone
-  watches ingest happen without installing a service, and it is deliberately not
-  a second publisher of the descriptor.
+  and nothing else: no port, no descriptor, no state file, no embedding. It is
+  how someone watches ingest happen without installing a service, and it is
+  deliberately not a second publisher of the descriptor.
 
 Naming the mistake a reader might make: this module does **not** reimplement the
 ingest loop. ``indexer.watch()`` is the engine and stays the engine; the daemon
@@ -76,7 +77,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import indexer, paths, ravenserve, store
+from . import embedder, indexer, paths, ravenserve, store
 from .receipt import ImportReceipt
 
 logger = logging.getLogger("muninn.daemon")
@@ -580,6 +581,7 @@ class Daemon:
 
     def __init__(self, db_path: str | Path, roots: dict[str, Path], *,
                  menubar: bool = True,
+                 embed: bool = True,
                  publish_state: bool = True,
                  holder: str = HOLDER_SERVE,
                  state_file: Path | None = None,
@@ -588,6 +590,17 @@ class Daemon:
         self.db_path = db_path
         self.roots = roots
         self.menubar = menubar
+        # Automatic embedding (spec 014). Default on, but gated on a provider
+        # actually being installed — ``BackgroundEmbedder.start()`` returns False
+        # on the default build, which ships none. So "on by default" costs a
+        # default install nothing, and turns on exactly for the user who already
+        # opted in by installing the [semantic] extra or a plugin.
+        #
+        # ``muninn index --watch`` passes False: it is the foreground/debug path
+        # and publishes nothing, and a debug watcher that quietly starts spending
+        # money against a hosted embedder would be a surprise in the one mode
+        # someone runs to observe behaviour.
+        self.embed = embed
         # ``muninn index --watch`` sets this False. A state file is a claim that
         # something can be supervised at that pid and port; a foreground watcher
         # publishes no port and expects no supervisor, and writing one anyway
@@ -599,6 +612,7 @@ class Daemon:
         self.lock_file = lock_file
         self.announce = announce or (lambda _msg: None)
         self.port: int | None = None
+        self.embedder: embedder.BackgroundEmbedder | None = None
 
     def run(self, **watch_kwargs: Any) -> int:
         """Run until a signal or an exhausted event source. Returns an exit code.
@@ -642,7 +656,22 @@ class Daemon:
                 else:
                     self.announce("muninn raven: not published (see `muninn doctor`)")
 
-            # 4. The state file last, so "the daemon is discoverable" implies
+            # 4. The embedding worker, before the state file and before the
+            #    ingest loop. Before the state file for the same reason the
+            #    descriptor is: everything the daemon advertises should already
+            #    be true when it becomes discoverable. Before the ingest loop
+            #    because ``indexer.watch()`` never returns, so anything started
+            #    after it is never started at all.
+            #
+            #    It gets its own connection and its own thread — see
+            #    embedder.py's docstring for why borrowing either would put a
+            #    provider round trip in front of ingest.
+            if self.embed:
+                worker = embedder.BackgroundEmbedder(self.db_path, announce=self.announce)
+                if worker.start():
+                    self.embedder = worker
+
+            # 5. The state file last, so "the daemon is discoverable" implies
             #    everything it advertises is already true.
             if self.publish_state:
                 written = write_state(self.port, path=self.state_file, db_path=self.db_path)
@@ -659,6 +688,10 @@ class Daemon:
         finally:
             # Teardown order, and each position is load-bearing:
             #   descriptor first — stop advertising a port before it dies;
+            #   embedder next    — it holds its own connection to the archive,
+            #                      and it must stop writing before the lock is
+            #                      released to a successor daemon that will
+            #                      immediately start its own worker;
             #   state file next  — a supervisor restarting us immediately must
             #                      not see a stale "running" state file while
             #                      the lock is already free, which is exactly
@@ -667,6 +700,8 @@ class Daemon:
             #                      whole teardown atomic from outside.
             if service is not None:
                 service.stop()
+            if self.embedder is not None:
+                self.embedder.stop()
             if self.publish_state:
                 remove_state(self.state_file)
             st.close()

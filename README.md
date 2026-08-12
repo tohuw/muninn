@@ -1,9 +1,10 @@
 # muninn
 
 A local-only console for **agent history** — what your AI agents did, across
-Claude Code, Codex, and vendor data exports. Fast search, quick resume, and — as
-they land — correlation of similar conversations and context briefs that read
-equally well to humans and agents.
+Claude Code, Codex, and vendor data exports. Find the half-remembered decision,
+recover its evidence, and resume its source when that source still exists. As
+they land, correlation and context briefs will read equally well to humans and
+agents.
 
 _Developed with AI assistance. See the git history for which agents contributed._
 
@@ -23,10 +24,11 @@ there.
 
 Three problems that `grep` over your transcripts does not solve.
 
-**Your transcripts are being deleted.** Claude Code sweeps session JSONLs older
-than `cleanupPeriodDays` (default **30 days**) on startup, and subagent
-transcripts go with their parent. On the machine this was developed on, the
-oldest surviving transcript was 29 days old and everything older was already
+**Your agents did work you will need again, but their memory is disposable by
+default.** Some agent tools delete local transcripts; Claude Code sweeps session
+JSONLs older than `cleanupPeriodDays` (default **30 days**) on startup, and
+subagent transcripts go with their parent. On the machine this was developed on,
+the oldest surviving transcript was 29 days old and everything older was already
 gone. Muninn's index is an archive of record: for much of a corpus it is the only
 surviving copy.
 
@@ -36,6 +38,11 @@ recall problem, not a ranking problem, which is why retrieval is hybrid
 
 **You want the moment something was decided**, not every line where a word
 appears. That needs enrichment at index time, not smarter matching at query time.
+
+For example: ask “Which conversation decided that rate limiting belongs in the
+core rather than the provider?” Muninn can return the matching session, decision
+excerpt, repository, date, provenance, and whether the original transcript is
+still present.
 
 ## Install
 
@@ -84,6 +91,18 @@ uv run muninn search "the retry decision" --outcome fixed
 # Health: index lag, queue, calibration drift, daemon and login-agent state.
 uv run muninn doctor
 ```
+
+### Agent access
+
+Agents should prefer an installed `muninn` command. A checkout is also a
+complete, no-global-install fallback:
+
+```sh
+uv run --directory /path/to/muninn muninn search "extension point"
+```
+
+Use that form when an agent's shell cannot resolve `muninn`; it preserves the
+CLI as the archive boundary without changing the user's `PATH`.
 
 Coming from `claudex` or `codexdex`? `uv run muninn backfill` ingests their prose
 indexes — see [Superseding the predecessors](#superseding-the-predecessors).
@@ -241,7 +260,12 @@ while broad `OR` queries degraded linearly to 45 ms — which is why query
 expansion is capped rather than unbounded.
 
 Semantic recall is optional and pluggable via an `EmbeddingProvider` protocol.
-`muninn embed` generates vectors; `search --semantic` fuses them with the lexical
+Once a provider is installed, **`muninn serve` embeds new sessions in the
+background** — newest first, so the session you just finished is searchable before
+the backlog from months ago finishes draining ([spec
+014](docs/specs/014-automatic-embedding.md)). `muninn embed` remains for a
+deliberate foreground backfill, and `--no-embed` declines the automatic one.
+`search --semantic` fuses vectors with the lexical
 results by reciprocal rank, and `muninn correlate` answers "conversations like
 this one" — best on short and medium sessions; see
 [spec 006](docs/specs/006-hybrid-retrieval.md) for a measured caveat about very
@@ -252,12 +276,15 @@ Measured on a real archive of **112,193 chunks** (384-dim vectors from the local
 MLX provider, 172 MB in memory): **0.99 ms for a cosine top-20**, and 1.3 s for a
 `correlate` including model load. So **no vector database is ever needed** — a
 matrix multiply and an `argpartition` are enough well past any plausible corpus.
-The only real cost is generating the embeddings once, which is why `embed` is a
-separate, resumable command.
+The only real cost is generating the embeddings once, which is why the work is
+resumable, committed per batch, and reported as a backlog by `muninn doctor` —
+an automatic process that spends money should not be silent about how much it
+has decided to do.
 
 ```sh
 uv sync --extra semantic        # the local Apple-silicon provider, plus numpy
-uv run muninn embed             # one-time; resumable, --dry-run to plan
+uv run muninn serve             # embeds in the background from here on
+uv run muninn embed --dry-run   # or do the backlog in the foreground, deliberately
 uv run muninn search "that time SSE kept dropping" --semantic
 uv run muninn correlate a7efca23
 ```
@@ -276,10 +303,11 @@ uv run muninn correlate a7efca23
 - [x] `muninn resume` — reopen a session, or say honestly why it cannot be
 - [x] Index-time enrichment (`muninn enrich`): topic, outcome, decisions, artifacts
 - [x] Hybrid retrieval: `muninn embed`, `search --semantic/--deep`, `muninn correlate`
+- [x] Automatic background embedding, owned by the daemon and gated on a provider
 - [ ] `muninn brief` — a synthesis across matching sessions, carrying provenance per claim
 - [x] Shared-menubar raven: descriptor and `/api/menu`, rendered by [Roost](https://github.com/tohuw/roost)
 - [ ] Console
-- [ ] Agent skill
+- [x] Agent skill
 
 ### Superseding the predecessors
 

@@ -153,15 +153,24 @@ def _run_ingest_loop(args: argparse.Namespace, roots: dict[str, Path], *,
                      menubar: bool, holder: str) -> int:
     """Shared body of `serve` and `index --watch`. One loop, two front doors.
 
-    The difference between them is entirely the ``menubar``/``holder`` pair, and
-    keeping it that narrow is the point: a future change to shutdown ordering or
-    to the lock cannot apply to one command and not the other, which is exactly
-    how `index --watch` came to be the thing publishing a descriptor in the first
-    place (spec 009's "The lifecycle question").
+    The difference between them is entirely the ``menubar``/``holder`` pair plus
+    the two things derived from ``holder`` below, and keeping it that narrow is
+    the point: a future change to shutdown ordering or to the lock cannot apply
+    to one command and not the other, which is exactly how `index --watch` came
+    to be the thing publishing a descriptor in the first place (spec 009's "The
+    lifecycle question").
     """
     service = daemon.Daemon(
         args.db, roots,
         menubar=menubar,
+        # Automatic embedding is the service's job, not the debug watcher's
+        # (spec 014), and `--no-embed` is how someone who has a provider
+        # installed declines to spend it. ``getattr`` because `index --watch`
+        # does not define the flag at all: unlike `--no-menubar`, which is
+        # accepted and inert there for the sake of plists written before spec
+        # 010, `--no-embed` is new, so no existing invocation can be passing it
+        # and there is nothing to stay compatible with.
+        embed=(holder == daemon.HOLDER_SERVE and not getattr(args, "no_embed", False)),
         # Only `serve` publishes a state file. A foreground watcher expects no
         # supervisor and advertises no port, so a state file would be a claim
         # that something can manage it — and `doctor` would report a daemon that
@@ -556,17 +565,12 @@ def cmd_embed(args: argparse.Namespace) -> int:
         print(f"muninn: {exc}", file=sys.stderr)
         return 2
 
-    rows = st.conn.execute(
-        "SELECT c.session_id, c.ordinal, c.body FROM chunks c "
-        "LEFT JOIN chunk_vectors v "
-        "  ON v.session_id = c.session_id AND v.ordinal = c.ordinal AND v.model = ? "
-        "WHERE v.session_id IS NULL " + ("" if not args.source else
-                                         "AND c.session_id IN "
-                                         "(SELECT session_id FROM sessions WHERE source = ?) ")
-        + "ORDER BY c.session_id, c.ordinal"
-        + (" LIMIT ?" if args.limit else ""),
-        tuple(x for x in (provider.model, args.source, args.limit) if x is not None),
-    ).fetchall()
+    # The same definition of "pending" the background worker uses (spec 014), so
+    # the two can never disagree about what is already embedded. Id order here
+    # rather than the worker's newest-first: a resumed manual run should visibly
+    # continue where the last one stopped.
+    rows = embed.pending_chunks(st, provider.model,
+                               source=args.source, limit=args.limit)
 
     if args.dry_run:
         # Every read finishes before the close. The first version closed the
@@ -1067,18 +1071,31 @@ def _print_embeddings_section(st: store.Store) -> None:
     re-embed — search uses one space at a time, so the older set is dead weight
     that still costs the memory printed next to it, and nothing else in the tool
     will ever mention it.
+
+    The **pending** count is the spec 014 line. Now that a background worker
+    embeds automatically, a stopped worker and a finished one look identical from
+    outside — and this project's recurring lesson is that the expensive kind of
+    staleness is the invisible kind. A backlog that is not shrinking between two
+    `doctor` runs is the signal; the daemon's log says why.
     """
     print("\nembeddings")
     models = embed.models_present(st)
     if not models:
-        print("  none — semantic search is unavailable until `muninn embed` runs")
+        print("  none — semantic search is unavailable until embeddings exist "
+              "(`muninn serve` embeds automatically; `muninn embed` does it in the foreground)")
         return
     chunks = st.count_chunks()
     for model, dim, rows in models:
         # float32: dim * 4 bytes per vector, which is what load_matrix holds.
         mb = rows * dim * 4 / (1024 * 1024)
-        coverage = f"{rows / chunks * 100:.0f}% of chunks" if chunks else "no chunks"
+        # Truncated, never rounded: 9,047 of 9,049 chunks is 99.98%, and printing
+        # "100% of chunks" next to a non-zero pending count is the report claiming
+        # completion it does not have. 100% is reserved for rows == chunks.
+        coverage = f"{int(rows / chunks * 100)}% of chunks" if chunks else "no chunks"
         print(f"  {model:44} dim {dim:<5} {rows:>8,} vectors  {mb:6.1f} MB  {coverage}")
+        pending = embed.pending_count(st, model)
+        if pending:
+            print(f"  {'':44} {pending:>14,} chunk(s) pending")
     if len(models) > 1:
         print("  WARNING: more than one embedding model is present. Search uses one at "
               "a time, so the others are dead weight — finish the re-embed or delete them")
@@ -1382,14 +1399,20 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run Muninn as a service. Sweeps on startup, then drains the "
                     "SessionEnd queue and reacts to transcript changes forever; "
                     "publishes the raven descriptor and serves /api/menu on "
-                    "loopback; writes a state file a supervisor can read; and "
-                    "tears all three down on SIGTERM, SIGHUP or Ctrl-C. "
-                    "See docs/specs/010-daemon.md.")
+                    "loopback; embeds new chunks in the background when an "
+                    "embedding provider is installed; writes a state file a "
+                    "supervisor can read; and tears all of it down on SIGTERM, "
+                    "SIGHUP or Ctrl-C. See docs/specs/010-daemon.md and "
+                    "docs/specs/014-automatic-embedding.md.")
     p_serve.add_argument("--source", choices=("claude", "codex"),
                          help="ingest only this source (default: every configured root)")
     p_serve.add_argument("--no-menubar", action="store_true",
                          help="do not publish a raven descriptor or serve /api/menu; "
                               "ingest only (docs/specs/009)")
+    p_serve.add_argument("--no-embed", action="store_true",
+                         help="do not embed in the background; semantic search then "
+                              "covers only what `muninn embed` has already written "
+                              "(docs/specs/014)")
     p_serve.set_defaults(func=cmd_serve)
 
     p_index = sub.add_parser("index", help="ingest transcripts into the archive")

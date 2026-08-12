@@ -13,6 +13,13 @@ The entire cost of "semantic" is *generating* the embeddings once, not searching
 them. That is why ``muninn embed`` is a separate, resumable, dry-runnable
 command and search is not.
 
+Since docs/specs/014-automatic-embedding.md that cost is paid **automatically**,
+by a background worker the daemon owns (``muninn/embedder.py``), whenever a
+provider is installed. This module is unchanged by that: the worker embeds the
+same :func:`pending_chunks` rows through the same :func:`store_vectors`, so
+"automatic" is a scheduling decision made elsewhere and not a second code path
+through storage.
+
 ## numpy is imported lazily, and that is load-bearing
 
 ``import muninn.embed`` must not import numpy. numpy lives in the optional
@@ -129,6 +136,69 @@ def store_vectors(st: Store, session_id: str, model: str, dim: int,
             "  dim = excluded.dim, vec = excluded.vec",
             rows)
     return len(rows)
+
+
+def pending_chunks(st: Store, model: str, *, source: str | None = None,
+                   limit: int | None = None, newest_first: bool = False) -> list[Any]:
+    """Chunks with no vector in ``model``'s space: the work still to be paid for.
+
+    One definition of "pending", used by both callers — ``muninn embed`` and the
+    background worker (``embedder.BackgroundEmbedder``). Two copies of this
+    ``LEFT JOIN`` would be two chances to disagree about what is already
+    embedded, and the direction that disagreement fails in is a worker that
+    re-embeds rows the CLI considers done, which costs real money per pass
+    against a metered provider.
+
+    ``newest_first`` orders by the session's start time rather than by
+    ``session_id``, and it is the worker's default for a reason worth stating:
+    on a fresh archive the backlog is thousands of chunks, and the session a
+    person most wants to find semantically is the one they just finished. Id
+    order would embed it last. The CLI keeps id order, which is stable and makes
+    a resumed run visibly continue where it stopped.
+
+    Sessions with no ``started_at`` sort last under ``newest_first`` rather than
+    first, which is what ``NULLS LAST`` would say if SQLite's older syntax
+    supported it here; an undated session is not evidence of recency.
+    """
+    sql = ("SELECT c.session_id, c.ordinal, c.body FROM chunks c "
+           "LEFT JOIN chunk_vectors v "
+           "  ON v.session_id = c.session_id AND v.ordinal = c.ordinal AND v.model = ? "
+           "WHERE v.session_id IS NULL ")
+    params: list[Any] = [model]
+    if source:
+        sql += "AND c.session_id IN (SELECT session_id FROM sessions WHERE source = ?) "
+        params.append(source)
+    if newest_first:
+        sql += ("ORDER BY (SELECT s.started_at IS NULL FROM sessions s "
+                "          WHERE s.session_id = c.session_id), "
+                "         (SELECT s.started_at FROM sessions s "
+                "          WHERE s.session_id = c.session_id) DESC, "
+                "         c.session_id, c.ordinal")
+    else:
+        sql += "ORDER BY c.session_id, c.ordinal"
+    if limit:
+        sql += " LIMIT ?"
+        params.append(limit)
+    return st.conn.execute(sql, tuple(params)).fetchall()
+
+
+def pending_count(st: Store, model: str, *, source: str | None = None) -> int:
+    """How many chunks still need a vector in ``model``'s space.
+
+    Reported by `doctor`, because an automatic background pass that has silently
+    stopped looks exactly like one that has finished — and this project's whole
+    recurring lesson is that invisible staleness is the expensive kind
+    (.valholl/articles/continuous-ingest-not-periodic.md).
+    """
+    sql = ("SELECT COUNT(*) n FROM chunks c "
+           "LEFT JOIN chunk_vectors v "
+           "  ON v.session_id = c.session_id AND v.ordinal = c.ordinal AND v.model = ? "
+           "WHERE v.session_id IS NULL ")
+    params: list[Any] = [model]
+    if source:
+        sql += "AND c.session_id IN (SELECT session_id FROM sessions WHERE source = ?) "
+        params.append(source)
+    return int(st.conn.execute(sql, tuple(params)).fetchone()["n"])
 
 
 def vector_count(st: Store, model: str | None = None) -> int:

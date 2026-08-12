@@ -28,6 +28,8 @@ the code does.
 - [The import ledger: schema and invariants](articles/import-ledger-schema.md) — the concrete schema, digest scheme and testable invariants
 - [Session lifecycle facts, documented vs. observed](articles/session-lifecycle-facts.md) — the 1.5s hook budget, and what the vendor does not guarantee
 
+- [Embedding is not a chore](articles/embedding-is-not-a-chore.md) — why the daemon owns embedding, and why the automatic loop is written to quit rather than retry
+
 - [Superseding a predecessor](articles/superseding-a-predecessor.md) — a byte-verified backfill that was still missing four of six directories
 
 ## Data model

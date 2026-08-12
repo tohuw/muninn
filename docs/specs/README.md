@@ -22,6 +22,7 @@ wiki wins and the contradiction is a bug worth reporting.
 | [011 — Survey and calibration](011-survey-calibration.md) | implemented | 001, 003 |
 | [012 — Prose-index backfill](012-prose-index-backfill.md) | implemented | 001 |
 | [013 — `muninn resume`](013-resume.md) | implemented | 004 |
+| [014 — Automatic embedding](014-automatic-embedding.md) | implemented | 006, 010 |
 
 Specs 002 and 003 both modify `muninn/cli.py`, as do 004, 005, 010 and 011. Run
 overlapping specs sequentially, or in separate git worktrees, so they cannot
@@ -53,6 +54,11 @@ itself needed no change — see 010, "The login-agent installer". Muninn's launc
 label, plist, systemd unit, log path and Windows Run value are all disjoint from
 Huginn's, because both ravens are meant to be installed at once and every
 collision would be silent.
+
+Spec 014 moves embedding from a command a human types to work the daemon owns.
+It changes nothing about how vectors are stored or searched — spec 006 still
+governs all of that — only *when* they are generated. Read it before concluding
+from 006 that `muninn embed` is the only way vectors appear.
 
 Later phases not yet spec'd: the console, the agent skill, and the Cisco
 distribution's plugins.
