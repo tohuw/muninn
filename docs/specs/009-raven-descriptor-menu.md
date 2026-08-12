@@ -120,6 +120,9 @@ for itself:
 - **No `action` endpoint.** Every row is a link. A history console has nothing that
   should be mutated from a menu, and adding an action "just to open a session"
   would put a POST endpoint on this port permanently.
+  **Amended by 017:** the daemon advertises one, for `Quit` and `Restart` only.
+  Stopping the process is not mutating history — see 017 for why that distinction
+  is what keeps this port credential-free, and why it does not generalise.
 
 `started` is marked optional by the protocol and is **supplied anyway**: the host
 cross-checks it against the OS's record of when `pid` began, and without it a
@@ -204,9 +207,12 @@ Bound loopback only, on an ephemeral port. Every rule the protocol requires:
   endpoint, and an ephemeral port published in a file is not a trust boundary.
 - **`Content-Length` is guarded before anything is read.** Negative is the case
   that matters: `read(-1)` means "until EOF", i.e. no bound at all. The cap is
-  zero — this surface takes no bodies.
+  zero — this surface takes no bodies. **Amended by 017:** 512 bytes, for the one
+  route that reads `{"id": "<action>"}`.
 - **`GET` only.** `POST` answers 405 (after the guards, so a cross-origin POST
   gets 403 rather than a route-shaped answer that confirms what the port is).
+  **Amended by 017:** `POST` routes at the action endpoint when the publisher
+  supplied a handler, and still answers 405 when none did.
 - **Response headers from a fixed set**, never copied from the request. `nosniff`
   and `no-store` on everything; `default-src 'none'` CSP on HTML.
 - A provider failure answers **500, not a dropped connection** — the host reports
@@ -272,12 +278,13 @@ not asserted.
 3. A stale descriptor (crash) carries `pid` and `started` sufficient for the
    host's liveness check to refuse it.
 4. Field values exactly as tabulated; declared range overlaps the host's; no
-   `token_path`; no `action` endpoint.
+   `token_path`; no `action` endpoint (017: unless a handler is supplied).
 5. The advertised port is listening by the time the descriptor exists.
 6. The payload parses under Appistry's real `menu_spec.parse_menu` with **no row
    dropped and no string repaired**.
 7. `Host` non-loopback → 400; missing `Host` → 400; any `Origin` → 403; bad or
-   negative `Content-Length` → 413; `POST` → 405; guards apply to every route.
+   negative `Content-Length` → 413; `POST` → 405 (017: when no action handler is
+   supplied); guards apply to every route.
 8. Hostile transcript text cannot put a control character, ANSI escape, bidi
    override, CR or LF into any label.
 9. `attach()` returns `None` rather than raising when it cannot bind or publish —
@@ -327,7 +334,9 @@ therefore hides a loop that never ends on its own.
   there and the failure is silent.
 - **Do not compare `api_version` for equality.**
 - **Do not add an `action` endpoint** without revisiting the token decision in the
-  same change.
+  same change. 017 did exactly that for `Quit`/`Restart` and reached the same
+  answer *on grounds specific to stopping a process*. An action that writes to the
+  archive, spends money, or returns transcript text does not inherit it.
 - **Do not put prose, transcript text, or a full path in a menu label.**
 - **Do not let the menubar break ingest.** `attach()` returns `None`; it never
   raises into the watcher.
@@ -347,4 +356,5 @@ therefore hides a loop that never ends on its own.
 - **Host election.** Ravens do not participate; Appistry elects its own host by
   lock file.
 - **Huginn's side.** Implemented separately in its own repository.
-- **Actions of any kind.** Link rows only.
+- **Actions of any kind.** Link rows only. **Superseded by 017** for the two
+  lifecycle rows; still true of everything else.

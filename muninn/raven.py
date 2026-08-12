@@ -88,6 +88,32 @@ HOST_PRIORITY = 50
 #: point every participant at one alternate location.
 STATE_DIR_ENV = "RAVENS_STATE_DIR"
 
+#: Endpoint paths, named rather than repeated as literals because the descriptor
+#: advertises them and the server routes them, and those two must not be able to
+#: disagree. ``ACTION_ENDPOINT`` matches the path Roost falls back to when a
+#: descriptor omits it, which is not a coincidence worth relying on — Muninn
+#: advertises it explicitly.
+MENU_ENDPOINT = "/api/menu"
+ACTION_ENDPOINT = "/api/menu/action"
+
+#: The two action ids Muninn publishes. They are ordinary ids and that is the
+#: whole design: the host draws the label and posts the id back exactly as it
+#: does for a link row, and it does not know that one of these ends the process
+#: it is talking to. Nothing in the protocol reserves these words, so adding them
+#: needed no version bump and ``MAX_API`` above is unchanged.
+#:
+#: There is deliberately **no start id.** A stopped daemon has withdrawn its
+#: descriptor, so there is no menu for a "Start Muninn" row to live in and no
+#: process to serve it. Starting at login is ``muninn install-agent``'s job,
+#: which puts the exec path in the OS supervisor rather than in a menu bar.
+QUIT = "quit"
+RESTART = "restart"
+
+#: A posted action id is truncated to this before it is compared or logged. Both
+#: ids Muninn publishes are far shorter, so nothing legitimate is affected, and
+#: an unbounded string never reaches a log line.
+MAX_ACTION_ID = 128
+
 # ── Sanitising ────────────────────────────────────────────────────────────────
 
 # CSI/OSC sequences and the short two-character escapes, matched before the
@@ -204,7 +230,8 @@ def descriptor_path() -> Path:
 
 
 def descriptor(port: int, *, pid: int | None = None,
-               started: float | None = None) -> dict[str, Any]:
+               started: float | None = None,
+               actions: bool = False) -> dict[str, Any]:
     """Build the descriptor document for a server listening on ``port``.
 
     ``started`` is this process's start time in epoch seconds. Supplying it is
@@ -222,7 +249,16 @@ def descriptor(port: int, *, pid: int | None = None,
 
     No ``token_path`` and no ``token_header``, which is a decision rather than an
     omission — see ravenserve.py and docs/specs/009.
+
+    ``actions`` advertises the action endpoint. It defaults to **False** so that
+    every caller that does not wire an action handler keeps saying "there is
+    nothing here to click" — the descriptor must not promise a route that answers
+    405, because the host would draw a row and the click would fail. Only the
+    daemon, which can honour Quit and Restart, passes True.
     """
+    endpoints: dict[str, str] = {"menu": MENU_ENDPOINT}
+    if actions:
+        endpoints["action"] = ACTION_ENDPOINT
     return {
         "api_version": API_VERSION,
         "min_api": MIN_API,
@@ -233,14 +269,15 @@ def descriptor(port: int, *, pid: int | None = None,
         "port": port,
         "started": time.time() if started is None else started,
         "host_priority": HOST_PRIORITY,
-        # Only "menu". Omitting "action" is how a raven says it has nothing to
-        # be clicked; Appistry renders link rows identically either way.
-        "endpoints": {"menu": "/api/menu"},
+        # Omitting "action" is how a raven says it has nothing to be clicked;
+        # Appistry renders link rows identically either way.
+        "endpoints": endpoints,
     }
 
 
 def publish(port: int, *, directory: Path | None = None,
-            started: float | None = None) -> Path:
+            started: float | None = None,
+            actions: bool = False) -> Path:
     """Write the descriptor atomically and owner-only. Returns its path.
 
     Call this **after** the port is bound, never before: a descriptor naming a
@@ -263,7 +300,8 @@ def publish(port: int, *, directory: Path | None = None,
     _restrict(directory, 0o700)
 
     target = directory / f"{NAME}.json"
-    payload = json.dumps(descriptor(port, started=started), indent=2, sort_keys=True) + "\n"
+    payload = json.dumps(descriptor(port, started=started, actions=actions),
+                         indent=2, sort_keys=True) + "\n"
     fd, tmp_name = tempfile.mkstemp(prefix=f".{NAME}.", dir=str(directory))
     tmp = Path(tmp_name)
     try:
@@ -399,7 +437,8 @@ def _session_label(row: dict[str, Any]) -> str:
 def build_menu(*, recent: list[dict[str, Any]], sessions: int, chunks: int,
                lag: dict[str, dict[str, Any]] | None = None,
                last_sweep: str | None = None,
-               pending_jobs: int = 0) -> dict[str, Any]:
+               pending_jobs: int = 0,
+               lifecycle: bool = False) -> dict[str, Any]:
     """Build the ``/api/menu`` payload from already-queried archive facts.
 
     Takes plain data rather than a ``Store`` so the payload can be built and
@@ -415,11 +454,19 @@ def build_menu(*, recent: list[dict[str, Any]], sessions: int, chunks: int,
        is built on (docs/specs/003): an index that silently stopped keeping up
        is the failure this project has already been bitten by.
 
+    3. **Lifecycle** — Quit and Restart, when ``lifecycle`` is set.
+
     No ``badge``. A badge is a count of things wanting *attention*, and nothing
     in a history archive is waiting on the user — Huginn owns that. Naming the
     mistake: putting the session count in the badge would add Muninn's whole
     corpus size to Huginn's approval count, since the host sums badges across
     ravens, and the menubar would read as thousands of pending decisions.
+
+    ``lifecycle`` defaults to **False** and the daemon is what turns it on. A row
+    is only drawn where the click can be honoured: this function is also called
+    with no server behind it (the payload is checked against the host's parser
+    with no database and no port), and a Quit row in a payload nobody can POST to
+    is a row that lies.
     """
     sections: list[dict[str, Any]] = []
 
@@ -481,11 +528,61 @@ def build_menu(*, recent: list[dict[str, Any]], sessions: int, chunks: int,
 
     sections.append({"id": "archive", "title": "Archive", "items": archive_items})
 
+    if lifecycle:
+        # Last, because it is the destructive part of the menu and belongs below
+        # everything a user opens the menu to read. Restart is a plain row rather
+        # than an Option-click alternate the way the native menu-bar apps did it:
+        # the host renders labels and has no modifier-key vocabulary to hide one
+        # behind, and a menu item nobody can discover is not a replacement for
+        # one they could.
+        #
+        # "muted" for both. These are not warnings and styling them as attention
+        # would compete with the one row in Archive that genuinely wants action.
+        sections.append({
+            "id": "lifecycle",
+            "items": [
+                {"label": f"Quit {DISPLAY}", "id": QUIT, "style": "muted"},
+                {"label": f"Restart {DISPLAY}", "id": RESTART, "style": "muted"},
+            ],
+        })
+
     return {
         "api_version": API_VERSION,
         "title": DISPLAY,
         "sections": sections,
     }
+
+
+def perform_action(daemon: Any, action_id: str) -> tuple[dict[str, Any], Any]:
+    """Dispatch one posted action id. Returns ``(reply, followup)``.
+
+    The two-part return is the substance of this function, so it is stated before
+    anything else: ``followup`` is a callable the *server* invokes after the reply
+    has been written and flushed, or ``None``. Quit cannot happen before the reply
+    reaches the host. Roost is holding an open request with a short budget, and a
+    connection dropped mid-response is indistinguishable from a wedged raven — so
+    a successful quit would render as an action that failed, which is precisely
+    the bug Huginn's issue #43 is about one layer down.
+
+    Muninn's stop routes through ``SIGTERM`` to its own pid rather than through a
+    shutdown path of its own. That is reuse of the one path this daemon has
+    already hardened: ``daemon.install_termination_handlers`` turns that signal
+    into ``SystemExit`` on the main thread, which unwinds ``indexer.watch`` and
+    lets ``Daemon.run``'s ``finally`` withdraw the descriptor, stop the embedder,
+    remove the state file and release the lock — in that order. A hard exit from
+    this request thread would skip all four and orphan every one of them.
+
+    An unknown id is reported, not ignored. The host only posts ids Muninn
+    published, so an unknown one means the two have drifted, and that is worth
+    seeing rather than swallowing.
+    """
+    if action_id == QUIT or action_id == RESTART:
+        restart = action_id == RESTART
+        if not daemon.request_stop(restart=restart):
+            return {"ok": False, "error": "daemon is not running a stoppable loop"}, None
+        return ({"ok": True, "restarting" if restart else "stopping": True},
+                daemon.deliver_stop_signal)
+    return {"ok": False, "error": "unknown action"}, None
 
 
 def _lag_summary(lag: dict[str, dict[str, Any]] | None) -> str:

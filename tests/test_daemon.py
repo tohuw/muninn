@@ -304,6 +304,27 @@ class TerminationHandlerTest(unittest.TestCase):
             signal.signal(getattr(signal, name), handler)
         daemon._reset_termination_state()
 
+    def test_installing_clears_the_in_teardown_flag(self) -> None:
+        """A restarted daemon must still be stoppable.
+
+        ``_terminating`` is process-global and says "a teardown is in progress,
+        ignore further signals". A menu-driven Restart stops the loop *with* a
+        SIGTERM, so the flag is set when the next run starts — and while it was
+        sticky, the restarted daemon ignored every SIGTERM for the rest of its
+        life. That is a service only SIGKILL can stop, and nothing about it is
+        visible short of restarting and then trying to stop.
+        """
+        daemon.install_termination_handlers()
+        with self.assertRaises(SystemExit):
+            daemon._on_terminating_signal(signal.SIGTERM, None)
+        # Second signal ignored: that part is deliberate, and is what makes the
+        # flag sticky within one teardown.
+        daemon._on_terminating_signal(signal.SIGTERM, None)
+
+        daemon.install_termination_handlers()        # the restarted run
+        with self.assertRaises(SystemExit):
+            daemon._on_terminating_signal(signal.SIGTERM, None)
+
     def test_it_claims_sigterm_and_sighup_and_says_which(self) -> None:
         # The identity of the signals is the guarantee, not the count — which is
         # why install_termination_handlers returns names at all.
@@ -749,6 +770,68 @@ class LiveLifecycleTest(unittest.TestCase):
         self.assertFalse(self.state.exists(),
                          "SIGTERM orphaned the state file — doctor will report a dead daemon "
                          "as running")
+
+    def _post_action(self, action_id: str) -> dict:
+        port = json.loads(self.state.read_text(encoding="utf-8"))["port"]
+        self.assertIsNotNone(port, "the daemon published no menu port")
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}{raven.ACTION_ENDPOINT}",
+            data=json.dumps({"id": action_id}).encode("utf-8"),
+            headers={"Host": f"127.0.0.1:{port}", "Content-Type": "application/json"},
+            method="POST")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def test_the_menu_quit_row_tears_down_as_cleanly_as_sigterm(self) -> None:
+        """The reason Quit exists as a menu row at all, tested end to end.
+
+        A menu-driven quit that orphaned the descriptor would be strictly worse
+        than having no row: the user clicks Quit, the process dies, and the host
+        then reports Muninn as "not answering on its recorded port" forever. That
+        is Huginn's issue #43 exactly, and the only way to know Muninn does not
+        have it is to click the row on a real process.
+        """
+        self._start()
+        self.assertTrue(self._post_action(raven.QUIT)["ok"])
+        # The reply arrived before the process went away, which is the ordering
+        # the deferred followup exists to guarantee — urlopen above would have
+        # raised on a dropped connection.
+        self.assertEqual(self.proc.wait(timeout=SHUTDOWN_TIMEOUT_S), 0)
+        self.assertFalse(self.descriptor.exists(),
+                         "the menu's Quit row orphaned the raven descriptor")
+        self.assertFalse(self.state.exists(),
+                         "the menu's Quit row orphaned the state file")
+
+    def test_the_menu_restart_row_comes_back_on_a_fresh_port(self) -> None:
+        """A restart has to look like a restart to everything watching.
+
+        Same pid — it restarts in this process rather than re-execing, so there is
+        no argv to build and no interpreter path to write and then run. A *new*
+        port and a republished descriptor, because the old listener was closed by
+        the teardown; a restart that silently kept serving the old socket would
+        mean the teardown did not actually run.
+        """
+        self._start()
+        first = json.loads(self.state.read_text(encoding="utf-8"))["port"]
+        self.assertTrue(self._post_action(raven.RESTART)["ok"])
+
+        _wait_for(lambda: self.state.exists()
+                  and (json.loads(self.state.read_text(encoding="utf-8")).get("port")
+                       not in (None, first)),
+                  STARTUP_TIMEOUT_S, "a state file naming a new port after the restart")
+        second = json.loads(self.state.read_text(encoding="utf-8"))
+        self.assertEqual(second["pid"], self.proc.pid, "the restart forked or re-execed")
+        self.assertNotEqual(second["port"], first)
+        self.assertTrue(self.descriptor.exists(), "the restart did not republish the descriptor")
+        self.assertEqual(json.loads(self.descriptor.read_text(encoding="utf-8"))["port"],
+                         second["port"], "the descriptor still names the pre-restart port")
+        self.assertIsNone(self.proc.poll(), "the restart exited instead of coming back")
+
+        # And it is still a daemon that stops cleanly afterwards — a restarted
+        # loop that lost its signal handler would fail here and nowhere else.
+        self.assertEqual(self._stop(signal.SIGTERM), 0)
+        self.assertFalse(self.descriptor.exists())
+        self.assertFalse(self.state.exists())
 
     def test_sigterm_during_the_startup_sweep_still_tears_down(self) -> None:
         """The window `watchfiles` cannot cover, and the reason the handler exists.

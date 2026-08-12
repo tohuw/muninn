@@ -51,8 +51,22 @@ request and that whether to accept that is the raven's call (its
   are the *only* thing between this port and any page the user has open, which is
   the opposite of the intuition that "no secret to steal" means less to defend.
 
-If a future menu row ever carries prose, an action, or anything a caller could
-mutate, this decision must be revisited in the same change — not afterwards.
+The paragraph above required that this decision be revisited in the same change
+that added an action, and the Quit/Restart rows are that change. **Revisited, and
+unchanged** — for one reason that is specific to what these actions do:
+
+- The only mutation they cause is *stopping this process*, and any local process
+  running as this user can already do that with ``kill``. A token would guard a
+  door that has no lock on the wall beside it, and pretending otherwise is worse
+  than declining.
+- The browser threat is unchanged and is still handled by ``Host`` and ``Origin``,
+  not by a credential: a page's ``fetch`` carries an ``Origin`` and is refused
+  before the router sees it, and ``<form>`` POSTs cannot set the JSON content the
+  handler requires. A token would refuse the same requests for a different reason.
+
+This does **not** generalise. An action that wrote to the archive, spent money at
+a provider, or exposed transcript text would not be defensible on either ground,
+and would need the token this endpoint still does not have.
 
 ## Every rule the surface follows
 
@@ -67,9 +81,10 @@ mutate, this decision must be revisited in the same change — not afterwards.
 - ``Content-Length`` is guarded before a byte is read, and a negative value is
   refused specifically: passed to ``read()`` it means "until EOF", i.e. no bound
   at all.
-- Only ``GET`` is routed. ``POST`` answers 405 rather than succeeding quietly,
-  because Muninn publishes no actions and a caller that thinks otherwise should
-  find out.
+- ``GET`` is routed always; ``POST`` only when the process running this surface
+  supplied an action handler, and only at the one action path. Without one it
+  answers 405 rather than succeeding quietly, and the descriptor it publishes
+  omits the action endpoint so the host never draws a row to click.
 - Response headers are built from a fixed set, never copied from the request, and
   every response carries ``nosniff``. HTML carries a CSP that forbids everything.
 """
@@ -92,9 +107,12 @@ logger = logging.getLogger("muninn.raven")
 #: reach an IPv4 listener through a dual-stack resolver and send the v6 literal.
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
-#: This surface takes no request bodies at all, so the cap is zero and a body is
-#: refused rather than read and ignored.
-MAX_REQUEST_BODY = 0
+#: The only body this surface reads is ``{"id": "<action>"}``, so the cap is a
+#: few hundred bytes rather than zero. It was zero — a body refused outright —
+#: until the menu gained Quit and Restart, and it stays this small for the same
+#: reason it was zero: the cap is what bounds ``rfile.read`` before anything
+#: parses, and no legitimate caller comes close to it.
+MAX_REQUEST_BODY = 512
 
 #: Forbids every source. The pages served here are a handful of escaped literals
 #: with no assets, so there is nothing to allow.
@@ -193,7 +211,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._json(403, {"error": "cross-origin request rejected"})
             return False
         if not body_length_ok(self.headers):
-            self._json(413, {"error": "this endpoint accepts no request body"})
+            self._json(413, {"error": "request body too large"})
             return False
         return True
 
@@ -225,15 +243,94 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 pass
 
     def do_POST(self) -> None:     # noqa: N802 - BaseHTTPRequestHandler's spelling
-        """405, because Muninn publishes no actions.
+        """Dispatch one action, or 405 when this server publishes none.
 
-        The guard runs first even though nothing is served: answering a
-        cross-origin POST with a route-shaped 405 would confirm what this port is
-        to a page that should have been refused before reaching a router.
+        The guard runs first even though the unrouted case serves nothing:
+        answering a cross-origin POST with a route-shaped 405 would confirm what
+        this port is to a page that should have been refused before reaching a
+        router.
+
+        ``action_handler`` is unset unless a caller wired one, so a bare
+        ``ravenserve.serve`` still answers 405 to everything — the pre-existing
+        contract, kept because the descriptor it publishes still says the same.
+
+        The followup call is the reason this is not simply "handle, then reply".
+        A Quit action stops this process, and it must not do so until the reply is
+        on the wire: the host is holding an open request, and a dropped connection
+        reads as a wedged raven rather than a successful quit.
         """
         if not self._guard():
             return
-        self._json(405, {"error": "this raven publishes no actions"})
+        handler = getattr(type(self), "action_handler", None)
+        if handler is None:
+            self._json(405, {"error": "this raven publishes no actions"})
+            return
+
+        path = self.path.partition("?")[0]
+        if path != raven.ACTION_ENDPOINT:
+            self._json(404, {"error": "not found"})
+            return
+
+        try:
+            action_id = self._posted_action_id()
+        except ValueError as exc:
+            self._json(400, {"error": str(exc)})
+            return
+
+        followup = None
+        try:
+            reply, followup = handler(action_id)
+        except Exception:
+            # Same rule as do_GET: a response, never a dropped connection, and
+            # the exception class only — an action id reaches this log and a
+            # message could carry more.
+            logger.warning("muninn raven: action failed")
+            try:
+                self._json(500, {"error": "internal error"})
+            except OSError:
+                pass
+            return
+
+        self._json(200 if reply.get("ok") else 409, reply)
+        if followup is not None:
+            try:
+                self.wfile.flush()
+            except OSError:
+                # The host hung up. Still run the followup: the user clicked
+                # Quit, and whether they are still listening does not change
+                # what they asked for.
+                pass
+            followup()
+
+    def _posted_action_id(self) -> str:
+        """Read ``{"id": ...}`` from the request body. Raises ValueError if it isn't.
+
+        The length was already bounded by ``body_length_ok`` in the guard, so this
+        reads exactly ``Content-Length`` bytes and never to EOF. Every rejection
+        is a ``ValueError`` with a short reason rather than a bare 400: the only
+        client is the menu-bar host, and "which part of my POST was wrong" is the
+        difference between a one-line fix and a protocol argument.
+        """
+        raw_length = self.headers.get("Content-Length")
+        try:
+            length = int(raw_length) if raw_length is not None else 0
+        except ValueError:
+            raise ValueError("unreadable Content-Length") from None
+        if length <= 0:
+            raise ValueError("expected a JSON body")
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError("body is not JSON") from None
+        if not isinstance(payload, dict):
+            raise ValueError("body is not a JSON object")
+        action_id = payload.get("id")
+        if not isinstance(action_id, str) or not action_id:
+            raise ValueError("no action id")
+        # Bounded before it is compared or logged. An id longer than any Muninn
+        # publishes cannot match one, so truncating loses nothing and keeps an
+        # unbounded string out of the log line below.
+        return action_id[:raven.MAX_ACTION_ID]
 
     def _session_page(self, session_id: str) -> None:
         """A stub page for a menu link's target.
@@ -368,7 +465,9 @@ class RavenService:
 
 
 def serve(menu_provider: Callable[[], dict[str, Any]], *,
-          directory: Path | None = None) -> RavenService:
+          directory: Path | None = None,
+          action_handler: Callable[[str], tuple[dict[str, Any], Any]] | None = None
+          ) -> RavenService:
     """Bind a loopback port, publish the descriptor, and start serving.
 
     ``menu_provider`` is called per request and must return the payload
@@ -377,16 +476,25 @@ def serve(menu_provider: Callable[[], dict[str, Any]], *,
     startup would show a session count that stops moving while the indexer that
     serves it keeps importing.
 
+    ``action_handler``, when given, is what makes POST route instead of answering
+    405, and the descriptor advertises the action endpoint only when it is. Those
+    two facts are set from the same argument on purpose: a descriptor that
+    promises an action route the server refuses would have the host draw a row
+    whose click fails.
+
     Binds port 0 and reads back what the OS assigned, rather than picking a free
     port and then binding it: those are two operations with a race between them,
     and losing that race means the descriptor names someone else's port.
     """
-    handler = type("_MuninnRavenHandler", (_Handler,),
-                   {"menu_provider": staticmethod(menu_provider)})
+    attrs: dict[str, Any] = {"menu_provider": staticmethod(menu_provider)}
+    if action_handler is not None:
+        attrs["action_handler"] = staticmethod(action_handler)
+    handler = type("_MuninnRavenHandler", (_Handler,), attrs)
     server = _Server(("127.0.0.1", 0), handler)
     port = int(server.server_address[1])
     try:
-        descriptor = raven.publish(port, directory=directory)
+        descriptor = raven.publish(port, directory=directory,
+                                   actions=action_handler is not None)
     except OSError:
         # A descriptor that cannot be written means Muninn cannot be discovered,
         # so there is no point holding the port. It is not fatal to the indexer
@@ -398,7 +506,8 @@ def serve(menu_provider: Callable[[], dict[str, Any]], *,
 
 
 def menu_provider_for(db_path: str | Path,
-                      roots: dict[str, Path] | None = None) -> Callable[[], dict[str, Any]]:
+                      roots: dict[str, Path] | None = None, *,
+                      lifecycle: bool = False) -> Callable[[], dict[str, Any]]:
     """Return a provider that queries the archive fresh on every menu fetch.
 
     Opens its own short-lived ``Store`` per request rather than sharing the
@@ -413,6 +522,9 @@ def menu_provider_for(db_path: str | Path,
     full corpus walk and time the raven out. The queue depth stands in for it: it
     is one directory listing, and a wedged drain is the failure that actually
     makes the index fall behind.
+
+    ``lifecycle`` is passed straight through to ``build_menu``, and the caller
+    that sets it is the same one that supplies an action handler — see attach().
     """
     from . import queue, store
 
@@ -426,6 +538,7 @@ def menu_provider_for(db_path: str | Path,
                 chunks=st.count_chunks(),
                 last_sweep=st.last_sweep_at(),
                 pending_jobs=queue.pending_count(),
+                lifecycle=lifecycle,
             )
         finally:
             st.close()
@@ -434,7 +547,9 @@ def menu_provider_for(db_path: str | Path,
     return provide
 
 
-def attach(db_path: str | Path) -> RavenService | None:
+def attach(db_path: str | Path, *,
+           action_handler: Callable[[str], tuple[dict[str, Any], Any]] | None = None
+           ) -> RavenService | None:
     """Start the raven surface for a long-running indexer, or return None.
 
     Returns None rather than raising on any failure to bind or publish. The
@@ -444,9 +559,16 @@ def attach(db_path: str | Path) -> RavenService | None:
     directory that cannot be written must cost Muninn its menu row, never its
     ingest. The failure is logged as a warning so it is visible rather than
     silent.
+
+    One argument controls three things — whether POST routes, whether the
+    descriptor advertises the action endpoint, and whether the menu draws the
+    Quit/Restart rows — because all three are the same claim, and any two of them
+    disagreeing produces a row that lies about what clicking it will do.
     """
     try:
-        return serve(menu_provider_for(db_path))
+        return serve(menu_provider_for(db_path,
+                                       lifecycle=action_handler is not None),
+                     action_handler=action_handler)
     except OSError as exc:
         logger.warning("muninn raven: not publishing to the menubar (%s)", type(exc).__name__)
         return None

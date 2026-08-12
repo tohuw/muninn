@@ -148,12 +148,22 @@ macOS menu bar / Windows tray item that renders whichever ravens are running.
 Install it from its own repository; Muninn does not ship, depend on, or install
 it, and publishing is best-effort, so ingest never pays for a menubar.
 
+The menu shows recent sessions, archive counts, index freshness, the embedding
+backlog, and — at the bottom — **Quit Muninn** and **Restart Muninn**. Restart
+tears the daemon down completely and brings it back in the same process, so it
+comes back on a new port with a freshly published descriptor. There is no *Start*
+row on purpose: a stopped daemon has withdrawn its descriptor, so there is no menu
+for one to live in. Starting at login is the next section's job.
+
 Roost's `SPEC.md` is normative for the wire format. Muninn's producer side is
-[`docs/specs/009-raven-descriptor-menu.md`](docs/specs/009-raven-descriptor-menu.md),
-including the two decisions worth knowing before reading the code: every row is a
-link (Muninn publishes no action endpoint), and there is no `token_path`, so
-`/api/menu` is unauthenticated by design and the `Host`/`Origin` checks are the
-only thing defending that port.
+[`docs/specs/009-raven-descriptor-menu.md`](docs/specs/009-raven-descriptor-menu.md)
+and [`017-menu-lifecycle-actions.md`](docs/specs/017-menu-lifecycle-actions.md),
+including the two decisions worth knowing before reading the code: the only thing
+a menu row can *do* is stop or restart the daemon (everything else is a link), and
+there is no `token_path`, so the port is unauthenticated by design and the
+`Host`/`Origin` checks are the only thing defending it. Spec 017 explains why those
+two facts are compatible — and why an action that touched the archive would not
+be.
 
 **Muninn is absent from the menubar when its daemon is not running.** That is a
 legitimate steady state, not a bug: no descriptor exists, and Roost draws nothing

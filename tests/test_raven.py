@@ -619,6 +619,102 @@ class MenuPayloadTest(unittest.TestCase):
 
 # ── Hostile transcript text ───────────────────────────────────────────────────
 
+class LifecycleMenuTest(unittest.TestCase):
+    """Quit and Restart: drawn only where the click can be honoured."""
+
+    def _menu(self, **kw) -> dict:
+        return parse_menu(raven.build_menu(recent=[a_session()], sessions=1,
+                                          chunks=1, **kw))
+
+    def _lifecycle(self, menu: dict) -> dict | None:
+        for section in menu["sections"]:
+            if section.get("id") == "lifecycle":
+                return section
+        return None
+
+    def test_absent_by_default(self) -> None:
+        """The default payload has no server behind it — a Quit row there lies."""
+        self.assertIsNone(self._lifecycle(self._menu()))
+
+    def test_present_when_asked_for(self) -> None:
+        section = self._lifecycle(self._menu(lifecycle=True))
+        self.assertIsNotNone(section)
+        self.assertEqual([item["label"] for item in section["items"]],
+                         ["Quit Muninn", "Restart Muninn"])
+        # action_id, because that is what the host's own parser produces from
+        # our "id" — and `enabled` is what proves it will render clickable rather
+        # than as an inert row.
+        self.assertEqual([item["action_id"] for item in section["items"]],
+                         [raven.QUIT, raven.RESTART])
+        self.assertTrue(all(item["enabled"] for item in section["items"]))
+
+    def test_it_is_the_last_section(self) -> None:
+        # The destructive rows belong below everything a user opens the menu to
+        # read, and a menu is read top-down.
+        self.assertEqual(self._menu(lifecycle=True)["sections"][-1]["id"], "lifecycle")
+
+    def test_the_rows_are_not_styled_as_attention(self) -> None:
+        # Attention competes with the one Archive row that genuinely wants it.
+        for item in self._lifecycle(self._menu(lifecycle=True))["items"]:
+            self.assertEqual(item["style"], "muted")
+
+    def test_no_start_row_is_published(self) -> None:
+        """A stopped daemon has no menu for a Start row to live in."""
+        labels = [item["label"]
+                  for section in self._menu(lifecycle=True)["sections"]
+                  for item in section["items"]]
+        self.assertNotIn("Start Muninn", labels)
+
+
+class ActionDispatchTest(unittest.TestCase):
+    """``perform_action`` records intent and defers the stop. Both matter."""
+
+    class FakeDaemon:
+        def __init__(self, running: bool = True) -> None:
+            self.running = running
+            self.restart_requested = False
+            self.signalled = False
+
+        def request_stop(self, *, restart: bool = False) -> bool:
+            if not self.running:
+                return False
+            self.restart_requested = restart
+            return True
+
+        def deliver_stop_signal(self) -> None:
+            self.signalled = True
+
+    def test_quit_accepts_and_defers_the_signal(self) -> None:
+        d = self.FakeDaemon()
+        reply, followup = raven.perform_action(d, raven.QUIT)
+        self.assertEqual(reply, {"ok": True, "stopping": True})
+        self.assertFalse(d.restart_requested)
+        # The whole point of the split: nothing has stopped yet, because the
+        # reply has not been written.
+        self.assertFalse(d.signalled)
+        followup()
+        self.assertTrue(d.signalled)
+
+    def test_restart_sets_the_flag_the_supervising_loop_reads(self) -> None:
+        d = self.FakeDaemon()
+        reply, followup = raven.perform_action(d, raven.RESTART)
+        self.assertEqual(reply, {"ok": True, "restarting": True})
+        self.assertTrue(d.restart_requested)
+        self.assertIsNotNone(followup)
+
+    def test_a_daemon_with_no_loop_refuses_rather_than_pretending(self) -> None:
+        reply, followup = raven.perform_action(self.FakeDaemon(running=False), raven.QUIT)
+        self.assertFalse(reply["ok"])
+        self.assertIsNone(followup)
+
+    def test_an_unknown_id_is_reported_not_ignored(self) -> None:
+        d = self.FakeDaemon()
+        reply, followup = raven.perform_action(d, "focus:something")
+        self.assertEqual(reply, {"ok": False, "error": "unknown action"})
+        self.assertIsNone(followup)
+        self.assertFalse(d.signalled)
+
+
 class HostileLabelTest(unittest.TestCase):
     """Titles, topics and paths come from transcripts. Assume they are hostile.
 
@@ -868,6 +964,129 @@ class HttpGuardTest(RavenTestCase):
                 finally:
                     conn.close()
         self.assertEqual(len(calls), 3)
+
+
+class ActionEndpointTest(RavenTestCase):
+    """The POST route, its guards, and the descriptor claim that goes with it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.calls: list[str] = []
+        self.followups: list[str] = []
+
+        def handler(action_id: str):
+            self.calls.append(action_id)
+            if action_id == raven.QUIT:
+                return {"ok": True, "stopping": True}, lambda: self.followups.append("ran")
+            if action_id == "boom":
+                raise RuntimeError("handler exploded")
+            return {"ok": False, "error": "unknown action"}, None
+
+        self.service = ravenserve.serve(
+            lambda: raven.build_menu(recent=[a_session()], sessions=1, chunks=1,
+                                     lifecycle=True),
+            action_handler=handler)
+        self.addCleanup(self.service.stop)
+
+    def post(self, body: bytes | None, path: str = raven.ACTION_ENDPOINT,
+             headers: dict[str, str] | None = None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.service.port, timeout=10)
+        try:
+            conn.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
+            conn.putheader("Host", "127.0.0.1")
+            if body is not None:
+                conn.putheader("Content-Length", str(len(body)))
+            for name, value in (headers or {}).items():
+                conn.putheader(name, value)
+            conn.endheaders()
+            if body is not None:
+                conn.send(body)
+            response = conn.getresponse()
+            return response.status, response.read()
+        finally:
+            conn.close()
+
+    def test_a_published_action_is_dispatched(self) -> None:
+        status, body = self.post(json.dumps({"id": raven.QUIT}).encode())
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["stopping"])
+        self.assertEqual(self.calls, [raven.QUIT])
+
+    def test_the_reply_is_written_before_the_followup_runs(self) -> None:
+        """A quit that drops the connection reads as a wedged raven, not a quit."""
+        status, _body = self.post(json.dumps({"id": raven.QUIT}).encode())
+        self.assertEqual(status, 200)
+        # The response completed and was read by this client; only then may the
+        # process-stopping followup have run. Ordering is the claim, so both
+        # halves are asserted.
+        self.assertEqual(self.followups, ["ran"])
+
+    def test_a_refused_action_answers_409_not_200(self) -> None:
+        # 200 with ok=false would make a failed action look successful to any
+        # caller that checks the status and not the body.
+        status, body = self.post(json.dumps({"id": "nope"}).encode())
+        self.assertEqual(status, 409)
+        self.assertFalse(json.loads(body)["ok"])
+
+    def test_a_handler_that_raises_answers_500_rather_than_dropping(self) -> None:
+        status, body = self.post(json.dumps({"id": "boom"}).encode())
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(body), {"error": "internal error"})
+
+    def test_malformed_bodies_are_refused_with_a_reason(self) -> None:
+        for body in (b"", b"not json", b"[]", b'{"id": ""}', b'{"id": 7}', b"{}"):
+            with self.subTest(body=body):
+                status, _ = self.post(body)
+                self.assertEqual(status, 400)
+        self.assertEqual(self.calls, [])
+
+    def test_a_body_over_the_cap_never_reaches_the_parser(self) -> None:
+        oversized = json.dumps({"id": "x" * (ravenserve.MAX_REQUEST_BODY * 2)}).encode()
+        self.assertEqual(self.post(oversized)[0], 413)
+        self.assertEqual(self.calls, [])
+
+    def test_a_long_id_is_truncated_before_it_is_dispatched(self) -> None:
+        self.post(json.dumps({"id": "a" * 400}).encode())
+        self.assertEqual(self.calls, ["a" * raven.MAX_ACTION_ID])
+
+    def test_another_post_path_is_not_an_action(self) -> None:
+        self.assertEqual(self.post(json.dumps({"id": raven.QUIT}).encode(),
+                                   path="/api/menu")[0], 404)
+        self.assertEqual(self.calls, [])
+
+    def test_the_guards_still_run_first(self) -> None:
+        body = json.dumps({"id": raven.QUIT}).encode()
+        self.assertEqual(self.post(body, headers={"Origin": "https://evil.example"})[0], 403)
+        self.assertEqual(self.calls, [])
+
+    def test_the_descriptor_advertises_the_action_endpoint(self) -> None:
+        # Advertising it is the same claim as routing it; the host draws a row
+        # from one and posts to the other.
+        payload = json.loads(raven.descriptor_path().read_text())
+        self.assertEqual(payload["endpoints"]["action"], raven.ACTION_ENDPOINT)
+
+
+class NoActionsPublishedTest(RavenTestCase):
+    """Without a handler, the pre-existing "no actions" contract is unchanged."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.service = ravenserve.serve(
+            lambda: raven.build_menu(recent=[a_session()], sessions=1, chunks=1))
+        self.addCleanup(self.service.stop)
+
+    def test_the_descriptor_omits_the_action_endpoint(self) -> None:
+        payload = json.loads(raven.descriptor_path().read_text())
+        self.assertEqual(payload["endpoints"], {"menu": raven.MENU_ENDPOINT})
+
+    def test_the_menu_draws_no_lifecycle_rows(self) -> None:
+        conn = http.client.HTTPConnection("127.0.0.1", self.service.port, timeout=10)
+        try:
+            conn.request("GET", raven.MENU_ENDPOINT)
+            menu = json.loads(conn.getresponse().read())
+        finally:
+            conn.close()
+        self.assertNotIn("lifecycle", [s.get("id") for s in menu["sections"]])
 
 
 class MenuProviderTest(RavenTestCase):

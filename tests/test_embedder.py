@@ -501,6 +501,10 @@ class CommandWiringTest(unittest.TestCase):
         seen: dict[str, object] = {}
 
         class FakeDaemon:
+            # Mirrors the real attribute the loop reads after run() returns; a
+            # fake without it makes the restart check look like a wiring bug.
+            restart_requested = False
+
             def __init__(self, *_a, **kw):
                 seen.update(kw)
 
@@ -520,6 +524,53 @@ class CommandWiringTest(unittest.TestCase):
 
     def test_index_watch_never_embeds(self) -> None:
         self.assertFalse(self._embed_kwarg("index", "--watch"))
+
+
+class RestartLoopTest(unittest.TestCase):
+    """The supervising loop around one ingest run."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="muninn-restart-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        parser = cli.build_parser()
+        self.args = parser.parse_args(["serve"])
+        self.args.db = self.tmp / "archive.db"
+
+    def _run(self, restarts: int, exit_code: int = 0) -> tuple[int, int]:
+        """Run the loop with a daemon that asks for ``restarts`` restarts."""
+        runs = {"n": 0}
+
+        class FakeDaemon:
+            def __init__(self, *_a, **_kw) -> None:
+                runs["n"] += 1
+                self.restart_requested = runs["n"] <= restarts
+
+            def run(self, **_kw) -> int:
+                return exit_code
+
+        with patch.object(cli.daemon, "Daemon", FakeDaemon), \
+                patch.object(cli, "_announce", lambda _msg: None):
+            code = cli._run_ingest_loop(self.args, {}, menubar=False,
+                                        holder=daemon.HOLDER_SERVE)
+        return code, runs["n"]
+
+    def test_no_restart_runs_once_and_returns_the_code(self) -> None:
+        self.assertEqual(self._run(restarts=0, exit_code=3), (3, 1))
+
+    def test_a_restart_constructs_a_second_daemon(self) -> None:
+        # A *new* instance, not a re-run of the old one: the action handler is
+        # bound to the instance, and a reused daemon would carry a stale server
+        # and a sticky restart flag.
+        self.assertEqual(self._run(restarts=1), (0, 2))
+
+    def test_restarts_are_not_bounded_by_a_count(self) -> None:
+        self.assertEqual(self._run(restarts=4), (0, 5))
+
+    def test_the_restart_sentinel_never_reaches_a_shell(self) -> None:
+        """A supervisor reading it as an exit code would start racing us."""
+        code, _runs = self._run(restarts=2)
+        self.assertIsInstance(code, int)
+        self.assertIsNot(code, cli._RESTART)
 
 
 if __name__ == "__main__":      # pragma: no cover

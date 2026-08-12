@@ -77,7 +77,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import embedder, indexer, paths, ravenserve, store
+from . import embedder, indexer, paths, raven, ravenserve, store
 from .receipt import ImportReceipt
 
 logger = logging.getLogger("muninn.daemon")
@@ -509,7 +509,19 @@ def install_termination_handlers() -> tuple[str, ...]:
     a Windows build has no ``SIGHUP`` at all. A signal that cannot be claimed is
     logged, never fatal — the descriptor is merely left stale in that case, which
     the host already renders as "Not running" from its pid check.
+
+    **The flag is cleared here**, and that is load-bearing rather than tidiness.
+    ``_terminating`` means "a teardown is in progress, ignore further signals", and
+    it is process-global. A menu-driven Restart stops the loop *with a SIGTERM*, so
+    the flag is set by the time the next run begins — and without this reset the
+    restarted daemon ignored every SIGTERM for the rest of its life, which is an
+    unstoppable service that a supervisor can only SIGKILL. Installing handlers
+    happens strictly before the teardown window opens, so there is no signal this
+    reset could swallow.
     """
+    global _terminating
+    _terminating = False
+
     installed: list[str] = []
     for name in ("SIGTERM", "SIGHUP"):
         sig = getattr(signal, name, None)
@@ -613,6 +625,15 @@ class Daemon:
         self.announce = announce or (lambda _msg: None)
         self.port: int | None = None
         self.embedder: embedder.BackgroundEmbedder | None = None
+        #: Set by :meth:`request_stop`. Read by the supervising loop in cli.py
+        #: *after* ``run`` returns, which is why it outlives the ingest loop and
+        #: why a restart gets a fresh ``Daemon`` rather than reusing this one.
+        self.restart_requested = False
+        #: True only between the start of the ingest loop and its unwind. A stop
+        #: is refused outside that window rather than faked: the two callers that
+        #: could hit it are a test-constructed daemon and a race with teardown,
+        #: and "there is no loop to stop" is a fact to report.
+        self._running = False
 
     def run(self, **watch_kwargs: Any) -> int:
         """Run until a signal or an exhausted event source. Returns an exit code.
@@ -649,7 +670,13 @@ class Daemon:
             #    returns None rather than raising, by spec 009's rule that a
             #    menubar section must never cost the indexer its ingest.
             if self.menubar:
-                service = ravenserve.attach(self.db_path)
+                # The action handler is bound to *this* daemon instance, which is
+                # why a restart constructs a new one: a handler closed over a torn
+                # down daemon would accept a click and stop nothing.
+                service = ravenserve.attach(
+                    self.db_path,
+                    action_handler=lambda action_id: raven.perform_action(self, action_id),
+                )
                 if service is not None:
                     self.port = service.port
                     self.announce(f"muninn raven serving http://127.0.0.1:{service.port}/api/menu")
@@ -678,6 +705,7 @@ class Daemon:
                 self.announce(f"muninn daemon pid {os.getpid()} · state {written}")
             self.announce(f"muninn indexer watching {', '.join(str(p) for p in self.roots.values())}")
 
+            self._running = True
             indexer.watch(st, self.roots, on_receipts=self._log_receipts, **watch_kwargs)
         except (KeyboardInterrupt, SystemExit):
             # SystemExit is ours: the termination handler raises it so this
@@ -686,6 +714,7 @@ class Daemon:
             # subcommand instead of leaving argparse's caller to interpret one.
             pass
         finally:
+            self._running = False
             # Teardown order, and each position is load-bearing:
             #   descriptor first — stop advertising a port before it dies;
             #   embedder next    — it holds its own connection to the archive,
@@ -707,6 +736,50 @@ class Daemon:
             st.close()
             lock.release()
         return 0
+
+    def request_stop(self, *, restart: bool = False) -> bool:
+        """Accept a menu-driven Quit/Restart. True if it will happen.
+
+        This only *records the intent*; :meth:`deliver_stop_signal` is what stops
+        the loop, and the split is deliberate. The caller is an in-flight HTTP
+        request from the menu-bar host, and the reply has to be written before the
+        process starts unwinding — see ``raven.perform_action`` for why a quit that
+        drops the connection reads to the host as a quit that failed.
+
+        Returns False when there is no ingest loop to stop — a daemon constructed
+        in a test, or one already tearing down — so the caller reports that rather
+        than appearing to succeed.
+        """
+        if not self._running:
+            return False
+        self.restart_requested = bool(restart)
+        self.announce(f"muninn: menu asked for {'restart' if restart else 'quit'}")
+        return True
+
+    def deliver_stop_signal(self) -> None:
+        """Signal our own pid so the main thread unwinds. Called after the reply.
+
+        ``SIGTERM`` rather than a bespoke shutdown flag, because the handler
+        installed at the top of :meth:`run` already turns it into ``SystemExit``
+        on the main thread, and that is the only thing that makes
+        ``indexer.watch`` return and the ``finally`` above run. Adding a second
+        shutdown path would mean two teardowns to keep correct, and the one that
+        gets exercised less is the one that orphans the descriptor.
+
+        Measured interaction worth naming: ``watchfiles``' Rust core notices any
+        terminating signal and returns its generator normally, so the Python
+        handler runs *and* the watch loop ends — see
+        :func:`install_termination_handlers` for the observed ordering.
+
+        Failure is logged, never raised: this runs on a request thread whose
+        response is already on the wire, so an exception here has nowhere useful
+        to go and would only be logged as a request failure with a misleading
+        shape.
+        """
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+        except OSError:
+            logger.warning("muninn: could not signal own process to stop")
 
     def _log_receipts(self, receipts: list[ImportReceipt]) -> None:
         for r in receipts:

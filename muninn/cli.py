@@ -169,6 +169,29 @@ def _run_ingest_loop(args: argparse.Namespace, roots: dict[str, Path], *,
     to be the thing publishing a descriptor in the first place (spec 009's "The
     lifecycle question").
     """
+    while True:
+        code = _run_ingest_loop_once(args, roots, menubar=menubar, holder=holder)
+        if code is not _RESTART:
+            return code
+        # The teardown in Daemon.run has already withdrawn the descriptor, stopped
+        # the embedder, removed the state file and released the lock — in that
+        # order — so the next iteration acquires the lock and republishes cleanly.
+        # A fresh Daemon rather than a reused one: a restart has to look like a
+        # restart to everything watching, which means a new port, a new state file
+        # and a worker that starts from the current backlog rather than a stalled
+        # counter (embedder.py's STALL_LIMIT is per-instance by design).
+        _announce("muninn: restarting")
+
+
+#: Sentinel for "the menu asked for a restart". Not an exit code, because it must
+#: never be able to reach a shell as one — a supervisor reading it would treat a
+#: restart as a failure and start racing us.
+_RESTART = object()
+
+
+def _run_ingest_loop_once(args: argparse.Namespace, roots: dict[str, Path], *,
+                          menubar: bool, holder: str) -> int | object:
+    """One run of the ingest loop. Returns an exit code, or ``_RESTART``."""
     service = daemon.Daemon(
         args.db, roots,
         menubar=menubar,
@@ -189,7 +212,8 @@ def _run_ingest_loop(args: argparse.Namespace, roots: dict[str, Path], *,
         announce=_announce,
     )
     try:
-        return service.run()
+        code = service.run()
+        return _RESTART if service.restart_requested else code
     except daemon.AlreadyRunning as exc:
         print(f"muninn: {exc}", file=sys.stderr)
         print("        stop it first, or run `muninn doctor` to see what is holding the lock.",
