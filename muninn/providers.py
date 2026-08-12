@@ -10,7 +10,8 @@ the one the user already has, authenticated the way they already authenticate.
 
 An SDK-backed or Bedrock-backed provider is a plugin's job
 (``muninn.plugins.TextProvider``) or the internal distribution's, not this
-package's. See CLAUDE.md, "Don't put Cisco-specific anything in this repo."
+package's — this repository is public, and that boundary is one CLAUDE.md
+records as having been crossed once already.
 
 ## Every call routes through the policy chokepoint
 
