@@ -22,6 +22,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -279,6 +280,7 @@ class CalibrationFileTest(_Archive):
         self.assertEqual(survey.calibration_path(self.db).parent, self.db.parent)
         self.assertEqual(survey.calibration_path(self.db).name, "calibration.json")
 
+    @unittest.skipIf(os.name == "nt", "Windows does not implement POSIX owner-only modes")
     def test_it_is_owner_only(self) -> None:
         path = self.tmp / "calibration.json"
         survey.write_calibration(self.survey(), path)

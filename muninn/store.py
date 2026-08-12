@@ -671,6 +671,11 @@ def pid_alive(pid: int | None) -> bool:
     except PermissionError:
         # Exists, but owned by someone else. Still alive from our perspective.
         return True
+    except OSError:
+        # Windows reports WinError 87, rather than ProcessLookupError, for a
+        # stale numeric pid. It is not a live holder, so never let it turn a
+        # stale lock or descriptor into an exception or an "unknown" owner.
+        return False
     return True
 
 

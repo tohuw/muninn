@@ -419,8 +419,11 @@ def format_mismatch(mismatch: EnvironmentMismatch, indent: str = "        ") -> 
     lines = [f"{indent}set here, unseen at login: {named}"]
     for div in mismatch.paths:
         lines.append(f"{indent}{div.what}")
-        lines.append(f"{indent}  here     {div.here}")
-        lines.append(f"{indent}  at login {div.at_login}")
+        # Diagnostic paths are data for a human, not platform shell syntax.
+        # Forward slashes make a redirected POSIX-shaped value legible even
+        # when this comparison is exercised on Windows.
+        lines.append(f"{indent}  here     {div.here.as_posix()}")
+        lines.append(f"{indent}  at login {div.at_login.as_posix()}")
     return lines
 
 
