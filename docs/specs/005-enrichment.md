@@ -40,6 +40,29 @@ itself on real data rather than on planted fixtures — these transcripts really
 do contain live credentials, and the archive still holds every one of them,
 because redaction runs on the way out and never on ingest.
 
+> **Correction (spec 015): the `assignment` figure above was mostly prose.**
+> Re-measured across the whole 680-session archive, the rule as written made
+> **4,245** substitutions and **3,632 of them — 86% — were English**: `token
+> storage`, `OAuth refresh`, `authoritative source`. The `\s+` separator branch
+> could not tell `--token abc123` from a sentence about tokens, and the reported
+> count hid it, because the recount only counted `=[REDACTED]` and `:
+> [REDACTED]` and then floored the result at 1 — so a session with fifteen
+> prose redactions reported *one*.
+>
+> The narrow vendor counts (`openai-key`, `anthropic-key`, `jwt`,
+> `bearer-token`, `credential-url`) are unaffected; those patterns are precise
+> and 170 of the 601 stand. The corrected rule makes **691** substitutions on
+> the same archive — fewer than before, but **78 more than the non-prose subset**,
+> because the same investigation found `"password": "x"` had never matched at
+> all (a quoted JSON key puts a `"` between the key and the `:`). Config and
+> credential blobs are the most common way a secret reaches a transcript, so the
+> gate was simultaneously over-firing on prose and under-firing on JSON.
+>
+> The cost of the over-firing was not neutral: the summariser received `OAuth
+> [REDACTED] tokens`, so the sessions hollowed out worst were the ones *about*
+> credential handling — exactly where technical specificity matters. See
+> `muninn/redact.py`'s module docstring and spec 015.
+
 **Parallelism was necessary, not a nicety.** Single-threaded the pass measured
 34.8 s per call and ~10.8 hours. `--shard K/N` partitions by SHA-256 of the
 session id — *not* `hash()`, which Python randomises per process and which would

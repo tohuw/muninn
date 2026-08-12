@@ -1,4 +1,4 @@
-# Spec 015 — Provider selection: a second CLI provider, and a declared default
+# Spec 015 — Provider selection, and two redaction-gate fixes
 
 **Status: implemented.** Depends on 005 (enrichment and the `TextProvider`
 contract) and 008 (the plugin contract).
@@ -40,7 +40,9 @@ question the original rule was protecting.
 
 **In:** `CodexCLIProvider`; `PluginSpec.default_text_provider` with load-time
 validation and `doctor` reporting; `resolve_provider` honouring it; `--provider`
-accepting either built-in by name.
+accepting either built-in by name. Two redaction-gate fixes and one `--json`
+behaviour change, all found by running the new provider on a real session (see
+"What running it for real found" below).
 
 **Out:** any change to `muninn.policy` or to what models are permitted; a
 non-CLI (SDK/HTTP) provider; making Codex the default here.
@@ -122,6 +124,55 @@ picking one would be precisely the silent preference the original rule refused.
 - Real check: enrichment through `--provider codex-cli` produces parseable facets
   on a real session, and `$CODEX_HOME/sessions` gains no new file.
 
+## What running it for real found
+
+Enriching one real session surfaced three defects that no test had, because every
+redaction test used planted secrets or prose with no auth vocabulary in it.
+
+**1. The assignment rule redacted prose, and the count hid it.** On that session
+the rule fired 15 times and every match was English (`token storage`, `OAuth
+refresh`, `authoritative source`) — while the report said `assignment ×1`,
+because the recount only counted `=[REDACTED]` / `: [REDACTED]` and floored the
+result at 1. Re-measured across all 680 sessions: **4,245 substitutions, 3,632
+(86%) prose.** The whitespace branch now asks whether the value looks like a
+secret at all (`_secret_shaped`: a digit, a non-letter, or ≥20 characters), and
+the count comes from the replacer that actually made the substitutions. The `=`
+and `:` forms still over-match freely, and the narrow vendor patterns are
+untouched. The trade-off is stated in `_secret_shaped` and asserted by a test: a
+short all-alphabetic secret passed as a bare flag value is now missed.
+
+The cost of the over-firing was not neutral. The summariser received `OAuth
+[REDACTED] tokens`, so the sessions hollowed out worst were the ones *about*
+credential handling — precisely where the specificity mattered.
+
+**2. `"password": "x"` had never been redacted.** A quoted JSON key puts a `"`
+between the key and the `:`, so neither separator branch matched — despite the
+module docstring listing that exact form as covered. Config dumps and credential
+blobs are the most common route a secret takes into a transcript, which made this
+the highest-value miss in the rule. Fixed with an optional quote before the
+separator, re-emitted so the key survives as `"password": [REDACTED]` rather than
+a malformed `"password:`. On the same archive this catches **78** values the
+non-prose subset had been missing.
+
+`contains_secret` is now defined in terms of `redact` rather than by re-running
+the patterns, because the two disagreed the moment the rule learned to decline a
+match: a pattern-only check answers "something matched", while every caller is
+asking "would anything be stripped".
+
+**3. `enrich --json` planned instead of enriching.** `--dry-run` and `--json`
+shared one condition, so an agent asking for receipts got a plan — and could
+reasonably believe the work was done. On every other command `--json` means "the
+machine-readable form of what this command does", so enrich was the anomaly. Now
+`--dry-run` plans (in either format) and `--json` enriches and emits a receipt:
+`enriched`, `failed`, `sessions`, `redactions`, `failures`, `skipped`, plus the
+`model` and `provider` that actually ran — which a chain provider decides at call
+time, so a caller cannot infer it from the flags it passed. Progress moves to
+stderr under `--json` so stdout stays a single parseable object.
+
+**This is a behaviour change with a cost consequence:** a script running
+`enrich --json` to preview a corpus pass will now perform it. `--dry-run --json`
+is the planning form.
+
 ## Guardrails
 
 - **Do not** let this spec widen what models are permitted. Selection and
@@ -131,4 +182,9 @@ picking one would be precisely the silent preference the original rule refused.
 - **Do not** resolve two declared defaults by ordering.
 - **Do not** drop `--ephemeral`, and do not "simplify" the last-message file to
   stdout capture.
+- **Do not** widen the whitespace branch of the assignment rule back to "any
+  value". The 86% prose rate is measured, and the report that hid it is fixed.
+- **Do not** reintroduce a redaction count derived from counting placeholders in
+  the output. It cannot see declined matches, which is how it came to floor 15
+  redactions at 1.
 - **Do not modify** `tests/test_losslessness.py` or `tests/test_ledger.py`.

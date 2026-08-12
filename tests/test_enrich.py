@@ -692,11 +692,15 @@ class CliTest(_Archive):
         self.assertEqual(code, 2)
         self.assertIn("muninn survey", err)
 
-    def test_json_output_is_parseable_and_makes_no_calls(self) -> None:
+    def test_dry_run_json_is_parseable_and_makes_no_calls(self) -> None:
+        # This assertion used to be written against `--json` alone, because
+        # `--json` planned instead of enriching. Spec 015 split them: `--dry-run`
+        # is what plans, `--json` only chooses the output shape. The property is
+        # unchanged and still worth pinning — it just needs the planning flag.
         self.add(words=5000)
         self._write_calibration(claude=1000)
         with patch("subprocess.run") as ran:
-            _, out, _ = self._run("--json")
+            _, out, _ = self._run("--dry-run", "--json")
         ran.assert_not_called()
         payload = json.loads(out)
         self.assertEqual(payload["planned"], 1)
@@ -831,3 +835,200 @@ class StoreFacetsTest(_Archive):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AuthProseIsNotASecretTest(unittest.TestCase):
+    """The whitespace branch of the assignment rule over-matched on prose.
+
+    Found by running the gate over a real 2,259-word session: it fired 15 times
+    and every match was English. The count then reported **one**, so the
+    over-matching was invisible from the outside — which is why the honest-count
+    test below sits next to these.
+    """
+
+    # Verbatim from the session that exposed it.
+    REAL_PROSE = [
+        "is there per-user Webex/Things/GitHub token storage already",
+        "let me check its auth/config reference for token storage patterns",
+        "`ui/server.py:1338-1357` is the authoritative source used by the app",
+        "`check_bedrock()` (443-453) does a 1-token probe call",
+        "resolution: `WEBEX_ACCESS_TOKEN` env var or OAuth refresh tokens",
+        "with the OAuth client secret in a file",
+        "its own OAuth refresh / PAT auth flow",
+    ]
+
+    def test_auth_prose_is_left_alone(self) -> None:
+        for prose in self.REAL_PROSE:
+            with self.subTest(prose=prose[:40]):
+                cleaned, counts = redact.redact(prose)
+                self.assertEqual(cleaned, prose)
+                self.assertEqual(counts, {})
+
+    def test_real_secrets_in_the_same_shape_are_still_caught(self) -> None:
+        for text, why in (("--token abc123def456", "has digits"),
+                          ("token aVeryLongOpaqueValueHere", "long enough"),
+                          ("--api-key 9f8e7d6c5b4a", "has digits")):
+            with self.subTest(why=why):
+                cleaned, counts = redact.redact(text)
+                self.assertEqual(counts.get("assignment"), 1)
+                self.assertIn(redact.PLACEHOLDER, cleaned)
+
+    def test_the_documented_gap_is_asserted_rather_than_discovered(self) -> None:
+        """A short all-alphabetic bare-flag value is missed. Stated, not hidden.
+
+        If this ever starts passing, the heuristic got stricter and the docstring
+        in `_secret_shaped` needs updating — a failing test here is a prompt to
+        re-read that trade-off, not a bug on its own.
+        """
+        _cleaned, counts = redact.redact("--token hunterhunter")
+        self.assertEqual(counts, {})
+
+    def test_the_equals_and_colon_forms_still_over_match_freely(self) -> None:
+        # Only the whitespace branch narrowed; these need no secret shape.
+        for text in ("PASSWORD=lowercase", "secret: lowercase"):
+            with self.subTest(text=text):
+                _cleaned, counts = redact.redact(text)
+                self.assertEqual(counts.get("assignment"), 1)
+
+
+class HonestRedactionCountTest(unittest.TestCase):
+    """The count is the number of substitutions actually made.
+
+    It used to be recounted as ``text.count("=[REDACTED]") + text.count(": [REDACTED]")``
+    and floored at 1, so any number of whitespace-separated redactions was
+    reported as exactly one. A gate whose report cannot be trusted is worse than
+    a silent one: it was read as "one credential was caught" when fifteen
+    substitutions had happened, none of them a credential.
+    """
+
+    def test_many_whitespace_redactions_are_counted_individually(self) -> None:
+        text = " ".join(f"--token abc{i}23def456" for i in range(5))
+        cleaned, counts = redact.redact(text)
+        self.assertEqual(counts["assignment"], 5)
+        self.assertEqual(cleaned.count(redact.PLACEHOLDER), 5)
+
+    def test_the_count_equals_the_placeholders_for_mixed_forms(self) -> None:
+        text = ('API_TOKEN=abc123def456\n'
+                '"password": "s3cretvalue"\n'
+                '--token 9f8e7d6c5b4a\n'
+                'token storage is prose\n')
+        cleaned, counts = redact.redact(text)
+        self.assertEqual(sum(counts.values()), cleaned.count(redact.PLACEHOLDER))
+
+    def test_a_declined_match_is_not_counted(self) -> None:
+        _cleaned, counts = redact.redact("password: null\ntoken storage")
+        self.assertEqual(counts, {})
+
+    def test_contains_secret_agrees_with_redact(self) -> None:
+        for text in ("token storage is prose", "PASSWORD=hunter2hunter",
+                     "password: null", '{"api_key": "abcdef123456"}',
+                     "nothing here at all"):
+            with self.subTest(text=text):
+                self.assertEqual(redact.contains_secret(text),
+                                 bool(redact.redact(text)[1]))
+
+
+class QuotedJsonKeyTest(unittest.TestCase):
+    """`"password": "x"` was never redacted, though the docstring claimed it was.
+
+    A quoted JSON key puts a `"` between the key and the `:`, so neither
+    separator branch matched. Config dumps and credential blobs are the most
+    common way a secret reaches a transcript, which made this the highest-value
+    miss in the rule.
+    """
+
+    def test_a_json_credential_blob_is_redacted(self) -> None:
+        text = '{"api_key": "abcdefghij", "client_secret": "0123456789"}'
+        cleaned, counts = redact.redact(text)
+        self.assertNotIn("abcdefghij", cleaned)
+        self.assertNotIn("0123456789", cleaned)
+        self.assertEqual(counts["assignment"], 2)
+
+    def test_single_quotes_work_too(self) -> None:
+        cleaned, _ = redact.redact("'client_secret': 'shhhhhhh1'")
+        self.assertNotIn("shhhhhhh1", cleaned)
+
+    def test_the_key_survives_intact_including_its_quote(self) -> None:
+        # The whole argument for keeping the key is that it tells a summariser
+        # what the session was doing; a mangled `"password:` is a worse artefact
+        # than a clean one for no benefit.
+        cleaned, _ = redact.redact('{"password": "s3cretvalue"}')
+        self.assertIn('"password":', cleaned)
+
+
+class EnrichJsonReceiptTest(_Archive):
+    """`--json` enriches and returns a receipt; `--dry-run` is what plans.
+
+    These were one condition, so `--json` planned instead of enriching. The cost
+    fell on the caller who cannot see it: an agent asking for receipts got a
+    plan, believed the work was done, and reported facets that were never
+    written.
+    """
+
+    def _write_calibration(self, **thresholds: int) -> None:
+        survey.write_calibration(self.calibrate(**thresholds),
+                                 survey.calibration_path(self.db))
+
+    def _run(self, *argv) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(["--db", str(self.db), "enrich", *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def _fake_provider(self):
+        provider = FakeProvider()
+        return patch.object(providers, "resolve_provider", return_value=provider), provider
+
+    def test_json_enriches_and_emits_a_receipt(self) -> None:
+        sid = self.add(words=3000, text="[USER] " + "word " * 3000)
+        self._write_calibration(claude=100)
+        patcher, provider = self._fake_provider()
+        with patcher:
+            code, out, _err = self._run("--json")
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload["enriched"], 1)
+        self.assertEqual(payload["failed"], 0)
+        self.assertIn(sid, payload["sessions"])
+        self.assertTrue(provider.prompts, "the provider was never called")
+
+    def test_the_receipt_names_the_model_and_provider_that_ran(self) -> None:
+        # A chain provider picks its hop at call time, so a caller cannot infer
+        # this from the flags it passed.
+        self.add(words=3000, text="[USER] " + "word " * 3000)
+        self._write_calibration(claude=100)
+        patcher, provider = self._fake_provider()
+        with patcher:
+            _code, out, _err = self._run("--json")
+        payload = json.loads(out)
+        self.assertEqual(payload["model"], provider.model)
+        self.assertEqual(payload["provider"], provider.name)
+
+    def test_stdout_is_exactly_one_json_object(self) -> None:
+        self.add(words=3000, text="[USER] " + "word " * 3000)
+        self._write_calibration(claude=100)
+        patcher, _provider = self._fake_provider()
+        with patcher:
+            _code, out, err = self._run("--json")
+        json.loads(out)                       # raises if progress leaked to stdout
+        self.assertIn("enriching", err)       # ...and progress still happened
+
+    def test_dry_run_json_still_plans_and_spends_nothing(self) -> None:
+        self.add(words=3000, text="[USER] " + "word " * 3000)
+        self._write_calibration(claude=100)
+        patcher, provider = self._fake_provider()
+        with patcher:
+            code, out, _err = self._run("--dry-run", "--json")
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertIn("planned", payload)
+        self.assertNotIn("enriched", payload)
+        self.assertEqual(provider.prompts, [])
+
+    def test_nothing_to_do_still_returns_a_receipt_shape(self) -> None:
+        self._write_calibration(claude=100_000)     # nothing clears the gate
+        code, out, _err = self._run("--json")
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload["enriched"], 0)
+        self.assertEqual(payload["sessions"], [])

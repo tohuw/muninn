@@ -149,6 +149,15 @@ def _announce(message: str) -> None:
     print(message, flush=True)
 
 
+def _announce_err(message: str) -> None:
+    """Progress for a run whose stdout is a machine-readable receipt.
+
+    Same flush discipline as :func:`_announce` and for the same reason — a
+    redirected long run that block-buffers looks hung.
+    """
+    print(message, file=sys.stderr, flush=True)
+
+
 def _run_ingest_loop(args: argparse.Namespace, roots: dict[str, Path], *,
                      menubar: bool, holder: str) -> int:
     """Shared body of `serve` and `index --watch`. One loop, two front doors.
@@ -350,7 +359,17 @@ def cmd_enrich(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
 
-    if args.dry_run or args.json:
+    # `--dry-run` is what plans; `--json` only chooses the *shape* of the output.
+    #
+    # These were one condition until spec 015, and `--json` therefore planned
+    # instead of enriching. On every other command `--json` means "the machine
+    # readable form of what this command does", so enrich was the anomaly — and
+    # the cost of the anomaly fell on exactly the caller who cannot see it: an
+    # agent asking for receipts got a plan, believed the work was done, and
+    # reported facets that were never written. `--dry-run --json` is still the
+    # planning form, and is what a caller that wants an estimate should use.
+    if args.dry_run:
+        st.close()
         payload = {
             "planned": len(plan.candidates),
             "estimated_calls": plan.estimated_calls,
@@ -358,7 +377,6 @@ def cmd_enrich(args: argparse.Namespace) -> int:
             "skipped": plan.skipped,
             "sessions": [c.session_id for c in plan.candidates],
         }
-        st.close()
         if args.json:
             print(json.dumps(payload))
         else:
@@ -366,8 +384,16 @@ def cmd_enrich(args: argparse.Namespace) -> int:
         return 0
 
     if not plan.candidates:
-        _print_enrich_plan(plan)
         st.close()
+        if args.json:
+            # A receipt for "nothing to do" rather than a human plan, so a caller
+            # parsing receipts never has to also parse the plan format.
+            print(json.dumps({"enriched": 0, "failed": 0, "sessions": [],
+                              "redactions": {}, "failures": {},
+                              "skipped": plan.skipped, "model": None,
+                              "provider": None}))
+        else:
+            _print_enrich_plan(plan)
         return 0
 
     try:
@@ -387,12 +413,17 @@ def cmd_enrich(args: argparse.Namespace) -> int:
     # the first real enrichment pass wrote an empty log for its entire life and
     # looked hung. muninn/daemon.py records the same lesson for `serve`; this is
     # the second place it applies, and both are long-running.
-    _announce(f"enriching {len(plan.candidates):,} session(s) with "
-              f"{getattr(provider, 'model', '?')} "
-              f"(~{plan.estimated_calls:,} model calls)")
+    # Progress goes to stderr under --json so stdout stays a single parseable
+    # object. Silencing it entirely would be worse: a corpus pass runs for hours,
+    # and the daemon's log lesson (muninn/daemon.py) is that a long run with no
+    # output is indistinguishable from a hung one.
+    progress = _announce_err if args.json else _announce
+    progress(f"enriching {len(plan.candidates):,} session(s) with "
+             f"{getattr(provider, 'model', '?')} "
+             f"(~{plan.estimated_calls:,} model calls)")
     try:
         result = enrich.enrich_sessions(st, plan.candidates, provider,
-                                        progress=_announce)
+                                        progress=progress)
     except PolicyRefused as exc:
         # A refused model is a statement about the run's configuration, not
         # about one session — retrying it per session would produce thousands of
@@ -401,6 +432,22 @@ def cmd_enrich(args: argparse.Namespace) -> int:
         print(f"muninn: {exc}", file=sys.stderr)
         return 2
     st.close()
+
+    if args.json:
+        # The receipt. Same facts the human output carries, plus the model and
+        # provider that actually ran — which a chain provider decides at call
+        # time, so a caller cannot infer it from the flags it passed.
+        print(json.dumps({
+            "enriched": result.enriched,
+            "failed": result.failed,
+            "sessions": [c.session_id for c in plan.candidates],
+            "redactions": result.redactions,
+            "failures": result.failures,
+            "skipped": plan.skipped,
+            "model": getattr(provider, "model", None),
+            "provider": getattr(provider, "name", None),
+        }))
+        return 0
 
     _announce(f"enriched {result.enriched:,} · failed {result.failed:,}")
     if result.redactions:
