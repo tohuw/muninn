@@ -215,6 +215,45 @@ a counted parse failure, never an exception. Parse-failure rates are reported so
 a format change shows up as a rising rate rather than as silently missing
 history.
 
+### The indexing pipeline
+
+Indexing runs in three layers, cheapest first, because the source deletes itself
+and any single layer can miss:
+
+1. **A `SessionEnd` hook** writes a job to a queue directory the moment a session
+   ends. This is the primary path: event-driven, no polling, and a session is
+   archived seconds after it finishes. The hook is deliberately tiny — it imports
+   no parser and no SQLite — because it runs inside a ~1.5 s budget the agent
+   gives it.
+2. **A watcher** (`watchfiles`) reacts to raw file changes, catching sessions
+   whose hook never fired: a crash, a `kill -9`, a misconfigured hook, another
+   tool writing transcripts.
+3. **A sweep** reconciles every configured root against the archive — on every
+   startup, then every 15 minutes. This is the only layer that *closes* the
+   guarantee, because events that happened while the daemon was down were missed
+   by both of the others.
+
+Two properties make running all three safe rather than wasteful. Imports are
+**incremental**: append-only transcripts are tailed from a stored byte offset, so
+re-reading a 50 MB session costs nothing. And they are **idempotent**, keyed by
+content digest in an append-only import ledger, so the same session arriving by
+hook *and* sweep produces one row plus a `duplicate` receipt — never two.
+
+Then each session's prose is split for search. **Chunks are 400-word windows on a
+320-word stride**, so consecutive windows overlap by 80 words; a phrase that
+straddles a boundary is still findable. Those windows go into a SQLite FTS5 table
+(`porter unicode61` tokenizer) as `(session_id, ordinal, body)`. On the real
+corpus this averages ~7 chunks per session.
+
+Chunks and vectors are **derived data**: both can be rebuilt from the archived
+prose, so re-indexing a session is safe and deleting a stale chunk is not data
+loss. The prose itself is not — see the archive-of-record guarantee below.
+Re-chunking a session drops vectors whose ordinal no longer exists, rather than
+leaving orphans that cosine search would rank and then fail to render.
+
+(Chunking is currently mechanical. Turn-aware chunking — windows that respect
+message boundaries — lands with the source adapters and is not built yet.)
+
 ### Provenance is first-class
 
 Not every entry in `~/.claude/projects` is a conversation. Sessions are
@@ -288,6 +327,55 @@ uv run muninn embed --dry-run   # or do the backlog in the foreground, deliberat
 uv run muninn search "that time SSE kept dropping" --semantic
 uv run muninn correlate a7efca23
 ```
+
+### Where the model is used, and where it is not
+
+Worth stating plainly, because "AI history tool" invites the assumption that a
+model is involved throughout:
+
+**Indexing calls no model at all.** Parsing, provenance classification,
+chunking, the FTS5 index, the import ledger, `muninn search`, `muninn log`,
+`muninn resume`, `muninn survey` and `muninn doctor` are pure Python and SQLite.
+Unplug every provider and all of that still works. Muninn is useful with no model
+configured.
+
+A model enters in exactly four places, all optional:
+
+| Operation | Model | What it sees |
+|---|---|---|
+| `muninn embed`, and the daemon's background worker | **Embedding** | Every pending chunk's text, one vector each |
+| `search --semantic` | **Embedding** | **Your query only** — one call |
+| `search --deep` | **Text (LLM)** | The query plus the top candidate snippets, to reorder them |
+| `muninn enrich` | **Text (LLM)** | One session's prose, to extract topic / outcome / decisions / artifacts |
+
+Four consequences of that shape:
+
+- **Semantic search does not send your history anywhere at query time.** The
+  archive's vectors were computed once, up front; a query embeds *the query*, and
+  ranking is a matrix multiply over stored vectors — ~1 ms at 60k. The expensive
+  half is generating the vectors, which is why that is a background job.
+- **`muninn correlate` calls no model whatsoever.** It resolves a provider only to
+  read its model *id* as a lookup key, then compares stored mean vectors. Asking
+  "what else is like this session" costs nothing.
+- **Every call routes through one redaction boundary and one policy check.**
+  `enrich` and `--deep` both reach a provider through a single function that
+  redacts first, so there is exactly one path from archived prose to a model.
+  Model id and provider are checked against intersecting `ModelPolicy` allowlists
+  that **fail closed** — an unparseable policy becomes refuse-everything, not
+  allow-everything.
+- **Transcript text is treated as data, never instructions.** Archived prose can
+  contain web content and other agents' output, so the enrichment prompt frames it
+  as data and the response is parsed as a closed vocabulary rather than trusted.
+  An unclear outcome becomes a named sentinel instead of free text drawn from
+  model output.
+
+And the reliability rule that differs between them: `--deep` **falls back to the
+input order** on any provider failure, because a worse ordering is still a
+ranking — but `--semantic` with no provider at all **exits non-zero and says so**,
+because silently returning lexical results labelled semantic reports the wrong
+thing confidently. Two embedding models are never mixed in one search: the model
+id is part of the vector's primary key, and mixing spaces returns confident
+nonsense rather than an error.
 
 ## Roadmap
 
