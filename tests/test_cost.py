@@ -211,5 +211,66 @@ class SurveyIntegrationTest(unittest.TestCase):
         json.loads(json.dumps(doc["cost"]))     # raises on a stray dataclass
 
 
+class StandaloneScriptDriftTest(unittest.TestCase):
+    """`tools/corpus-survey.py` mirrors this module's numbers; they must not drift.
+
+    The script is standalone by design — one file, stdlib only, runnable on a
+    machine that has never installed Muninn — so it cannot import `muninn.cost`.
+    That duplication is deliberate and this test is what makes it safe, exactly as
+    `MirroredConstantsTest` does for the enrich constants one layer down.
+
+    Parsed rather than imported: importing the script executes it, and it is a CLI
+    with a `main()` and module-level dataclasses. Reading the assignments is
+    cheaper and cannot have side effects.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import ast
+        import pathlib as _pathlib
+
+        source = (_pathlib.Path(__file__).resolve().parents[1]
+                  / "tools" / "corpus-survey.py").read_text()
+        cls.values = {}
+        for node in ast.parse(source).body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target = node.targets[0]
+                if isinstance(target, ast.Name):
+                    try:
+                        cls.values[target.id] = ast.literal_eval(node.value)
+                    except (ValueError, TypeError):
+                        pass
+
+    def test_the_token_ratios_match(self) -> None:
+        self.assertEqual(self.values["EMBED_TOKENS_PER_WORD"],
+                         cost.TOKEN_RATIOS["embed_tokens_per_word"])
+        self.assertEqual(self.values["ENRICH_INPUT_TOKENS_PER_WORD"],
+                         cost.TOKEN_RATIOS["enrich_input_tokens_per_word"])
+        self.assertEqual(self.values["ENRICH_OUTPUT_TOKENS_PER_CALL"],
+                         cost.TOKEN_RATIOS["enrich_output_tokens_per_call"])
+
+    def test_the_enrichment_chunking_matches(self) -> None:
+        self.assertEqual(self.values["ENRICH_CHUNK_WORDS"], cost.ENRICH_CHUNK_WORDS)
+        self.assertEqual(self.values["ENRICH_CHUNK_OVERLAP_WORDS"],
+                         cost.ENRICH_CHUNK_OVERLAP_WORDS)
+
+    def test_the_rates_match(self) -> None:
+        rates = self.values["COST_RATES"]
+        self.assertEqual(rates["titan-embed"]["input"],
+                         cost.RATES["amazon.titan-embed-text-v2:0"].input)
+        self.assertEqual(rates["claude-haiku-4-5"]["input"],
+                         cost.RATES["claude-haiku-4-5"].input)
+        self.assertEqual(rates["claude-haiku-4-5"]["output"],
+                         cost.RATES["claude-haiku-4-5"].output)
+        self.assertEqual(rates["claude-sonnet-5"]["input"],
+                         cost.RATES["claude-sonnet-5"].input)
+
+    def test_the_unverified_rate_is_marked_in_both(self) -> None:
+        # If one of them stops flagging Titan, a reader of that one gets a figure
+        # presented as measured when it is not.
+        self.assertEqual(self.values["COST_RATES"]["titan-embed"]["confidence"], "low")
+        self.assertEqual(cost.RATES["amazon.titan-embed-text-v2:0"].confidence, "low")
+
+
 if __name__ == "__main__":      # pragma: no cover
     unittest.main()

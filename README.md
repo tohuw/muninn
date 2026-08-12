@@ -286,7 +286,9 @@ Every statistic is scoped to a provenance class, and the survey's first act is t
 report what is strange about your data — a tool-invoked majority, a source with
 no human sessions, sessions whose only copy is the archive.
 
-`muninn survey` also projects **what a full pass would cost**, per stage — see
+`muninn survey` also projects **what a full pass would cost**, per stage — and
+`tools/corpus-survey.py` does the same thing standalone, stdlib-only, on a
+machine that has never installed Muninn. See
 [spec 016](docs/specs/016-cost-estimation.md). Volumes are measured from your
 corpus; rates are declared with a source and a confidence, and any figure
 depending on an unverified rate is marked. Measured on a real 680-session

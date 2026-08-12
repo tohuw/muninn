@@ -121,6 +121,42 @@ NON_INTERACTIVE_ORIGINATORS: tuple[str, ...] = (
 CHUNK_TARGET_WORDS = 400
 CHUNK_STRIDE_WORDS = 320
 COVERAGE_TARGET_PCT = 85.0
+
+# --- Cost projection ------------------------------------------------------- #
+# Mirrored from muninn/cost.py rather than imported, because this script is
+# standalone by design: it runs on a machine that has never installed Muninn, from
+# a single file, with nothing but the standard library. A drift test in the main
+# repo (tests/test_cost.py) fails if these values stop matching, which is the same
+# trade muninn/cost.py itself makes to mirror enrich's chunking constants.
+#
+# The ratios are measured, not assumed: Titan's own inputTextTokenCount over 40
+# real chunks, and Bedrock usage over 15 real enrichment calls spanning a corpus.
+# Both are far above the familiar ~1.3 tokens/word, which describes English prose
+# rather than transcripts dense with code, paths and JSON.
+EMBED_TOKENS_PER_WORD = 1.764
+ENRICH_INPUT_TOKENS_PER_WORD = 2.020
+ENRICH_OUTPUT_TOKENS_PER_CALL = 1048
+
+# Enrichment splits a long session, and each split pays the instruction block
+# again — so calls, not sessions, drive output cost.
+ENRICH_CHUNK_WORDS = 12_000
+ENRICH_CHUNK_OVERLAP_WORDS = 400
+
+# USD per 1M tokens. `confidence: low` marks a rate nobody here has verified
+# against an invoice; a projection that uses one says so in its output, because a
+# cost figure whose inputs cannot be ranked by trustworthiness gets quoted as
+# though all of it were measured.
+COST_RATES = {
+    "titan-embed": {"input": 0.02, "output": None, "confidence": "low",
+                    "source": "commonly published on-demand figure; not verified"},
+    "claude-haiku-4-5": {"input": 1.00, "output": 5.00, "confidence": "high",
+                         "source": "Anthropic first-party API rates"},
+    "claude-sonnet-5": {"input": 3.00, "output": 15.00, "confidence": "high",
+                        "source": "Anthropic first-party API rates"},
+    "local-or-seat-licensed": {"input": 0.0, "output": 0.0, "confidence": "high",
+                               "source": "local inference or seat-based access — "
+                                         "no per-token charge"},
+}
 AGE_BUCKET_DAYS = 10
 
 PERCENTILES: tuple[int, ...] = (10, 25, 50, 75, 90, 95, 99)
@@ -198,6 +234,19 @@ def estimate_chunks(words: int, target: int = CHUNK_TARGET_WORDS,
     if words <= target:
         return 1
     return 1 + math.ceil((words - target) / stride)
+
+
+def enrich_calls(words: int) -> int:
+    """Provider calls one session of ``words`` costs during enrichment."""
+    if words <= 0:
+        return 0
+    stride = max(ENRICH_CHUNK_WORDS - ENRICH_CHUNK_OVERLAP_WORDS, 1)
+    return max(1, -(-words // stride))
+
+
+def _tokens_usd(rate: dict, input_tokens: float, output_tokens: float = 0.0) -> float:
+    return (input_tokens / 1_000_000 * rate["input"]
+            + output_tokens / 1_000_000 * (rate.get("output") or 0.0))
 
 
 def derive_enrichment_gate(word_counts: Sequence[int],
@@ -1142,6 +1191,105 @@ class Aggregator:
             }
         return out
 
+    def cost_projection(self) -> dict[str, Any]:
+        """What a full Muninn pass over this corpus would cost, per scenario.
+
+        Answerable **before installing anything**, which is the point of putting it
+        here rather than only in `muninn survey`: the question "what would this cost
+        me" arrives before the decision to install, and a number you can only get
+        after installing is a number nobody asks for.
+
+        Two scenarios rather than one, because the honest answer depends on what a
+        person already has and this script cannot know:
+
+        - ``local_or_seat_licensed`` — a local embedding model and a text model
+          reached through seat-based access (no per-token charge). Zero.
+        - ``metered_titan_and_haiku`` — Bedrock Titan embeddings plus Claude Haiku
+          for enrichment, the metered path.
+
+        Privacy: every value below is a count, a token estimate or a dollar figure
+        derived from them. No prose, no paths, no identifiers — the same contract
+        as the rest of this report.
+        """
+        total_words = 0
+        total_chunks = 0
+        above_words = 0
+        above_sessions = 0
+        above_calls = 0
+        for source in self.sources_seen():
+            words = self.human_words.get(source, [])
+            if not words:
+                continue
+            threshold = derive_enrichment_gate(words)["threshold_words"]
+            total_words += sum(words)
+            total_chunks += sum(estimate_chunks(count) for count in words)
+            for count in words:
+                if count >= threshold:
+                    above_words += count
+                    above_sessions += 1
+                    above_calls += enrich_calls(count)
+
+        # Chunking overlaps (400-word windows on a 320-word stride), so the tokens
+        # actually embedded exceed the corpus word count. Pricing `total_words`
+        # directly under-projects by roughly the overlap ratio, silently.
+        effective_words = total_chunks * CHUNK_TARGET_WORDS
+        embed_tokens = effective_words * EMBED_TOKENS_PER_WORD
+        enrich_in = above_words * ENRICH_INPUT_TOKENS_PER_WORD
+        enrich_out = above_calls * ENRICH_OUTPUT_TOKENS_PER_CALL
+
+        free = COST_RATES["local-or-seat-licensed"]
+        titan = COST_RATES["titan-embed"]
+        haiku = COST_RATES["claude-haiku-4-5"]
+
+        def scenario(embed_rate: dict, text_rate: dict) -> dict[str, Any]:
+            embed_usd = _tokens_usd(embed_rate, embed_tokens)
+            enrich_usd = _tokens_usd(text_rate, enrich_in, enrich_out)
+            return {
+                "embed_usd": round(embed_usd, 4),
+                "enrich_usd": round(enrich_usd, 4),
+                "one_time_total_usd": round(embed_usd + enrich_usd, 4),
+                "usd_per_1000_sessions_enriched": round(
+                    (enrich_usd / above_sessions * 1000) if above_sessions else 0.0, 4),
+                "usd_per_1m_words_embedded": round(
+                    (embed_usd / total_words * 1_000_000) if total_words else 0.0, 4),
+            }
+
+        return {
+            "note": "One-time per session. Ingest, lexical search, correlate and "
+                    "the reports are free — they call no model at all.",
+            "scope": "human-provenance sessions only, matching this script's "
+                     "derived_calibration. `muninn survey` also enriches subagent "
+                     "sessions, so its figures are higher for the same corpus and "
+                     "the same rates — the difference is scope, not disagreement.",
+            "token_ratios": {
+                "embed_tokens_per_word": EMBED_TOKENS_PER_WORD,
+                "enrich_input_tokens_per_word": ENRICH_INPUT_TOKENS_PER_WORD,
+                "enrich_output_tokens_per_call": ENRICH_OUTPUT_TOKENS_PER_CALL,
+                "measured_on": "a real 680-session archive of Claude Code and "
+                               "Codex transcripts; far above the ~1.3 that "
+                               "describes English prose",
+            },
+            "inputs": {
+                "conversation_words": total_words,
+                "estimated_chunks": total_chunks,
+                "above_gate_words": above_words,
+                "above_gate_sessions": above_sessions,
+                "estimated_enrichment_calls": above_calls,
+                "embed_tokens": int(embed_tokens),
+                "enrich_input_tokens": int(enrich_in),
+                "enrich_output_tokens": int(enrich_out),
+            },
+            "rates_used": {"titan-embed": titan, "claude-haiku-4-5": haiku,
+                           "local-or-seat-licensed": free},
+            "scenarios": {
+                "local_or_seat_licensed": scenario(free, free),
+                "metered_titan_and_haiku": scenario(titan, haiku),
+            },
+            "low_confidence_rates": sorted(
+                name for name, rate in COST_RATES.items()
+                if rate["confidence"] == "low"),
+        }
+
 
 # --------------------------------------------------------------------------- #
 # Anomalies (plain language, numbers and hashes only)
@@ -1358,6 +1506,7 @@ def run_survey(claude_override: Path | None, codex_override: Path | None,
                            for name, data in source_reports.items()},
         "retention": aggregator.retention(),
         "derived_calibration": aggregator.derived_calibration(),
+        "cost_projection": aggregator.cost_projection(),
     }
     report["anomalies"] = build_anomalies(aggregator, source_reports)
     return report
@@ -1467,6 +1616,30 @@ def render_summary(report: dict[str, Any], out_path: Path | None) -> str:
             add(f"  {source:8} total {failures[source]:,}"
                 f"{('  [' + detail + ']') if detail else ''}")
         add("")
+
+    cost = report.get("cost_projection")
+    if cost and cost["inputs"]["conversation_words"]:
+        add("")
+        add("estimated cost of a full Muninn pass over this corpus")
+        inputs = cost["inputs"]
+        add(f"  {inputs['above_gate_sessions']:,} sessions would be enriched "
+            f"({inputs['estimated_enrichment_calls']:,} model calls); "
+            f"{inputs['estimated_chunks']:,} chunks embedded from "
+            f"{inputs['conversation_words']:,} words")
+        add("  Scope is human-provenance sessions only, so these counts are lower "
+            "than `muninn survey`'s,")
+        add("  which also enriches subagent sessions. Same rates, wider corpus.")
+        for name, scenario in cost["scenarios"].items():
+            mark = "~" if cost["low_confidence_rates"] and "metered" in name else " "
+            add(f"  {name:26} {mark}${scenario['one_time_total_usd']:>8,.2f}   "
+                f"embed {mark}${scenario['embed_usd']:.2f} + "
+                f"enrich {mark}${scenario['enrich_usd']:.2f}")
+            add(f"  {'':26}  ${scenario['usd_per_1000_sessions_enriched']:>8,.2f} "
+                f"per 1,000 sessions enriched")
+        add("  Ingest, lexical search, correlate and these reports are free — no model.")
+        if cost["low_confidence_rates"]:
+            add(f"  [~] depends on an unverified rate: "
+                f"{', '.join(cost['low_confidence_rates'])}")
 
     if report["anomalies"]:
         add("## Anomalies")

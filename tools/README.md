@@ -141,3 +141,26 @@ dictionary-attacked, and cannot be correlated across runs or across people.
 - **Handles an empty corpus.** If no transcripts are found it says so clearly and
   still produces a valid report — "this developer has no local history" is itself
   a useful calibration data point.
+
+## Cost projection
+
+The report includes a `cost_projection` section, and the summary prints it: what a
+full Muninn pass over *your* corpus would cost, before you install anything.
+
+Two scenarios, because the honest answer depends on what you already have and this
+script cannot know: a local embedding model with seat-based text access (zero), or
+metered Bedrock Titan embeddings with Claude Haiku enrichment. Per-unit figures
+too — dollars per 1,000 sessions enriched and per 1M words embedded.
+
+The token ratios are measured rather than assumed (Titan's own token counts over
+real chunks; Bedrock usage over real enrichment calls) and are far above the
+familiar ~1.3 tokens/word, which describes English prose rather than transcripts
+dense with code and JSON. Rates carry a confidence, and any figure depending on an
+unverified one is marked `~`.
+
+Scope note: this script counts **human-provenance sessions only**, so its numbers
+are lower than `muninn survey`'s, which also enriches subagent sessions. Same
+rates, wider corpus — the difference is scope, not disagreement.
+
+Nothing about this changes the privacy guarantee: every value is a count, a token
+estimate, or a dollar figure derived from them.
