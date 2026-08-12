@@ -159,6 +159,19 @@ class PluginSpec:
     text_providers: tuple[TextProvider, ...] = ()
     history_sources: tuple[HistorySource, ...] = ()
 
+    #: The name of one of this spec's own ``text_providers``, declared as the
+    #: default when no ``--provider`` is passed. ``None`` (the default) means
+    #: "do not change the built-in default", which is what every plugin that
+    #: has no opinion should leave it as.
+    #:
+    #: This is a **declaration, not a preference**: discovery rejects a spec
+    #: whose value does not match one of its own providers, ``muninn doctor``
+    #: prints it, and ``--provider`` overrides it per command. Those three
+    #: properties are what keep "which model just read my transcripts"
+    #: answerable — see ``providers.resolve_provider``, whose docstring records
+    #: why it previously refused to honour a plugin default at all.
+    default_text_provider: str | None = None
+
 
 @dataclass(frozen=True)
 class PluginLoadError:
@@ -203,6 +216,18 @@ class IncompatibleApiVersion(ValueError):
     """``[min_api, max_api]`` does not overlap core's ``API_VERSION``."""
 
 
+class UnknownDefaultTextProvider(ValueError):
+    """``default_text_provider`` does not name one of this spec's own providers.
+
+    Rejected at load time rather than at first use, because the failure it
+    prevents is the one ``providers.resolve_provider`` is written to avoid: a
+    declared default that cannot be resolved would otherwise fall through to
+    the built-in provider at enrichment time, and the distribution would
+    silently enrich through a model it had explicitly declared it did not want.
+    A typo in the declaration is a broken plugin, not a preference to ignore.
+    """
+
+
 class PluginSpecNotInstance(TypeError):
     """The entry point resolved to something other than a ``PluginSpec`` instance.
 
@@ -237,6 +262,13 @@ def _validate(spec: PluginSpec, seen_names: set[str]) -> None:
             f"{spec.name!r} declares [{spec.min_api}, {spec.max_api}], "
             f"which does not cover core API_VERSION={API_VERSION}"
         )
+    if spec.default_text_provider is not None:
+        names = {getattr(p, "name", None) for p in spec.text_providers}
+        if spec.default_text_provider not in names:
+            raise UnknownDefaultTextProvider(
+                f"{spec.name!r} declares default text provider "
+                f"{spec.default_text_provider!r}, which is not among the "
+                f"providers it contributes")
 
 
 @lru_cache(maxsize=1)
@@ -290,7 +322,8 @@ def discover_plugins() -> DiscoveryResult:
 
         try:
             _validate(candidate, seen_names)
-        except (InvalidPluginName, DuplicatePluginName, ReservedPluginName, IncompatibleApiVersion) as exc:
+        except (InvalidPluginName, DuplicatePluginName, ReservedPluginName,
+                IncompatibleApiVersion, UnknownDefaultTextProvider) as exc:
             errors.append(PluginLoadError(
                 entry_point=ep.name, error_class=type(exc).__name__, detail=str(exc)))
             continue

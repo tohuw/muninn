@@ -1342,6 +1342,15 @@ def _print_plugins_section() -> None:
             caps.append(f"{len(spec.history_sources)} history source(s)")
         cap_str = ", ".join(caps) if caps else "no capabilities"
         print(f"  {spec.name:16} v{spec.version:10} api [{spec.min_api},{spec.max_api}]  {cap_str}")
+        # The load-bearing line for spec 015: a plugin may declare the default
+        # text provider, and the whole justification for allowing that is that
+        # it is *visible* here rather than inferred from precedence rules. A
+        # declared default that doctor did not print would be exactly the
+        # silent-preference failure `providers.resolve_provider` refused for
+        # two specs.
+        if getattr(spec, "default_text_provider", None):
+            print(f"  {'':16} {'':11} default text provider: "
+                  f"{spec.default_text_provider} (override per command with --provider)")
     for err in result.errors:
         # Only error.error_class is a class name — never render err.detail
         # verbatim here even though this module's own validation errors are

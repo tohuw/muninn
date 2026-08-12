@@ -290,3 +290,124 @@ class ReconcileContractTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeclaredDefaultTextProviderTest(unittest.TestCase):
+    """`PluginSpec.default_text_provider` (spec 015).
+
+    ``providers.resolve_provider`` used to refuse to honour a plugin default at
+    all, on the reasoning that silently preferring a contributed provider makes
+    "which model just read my transcripts" depend on what happens to be
+    installed. These tests pin the three properties that replaced that refusal —
+    the declaration is validated at load, ambiguity is refused, and an explicit
+    ``--provider`` still wins — because without all three, the original
+    objection is simply correct again.
+    """
+
+    @staticmethod
+    def _provider(name: str, model: str = "m"):
+        class FakeText:
+            def __init__(self) -> None:
+                self.name = name
+                self.model = model
+
+            def available(self) -> str | None:
+                return None
+
+            def generate(self, prompt: str, *, max_tokens: int = 2048,
+                         timeout: float = 60.0) -> str:
+                return "{}"
+
+        return FakeText()
+
+    def test_a_valid_declaration_loads(self) -> None:
+        spec = PluginSpec(name="dist", version="1.0.0",
+                          text_providers=(self._provider("dist-text"),),
+                          default_text_provider="dist-text")
+        result = _discover_with(_fake_entry_point("dist", spec))
+        self.assertEqual(result.errors, ())
+        self.assertEqual(result.specs[0].default_text_provider, "dist-text")
+
+    def test_a_typo_is_rejected_at_load_not_at_first_use(self) -> None:
+        """The failure prevented: falling through to the built-in provider."""
+        spec = PluginSpec(name="typo", version="1.0.0",
+                          text_providers=(self._provider("dist-text"),),
+                          default_text_provider="dist-txt")
+        result = _discover_with(_fake_entry_point("typo", spec))
+        self.assertEqual(result.specs, ())
+        self.assertEqual(len(result.errors), 1)
+        self.assertEqual(result.errors[0].error_class, "UnknownDefaultTextProvider")
+
+    def test_declaring_nothing_is_the_normal_case(self) -> None:
+        spec = PluginSpec(name="opinionless", version="1.0.0",
+                          text_providers=(self._provider("dist-text"),))
+        result = _discover_with(_fake_entry_point("opinionless", spec))
+        self.assertEqual(result.errors, ())
+        self.assertIsNone(result.specs[0].default_text_provider)
+
+    def test_resolve_honours_the_declaration(self) -> None:
+        from muninn import providers
+
+        spec = PluginSpec(name="dist", version="1.0.0",
+                          text_providers=(self._provider("dist-text"),),
+                          default_text_provider="dist-text")
+        with mock.patch("muninn.plugins.entry_points",
+                        return_value=[_fake_entry_point("dist", spec)]):
+            discover_plugins.cache_clear()
+            try:
+                self.assertEqual(providers.resolve_provider().name, "dist-text")
+            finally:
+                discover_plugins.cache_clear()
+
+    def test_explicit_provider_still_overrides_the_declaration(self) -> None:
+        from muninn import providers
+
+        spec = PluginSpec(name="dist", version="1.0.0",
+                          text_providers=(self._provider("dist-text"),),
+                          default_text_provider="dist-text")
+        with mock.patch("muninn.plugins.entry_points",
+                        return_value=[_fake_entry_point("dist", spec)]):
+            discover_plugins.cache_clear()
+            try:
+                self.assertEqual(
+                    providers.resolve_provider(provider_name="claude-cli").name,
+                    "claude-cli")
+                self.assertEqual(
+                    providers.resolve_provider(provider_name="codex-cli").name,
+                    "codex-cli")
+            finally:
+                discover_plugins.cache_clear()
+
+    def test_two_declared_defaults_are_refused_rather_than_ordered(self) -> None:
+        """Picking by discovery order would be the silent preference itself."""
+        from muninn import providers
+
+        a = PluginSpec(name="dista", version="1.0.0",
+                       text_providers=(self._provider("a-text"),),
+                       default_text_provider="a-text")
+        b = PluginSpec(name="distb", version="1.0.0",
+                       text_providers=(self._provider("b-text"),),
+                       default_text_provider="b-text")
+        with mock.patch("muninn.plugins.entry_points",
+                        return_value=[_fake_entry_point("dista", a),
+                                      _fake_entry_point("distb", b)]):
+            discover_plugins.cache_clear()
+            try:
+                with self.assertRaises(providers.ProviderError) as caught:
+                    providers.resolve_provider()
+                self.assertIn("dista", str(caught.exception))
+                self.assertIn("distb", str(caught.exception))
+            finally:
+                discover_plugins.cache_clear()
+
+    def test_no_plugin_means_the_builtin_default_is_unchanged(self) -> None:
+        from muninn import providers
+
+        with mock.patch("muninn.plugins.entry_points", return_value=[]):
+            discover_plugins.cache_clear()
+            try:
+                resolved = providers.resolve_provider()
+            finally:
+                discover_plugins.cache_clear()
+        self.assertEqual(resolved.name, "claude-cli")
+        self.assertEqual(resolved.model, providers.DEFAULT_MODEL)

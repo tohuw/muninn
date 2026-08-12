@@ -348,6 +348,14 @@ A model enters in exactly four places, all optional:
 | `search --deep` | **Text (LLM)** | The query plus the top candidate snippets, to reorder them |
 | `muninn enrich` | **Text (LLM)** | One session's prose, to extract topic / outcome / decisions / artifacts |
 
+The text provider is a **local CLI**, not an SDK: `claude -p` by default (Haiku,
+for cost — one call per substantive session), or `codex exec` with
+`--provider codex-cli` (`gpt-5.6-luna`, Codex's cheap tier). Both send the prompt
+on stdin, never argv, and both pass `policy.check` before the subprocess starts.
+A distribution can *declare* which one is default — see [spec
+015](docs/specs/015-provider-selection.md); `muninn doctor` prints the declaration
+and `--provider` overrides it per command.
+
 Four consequences of that shape:
 
 - **Semantic search does not send your history anywhere at query time.** The

@@ -23,6 +23,7 @@ wiki wins and the contradiction is a bug worth reporting.
 | [012 — Prose-index backfill](012-prose-index-backfill.md) | implemented | 001 |
 | [013 — `muninn resume`](013-resume.md) | implemented | 004 |
 | [014 — Automatic embedding](014-automatic-embedding.md) | implemented | 006, 010 |
+| [015 — Provider selection](015-provider-selection.md) | implemented | 005, 008 |
 
 Specs 002 and 003 both modify `muninn/cli.py`, as do 004, 005, 010 and 011. Run
 overlapping specs sequentially, or in separate git worktrees, so they cannot
@@ -59,6 +60,12 @@ Spec 014 moves embedding from a command a human types to work the daemon owns.
 It changes nothing about how vectors are stored or searched — spec 006 still
 governs all of that — only *when* they are generated. Read it before concluding
 from 006 that `muninn embed` is the only way vectors appear.
+
+Spec 015 adds a second text provider (`codex exec`) and lets a plugin *declare*
+the default one. It reverses a decision spec 008's `resolve_provider` recorded —
+read 015's "Why" before concluding the old refusal still stands — and it changes
+nothing about which models are *permitted*: selection and permission stay
+separate, with `muninn.policy` the only chokepoint.
 
 Later phases not yet spec'd: the console, the agent skill, and the Cisco
 distribution's plugins.

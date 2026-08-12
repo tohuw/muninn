@@ -11,6 +11,8 @@ and each is named in a test below.
 """
 from __future__ import annotations
 
+import pathlib
+
 import contextlib
 import io
 import json
@@ -563,6 +565,100 @@ class ProviderTest(unittest.TestCase):
         # Enrichment is one call per substantive session across a corpus of
         # thousands; this is the most cost-sensitive call site in the tool.
         self.assertIn("haiku", providers.DEFAULT_MODEL)
+
+
+class CodexProviderTest(unittest.TestCase):
+    """The second shipped provider (spec 015). Same discipline, one new hazard.
+
+    The new hazard is a feedback loop, not a leak: ``codex exec`` persists a
+    session rollout under ``$CODEX_HOME/sessions`` unless told not to, and that
+    directory is one Muninn *ingests*. Enrichment would then manufacture one new
+    session to enrich per call, forever, each generation costing money. The
+    ``--ephemeral`` assertion below is the only thing standing between this
+    provider and that loop, which is why it is asserted rather than trusted.
+    """
+
+    def _fake_run(self, out_text: str = '{"topic": "t"}', returncode: int = 0):
+        """Patch subprocess.run so it writes the last-message file like codex does."""
+        def run(argv, **kwargs):
+            if returncode == 0:
+                path = argv[argv.index("--output-last-message") + 1]
+                pathlib.Path(path).write_text(out_text, encoding="utf-8")
+            return type("P", (), {"returncode": returncode, "stdout": "", "stderr": ""})()
+        return run
+
+    def test_the_prompt_goes_through_stdin_never_argv(self) -> None:
+        with patch("subprocess.run", side_effect=self._fake_run()) as ran:
+            providers.CodexCLIProvider().generate("SENSITIVE PROMPT TEXT")
+        argv, kwargs = ran.call_args[0][0], ran.call_args[1]
+        self.assertNotIn("SENSITIVE PROMPT TEXT", " ".join(argv))
+        self.assertEqual(kwargs["input"], "SENSITIVE PROMPT TEXT")
+        self.assertFalse(kwargs["shell"])
+
+    def test_ephemeral_is_passed_so_enrichment_cannot_feed_itself(self) -> None:
+        with patch("subprocess.run", side_effect=self._fake_run()) as ran:
+            providers.CodexCLIProvider().generate("x")
+        self.assertIn("--ephemeral", ran.call_args[0][0])
+
+    def test_the_sandbox_is_pinned_read_only_not_inherited(self) -> None:
+        # A user's config.toml may set sandbox_mode = "danger-full-access" for
+        # interactive work; an unattended summariser must not inherit it.
+        with patch("subprocess.run", side_effect=self._fake_run()) as ran:
+            providers.CodexCLIProvider().generate("x")
+        argv = ran.call_args[0][0]
+        self.assertEqual(argv[argv.index("--sandbox") + 1], "read-only")
+
+    def test_output_comes_from_the_last_message_file_not_stdout(self) -> None:
+        # stdout carries the whole event trace; the parser downstream is given
+        # a JSON object, not a transcript of one being produced.
+        with patch("subprocess.run", side_effect=self._fake_run('{"topic": "parsed"}')):
+            out = providers.CodexCLIProvider().generate("x")
+        self.assertEqual(out, '{"topic": "parsed"}')
+
+    def test_the_temp_file_is_removed_even_on_failure(self) -> None:
+        seen = {}
+
+        def run(argv, **kwargs):
+            seen["path"] = argv[argv.index("--output-last-message") + 1]
+            return type("P", (), {"returncode": 3, "stdout": "", "stderr": "SENSITIVE"})()
+
+        with patch("subprocess.run", side_effect=run):
+            with self.assertRaises(providers.ProviderError):
+                providers.CodexCLIProvider().generate("x")
+        self.assertFalse(pathlib.Path(seen["path"]).exists())
+
+    def test_failures_carry_no_provider_output(self) -> None:
+        with patch("subprocess.run", side_effect=self._fake_run(returncode=1)):
+            with self.assertRaises(providers.ProviderError) as caught:
+                providers.CodexCLIProvider().generate("x")
+        self.assertNotIn("SENSITIVE", str(caught.exception))
+
+    def test_the_check_happens_before_the_subprocess(self) -> None:
+        with patch.object(policy, "check", side_effect=policy.PolicyRefused("no")), \
+                patch("subprocess.run") as ran:
+            with self.assertRaises(policy.PolicyRefused):
+                providers.CodexCLIProvider().generate("hello")
+        ran.assert_not_called()
+
+    def test_available_does_no_io(self) -> None:
+        with patch("subprocess.run") as ran:
+            providers.CodexCLIProvider().available()
+        ran.assert_not_called()
+
+    def test_the_default_model_is_the_cheap_tier(self) -> None:
+        # Same arithmetic as Haiku upstream: one call per substantive session.
+        self.assertEqual(providers.DEFAULT_CODEX_MODEL, "gpt-5.6-luna")
+
+    def test_it_is_not_the_default_provider(self) -> None:
+        # Adding a provider must not change what an existing install enriches
+        # with. Only an explicit --provider or a declared plugin default does.
+        with patch("muninn.plugins.entry_points", return_value=[]):
+            from muninn.plugins import discover_plugins
+            discover_plugins.cache_clear()
+            try:
+                self.assertEqual(providers.resolve_provider().name, "claude-cli")
+            finally:
+                discover_plugins.cache_clear()
 
 
 # ── Criteria 12-13: the CLI, end to end ───────────────────────────────────────
