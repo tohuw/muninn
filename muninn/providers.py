@@ -85,6 +85,21 @@ class TextProvider(Protocol):
     name: str
     model: str
 
+    #: Whether a call bills per token. **Optional**, and ``None`` means "no
+    #: opinion — price it from the model id".
+    #:
+    #: It exists because the model id is not enough to answer the question, and
+    #: getting it wrong in either direction is costly. ``claude -p`` on a Claude
+    #: Code subscription and ``codex exec`` on a seat both have *no marginal
+    #: token cost*, while the very same model reached through Bedrock or an API
+    #: key does. A rate table keyed on the model would call both metered and an
+    #: unattended worker would then refuse to run for almost everybody; keyed on
+    #: the provider name it would call a plugin's Bedrock path free.
+    #:
+    #: A chain provider should compute this **per call**, matching whichever hop
+    #: ``model`` currently reports.
+    metered: bool | None
+
     def available(self) -> str | None:
         """``None`` if usable, else a human-readable reason. No I/O, no network."""
         ...
@@ -108,6 +123,12 @@ class ClaudeCLIProvider:
     model: str = DEFAULT_MODEL
     binary: str = "claude"
     name: str = PROVIDER_NAME
+    #: The user's own authenticated CLI. A Claude Code subscription already paid
+    #: for this call, so enrichment through it has no marginal token cost —
+    #: which the model id alone cannot tell you, since the same model on Bedrock
+    #: does bill. An API-key-authenticated `claude` is the exception this gets
+    #: wrong in the user's favour, and `muninn survey` prices it either way.
+    metered: bool | None = False
 
     def available(self) -> str | None:
         import shutil
@@ -192,6 +213,10 @@ class CodexCLIProvider:
 
     model: str = DEFAULT_CODEX_MODEL
     binary: str = "codex"
+    #: Same reasoning as ClaudeCLIProvider's: this runs the user's own
+    #: authenticated `codex` binary, and that access is seat- or
+    #: subscription-based rather than token-billed.
+    metered: bool | None = False
     name: str = CODEX_PROVIDER_NAME
 
     def available(self) -> str | None:

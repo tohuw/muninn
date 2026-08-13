@@ -153,10 +153,14 @@ RERANK_OUTPUT_TOKENS_PER_SEARCH = 120
 # Assumed query volume for the recurring figure. A guess, labelled as one in the
 # output: this script can measure a corpus but cannot know how often someone will
 # search it.
-# Mirrors muninn/cost.py's free_stages(). Named for the drift test, which asserts
-# the two files agree on what costs nothing — a stage listed free here while the
-# library meters it is the failure that would actually mislead someone.
-FREE_OPERATIONS = [
+# Mirrors muninn/cost.py's unmetered_stages(). Named for the drift test, which
+# asserts the two files agree on what reaches a model — a stage listed here while
+# the library meters it is the failure that would actually mislead someone.
+#
+# Deliberately not called "free" in any output. Seat-licensed model access carries
+# no incremental charge but draws on a shared pool of tokens, and these operations
+# are the ones where that question does not arise at all: they call no model.
+UNMETERED_OPERATIONS = [
     "ingest (hook, watcher, sweep, ledger)",
     "search (lexical), log, show, resume",
     "correlate (compares stored vectors; no model call)",
@@ -177,9 +181,11 @@ COST_RATES = {
                          "source": "Anthropic first-party API rates"},
     "claude-sonnet-5": {"input": 3.00, "output": 15.00, "confidence": "high",
                         "source": "Anthropic first-party API rates"},
-    "local-or-seat-licensed": {"input": 0.0, "output": 0.0, "confidence": "high",
-                               "source": "local inference or seat-based access — "
-                                         "no per-token charge"},
+    "seat-licensed-or-local": {"input": 0.0, "output": 0.0, "confidence": "high",
+                               "source": "local inference, or seat/subscription "
+                                         "access — no incremental charge. Seat "
+                                         "access still draws on a shared token "
+                                         "pool, so this is not the same as costless"},
 }
 AGE_BUCKET_DAYS = 10
 
@@ -1234,10 +1240,15 @@ class Aggregator:
         Two scenarios rather than one, because the honest answer depends on what a
         person already has and this script cannot know:
 
-        - ``local_or_seat_licensed`` — a local embedding model and a text model
-          reached through seat-based access (no per-token charge). Zero.
+        - ``seat_licensed_or_local`` — a local embedding model and a text model
+          reached through seat or subscription access, which carries no
+          *incremental* charge. Reported as $0.00, and that is deliberately not
+          called "free": seat access draws on a shared pool of tokens, so a reader
+          should not take it as unlimited.
         - ``metered_titan_and_haiku`` — Bedrock Titan embeddings plus Claude Haiku
-          for enrichment, the metered path.
+          for enrichment: the path that bills per token.
+        - ``metered_titan_and_sonnet`` — the same, on a more expensive text model,
+          for the spread between fallback tiers.
 
         Privacy: every value below is a count, a token estimate or a dollar figure
         derived from them. No prose, no paths, no identifiers — the same contract
@@ -1301,7 +1312,7 @@ class Aggregator:
         searches = ASSUMED_SEARCHES_PER_MONTH
         deep_searches = int(searches * ASSUMED_DEEP_SHARE)
 
-        free = COST_RATES["local-or-seat-licensed"]
+        free = COST_RATES["seat-licensed-or-local"]
         titan = COST_RATES["titan-embed"]
         haiku = COST_RATES["claude-haiku-4-5"]
         sonnet = COST_RATES["claude-sonnet-5"]
@@ -1350,7 +1361,8 @@ class Aggregator:
 
         return {
             "note": "One-time per session. Ingest, lexical search, correlate and "
-                    "the reports are free — they call no model at all.",
+                    "the reports call no model at all, so they consume no model "
+                    "capacity at any volume.",
             "scope": "human-provenance sessions only, matching this script's "
                      "derived_calibration. `muninn survey` also enriches subagent "
                      "sessions, so its figures are higher for the same corpus and "
@@ -1374,8 +1386,8 @@ class Aggregator:
                 "enrich_output_tokens": int(enrich_out),
             },
             "rates_used": {"titan-embed": titan, "claude-haiku-4-5": haiku,
-                           "local-or-seat-licensed": free},
-            "free_operations": list(FREE_OPERATIONS),
+                           "seat-licensed-or-local": free},
+            "operations_calling_no_model": list(UNMETERED_OPERATIONS),
             "ongoing_basis": {
                 "complete_months_observed": complete_months,
                 "median_enrichable_sessions_per_month": median_sessions,
@@ -1388,7 +1400,7 @@ class Aggregator:
                         "is a guess; this script cannot know how often you will search.",
             },
             "scenarios": {
-                "local_or_seat_licensed": scenario(free, free),
+                "seat_licensed_or_local": scenario(free, free),
                 "metered_titan_and_haiku": scenario(titan, haiku),
                 "metered_titan_and_sonnet": scenario(titan, sonnet),
             },
@@ -1737,6 +1749,10 @@ def render_summary(report: dict[str, Any], out_path: Path | None) -> str:
             "than `muninn survey`'s,")
         add("  which also enriches subagent sessions. Same rates, wider corpus.")
         add("")
+        add("  seat_licensed_or_local shows $0.00 because seat or subscription access")
+        add("  carries no incremental charge. It still draws on a shared pool of tokens,")
+        add("  so read it as budgeted rather than unlimited.")
+        add("")
         add("  one-time backfill (embed the corpus, enrich what clears the gate)")
         for name, scenario in cost["scenarios"].items():
             mark = "~" if cost["low_confidence_rates"] and "metered" in name else " "
@@ -1779,8 +1795,8 @@ def render_summary(report: dict[str, Any], out_path: Path | None) -> str:
                 f"`--semantic`)")
 
         add("")
-        add("  free — no model call, any volume:")
-        for item in cost["free_operations"]:
+        add("  calls no model — consumes no model capacity at any volume:")
+        for item in cost["operations_calling_no_model"]:
             add(f"    {item}")
         if cost["low_confidence_rates"]:
             add(f"  [~] depends on an unverified rate: "

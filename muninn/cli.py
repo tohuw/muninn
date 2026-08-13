@@ -15,6 +15,7 @@ from pathlib import Path
 from . import (
     __version__,
     agent_install,
+    cost,
     daemon,
     embed,
     enrich,
@@ -203,6 +204,11 @@ def _run_ingest_loop_once(args: argparse.Namespace, roots: dict[str, Path], *,
         # 010, `--no-embed` is new, so no existing invocation can be passing it
         # and there is nothing to stay compatible with.
         embed=(holder == daemon.HOLDER_SERVE and not getattr(args, "no_embed", False)),
+        # Same ``getattr`` reasoning as ``embed`` above, and the same
+        # service-only rule: `index --watch` is a debug ingest loop and must not
+        # start spending model calls because someone wanted to watch a sweep.
+        enrich=(holder == daemon.HOLDER_SERVE and not getattr(args, "no_enrich", False)),
+        enrich_metered=getattr(args, "enrich_metered", False),
         # Only `serve` publishes a state file. A foreground watcher expects no
         # supervisor and advertises no port, so a state file would be a claim
         # that something can manage it — and `doctor` would report a daemon that
@@ -626,9 +632,13 @@ def _print_survey(doc: dict, path: Path, *, wrote: bool) -> None:
 def _print_cost(cost: dict | None) -> None:
     """What a full pass over this corpus would cost, per stage.
 
-    Free stages are printed rather than filtered out. A cost table that lists only
-    the priced operations reads as "these are the operations", and the most useful
-    fact here is how few of them cost anything at all.
+    Stages that call no model are printed rather than filtered out. A cost table
+    listing only the priced operations reads as "these are the operations", and the
+    most useful fact here is how few of them reach a model at all.
+
+    Nothing is labelled "free". A seat-licensed model carries no incremental charge
+    but draws on a shared token pool, and flattening that to "free" is how a shared
+    budget gets treated as unlimited.
 
     Rates are printed with their confidence, and a ``~`` marks any figure that
     depends on an unverified one. A projection whose inputs a reader cannot rank
@@ -638,16 +648,16 @@ def _print_cost(cost: dict | None) -> None:
         return
     print("\ncost estimate (model-side only; override rates for your account)")
     priced = [s for s in cost["stages"] if s["usd"] or s["model"]]
-    free = [s for s in cost["stages"] if not s["model"]]
+    unmetered = [s for s in cost["stages"] if not s["model"]]
     for stage in priced:
         mark = "~" if stage["confidence"] == "low" else " "
-        seat = " (seat-licensed: no marginal cost)" if (
+        seat = " (seat-licensed: no incremental charge; draws on shared capacity)" if (
             stage["usd"] == 0 and stage["model"] and "seat" in stage["note"]) else ""
         print(f"  {stage['stage']:20} {mark}${stage['usd']:>9,.2f}  "
               f"{stage['model'] or ''}{seat}")
         print(f"  {'':20}  {mark}${stage['per_unit_usd']:>9,.2f} per {stage['unit']}")
-    for stage in free:
-        print(f"  {stage['stage']:20}  {'$0.00':>10}  {stage['note']}")
+    for stage in unmetered:
+        print(f"  {stage['stage']:20}  {'no model':>10}  {stage['note']}")
     print(f"  {'one-time total':20} {'~' if cost['low_confidence_models'] else ' '}"
           f"${cost['one_time_usd']:>9,.2f}  embed + enrich, once per session")
     print(f"  {'recurring':20} {'~' if cost['low_confidence_models'] else ' '}"
@@ -1163,6 +1173,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                   f"since {lock['acquired_at']}")
 
     _print_embeddings_section(st)
+    _print_enrichment_section(st, args.db)
     _print_calibration_section(st, args.db)
     _print_plugins_section()
     _print_policy_section()
@@ -1208,6 +1219,59 @@ def _print_embeddings_section(st: store.Store) -> None:
     if len(models) > 1:
         print("  WARNING: more than one embedding model is present. Search uses one at "
               "a time, so the others are dead weight — finish the re-embed or delete them")
+
+
+def _print_enrichment_section(st: store.Store, db: str) -> None:
+    """Facet coverage, and whether the background worker would be allowed to run.
+
+    The spec 018 line, and it exists for a failure the embedding section does not
+    have. A stopped embedder leaves a visible backlog; a *refused* enricher leaves
+    a corpus where every facet filter returns nothing — and "no session was fixed"
+    is a perfectly ordinary-looking answer. Before this, 681 sessions and 2
+    enriched read identically to a healthy archive from every command's output.
+
+    So two facts, and the second is the one worth printing even when it is boring:
+    how much of the eligible corpus has facets, and whether an unattended pass
+    *would* cost money — because if it would, the daemon is refusing to run it and
+    the coverage above will not move on its own.
+    """
+    print("\nenrichment")
+    calibration = enrich.load_calibration(db)
+    if calibration is None:
+        print("  no calibration — the enrichment gate is not derived yet; "
+              "run `muninn survey`")
+        return
+
+    plan = enrich.plan(st, calibration)
+    enriched = st.conn.execute(
+        "SELECT COUNT(*) FROM sessions WHERE topic IS NOT NULL AND topic != ''"
+    ).fetchone()[0]
+    planned = len(plan.candidates)
+    eligible = enriched + planned
+    coverage = f"{int(enriched / eligible * 100)}% of eligible" if eligible else "nothing eligible"
+    print(f"  facets      {enriched:,} of {eligible:,} session(s) enriched  ({coverage})")
+    if planned:
+        print(f"  pending     {planned:,} session(s) · ~{plan.estimated_calls:,} model call(s)")
+    for reason, count in sorted(plan.skipped.items()):
+        print(f"  {'':11} skipped {count:,} ({reason})")
+
+    # Which model, and whether an unattended pass may use it. Resolved rather than
+    # assumed: the estimate and the refusal must name the same hop.
+    try:
+        provider = providers.resolve_provider()
+        model = provider.model
+    except Exception:                       # noqa: BLE001 - doctor never fails here
+        print("  auto        no text provider resolved — background enrichment is off")
+        return
+    declared = getattr(provider, "metered", None)
+    metered = bool(declared) if declared is not None else cost.bills_per_token(model)
+    if metered:
+        print(f"  auto        REFUSED — {model} bills per token, so the daemon will not "
+              f"enrich unattended")
+        print("              start it with `--enrich-metered` to allow that, or run "
+              "`muninn enrich` yourself")
+    else:
+        print(f"  auto        allowed — {model} has no marginal token cost")
 
 
 def _print_calibration_section(st: store.Store, db: str) -> None:
@@ -1531,6 +1595,17 @@ def build_parser() -> argparse.ArgumentParser:
                          help="do not embed in the background; semantic search then "
                               "covers only what `muninn embed` has already written "
                               "(docs/specs/014)")
+    p_serve.add_argument("--no-enrich", action="store_true",
+                         help="do not enrich in the background; --outcome and the "
+                              "other facet filters then stay empty until you run "
+                              "`muninn enrich` yourself (docs/specs/018)")
+    p_serve.add_argument("--enrich-metered", action="store_true",
+                         help="allow background enrichment to use a model that bills "
+                              "per token. Off by default: without it the worker "
+                              "refuses to spend unattended and says which model it "
+                              "declined, which is what stops a provider falling back "
+                              "from a seat-licensed model to a metered one from "
+                              "quietly starting a bill (docs/specs/018)")
     p_serve.set_defaults(func=cmd_serve)
 
     p_index = sub.add_parser("index", help="ingest transcripts into the archive")

@@ -18,13 +18,19 @@ every entry carries a ``source`` and a ``confidence``, and a projection built fr
 a low-confidence rate says so in its output. A cost report that cannot tell you
 which of its inputs is a guess is worse than no report, because it will be quoted.
 
-## What is deliberately free
+## What calls no model at all
 
 Ingest, chunking, FTS5 search, `log`, `resume`, `doctor`, `survey` and
-`correlate` call no model and cost nothing. `correlate` surprises people — it
-resolves a provider only to read its model *id* as a lookup key, then compares
-vectors already on disk. It is listed at zero rather than omitted, because "not
-mentioned" reads as "not measured".
+`correlate` call no model, so they consume no model capacity at any volume.
+`correlate` surprises people — it resolves a provider only to read its model *id*
+as a lookup key, then compares vectors already on disk. It is listed at zero
+rather than omitted, because "not mentioned" reads as "not measured".
+
+**Nothing here is described as "free", including a seat-licensed model.** Seat or
+subscription access carries no *incremental* charge, but it draws on a shared pool
+of tokens, and a report that calls that free invites a reader to treat a shared
+budget as unlimited. "No incremental charge" and "calls no model" are the two
+honest statements, and they are not the same statement.
 """
 from __future__ import annotations
 
@@ -80,8 +86,9 @@ class Rate:
     confidence: str = "high"
     #: ``True`` when the marginal cost is expected to be zero because access is
     #: seat- or subscription-based rather than metered. Kept as a flag rather
-    #: than a rate of 0.0 so the distinction between "free" and "unmeasured"
-    #: survives into the report.
+    #: than a rate of 0.0 so the distinction between "carries no incremental
+    #: charge" and "unmeasured" survives into the report. Note it is *not* the
+    #: same as costless: seat access draws on a shared token pool.
     seat_licensed: bool = False
 
 
@@ -124,7 +131,7 @@ RATES: dict[str, Rate] = {
 INGEST_RATE = 0.0
 
 #: Stand-in for a model with no rate entry. Priced at zero but flagged, so an
-#: unknown model reads as "unknown" rather than "free".
+#: unknown model reads as "unknown" rather than "no charge".
 _UNKNOWN = Rate(model="(unknown)", input=0.0, output=0.0,
                 source="no rate entry for this model id — add one to RATES",
                 as_of="", confidence="low")
@@ -148,7 +155,7 @@ def rate_for(model: str) -> Rate | None:
     wrong about cost.
 
     Returns ``None`` for an unknown model rather than guessing. The caller is
-    expected to surface that as "unknown rate", not as free.
+    expected to surface that as "unknown rate", not as "no charge".
     """
     if model in RATES:
         return RATES[model]
@@ -168,6 +175,33 @@ def rate_for(model: str) -> Rate | None:
         if needle.startswith(bare) or bare in needle:
             return RATES[key]
     return None
+
+
+def bills_per_token(model: str) -> bool:
+    """True if calling ``model`` costs money per token. **Fails closed.**
+
+    This is the predicate an *unattended* caller needs, and it is deliberately
+    not "is there a rate": an unknown model returns ``True``, because a price
+    nobody has recorded is a price nobody has ruled out. Every other function in
+    this module reports an unknown rate as "unverified" and carries on, which is
+    right for an estimate a human reads and wrong for a loop that would spend.
+
+    "Does not bill" means one of two things, both recorded on the rate rather than
+    inferred here: ``seat_licensed`` (paid for by a seat or subscription, so a call
+    carries no incremental charge — it still draws on a shared token pool) or a
+    genuinely zero rate (a local model, which consumes nothing shared).
+
+    Naming the mistake this exists to prevent: a provider chain whose primary hop
+    is seat-licensed and whose fallback is metered reports whichever hop *would*
+    run, so "it did not bill when the daemon started" is not a claim that holds for
+    the life of the process. See ``enricher.BackgroundEnricher``.
+    """
+    rate = rate_for(model)
+    if rate is None:
+        return True
+    if rate.seat_licensed:
+        return False
+    return bool(rate.input) or bool(rate.output)
 
 #: Enrichment's chunking, **mirrored from ``enrich.CHUNK_WORDS`` /
 #: ``enrich.CHUNK_OVERLAP_WORDS`` rather than imported**, because ``enrich``
@@ -277,7 +311,8 @@ def enrich_cost(words: int, calls: int, *, model: str = "claude-haiku-4-5",
         inputs={"words": words, "calls": calls, "sessions": sessions,
                 "input_tokens": int(in_tokens), "output_tokens": int(out_tokens)},
         confidence=rate.confidence,
-        note=("seat-licensed: no marginal token cost" if rate.seat_licensed
+        note=("covered by seat licensing — no incremental charge, though it does "
+              "draw on shared capacity" if rate.seat_licensed
               else "one-time per session, until the session changes"))
 
 
@@ -313,8 +348,15 @@ def search_cost(searches: int, *, semantic_model: str = "amazon.titan-embed-text
         note="recurring per query; corpus vectors are not re-paid for")
 
 
-def free_stages() -> list[StageCost]:
-    """The stages that call no model, listed so their absence is not inferred."""
+def unmetered_stages() -> list[StageCost]:
+    """The stages that call no model, listed so their absence is not inferred.
+
+    Described as "no model call" rather than "free", and the distinction is not
+    pedantry: seat-licensed model access draws on a **shared pool of tokens**, so
+    calling anything model-backed "free" invites someone to treat a shared budget
+    as unlimited. These stages are the ones where that question does not arise —
+    they consume no model capacity at all, at any volume.
+    """
     return [
         StageCost(stage=name, model=None, usd=0.0, unit="unlimited",
                   per_unit_usd=0.0, note=note)
@@ -345,7 +387,7 @@ def project(*, words: int, chunks: int, enrich_words: int, enrich_calls: int,
         search_cost(searches_per_month, semantic_model=embed_model),
         search_cost(int(searches_per_month * deep_share), deep=True,
                     semantic_model=embed_model, rerank_model=text_model),
-        *free_stages(),
+        *unmetered_stages(),
     ]
     one_time = sum(s.usd for s in stages if s.stage in ("embed", "enrich"))
     monthly = sum(s.usd for s in stages if s.stage.startswith("search "))

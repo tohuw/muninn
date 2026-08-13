@@ -26,6 +26,7 @@ wiki wins and the contradiction is a bug worth reporting.
 | [015 — Provider selection](015-provider-selection.md) | implemented | 005, 008 |
 | [016 — Cost estimation](016-cost-estimation.md) | implemented | 011, 005, 006 |
 | [017 — Menu lifecycle actions](017-menu-lifecycle-actions.md) | implemented | 009, 010 |
+| [018 — Automatic enrichment](018-automatic-enrichment.md) | implemented | 014, 016, 011, 005 |
 
 Specs 002 and 003 both modify `muninn/cli.py`, as do 004, 005, 010 and 011. Run
 overlapping specs sequentially, or in separate git worktrees, so they cannot

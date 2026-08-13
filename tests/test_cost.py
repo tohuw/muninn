@@ -84,6 +84,15 @@ class StageCostTest(unittest.TestCase):
         self.assertEqual(stage.usd, 0.0)
         self.assertIn("seat", stage.note)
 
+    def test_nothing_model_backed_is_described_as_free(self) -> None:
+        """Seat access draws on a shared token pool; "free" invites treating it
+        as unlimited. $0.00 is fine; the *word* is what misleads."""
+        stage = cost.enrich_cost(100_000, 10, model="gpt-5.6-luna", sessions=10)
+        self.assertNotIn("free", stage.note.lower())
+        for s in cost.unmetered_stages():
+            self.assertNotIn("free", (s.note or "").lower())
+            self.assertNotIn("free", s.stage.lower())
+
     def test_output_tokens_scale_with_calls_not_sessions(self) -> None:
         # One long session is several calls, and each pays the instruction block
         # and produces its own facet object.
@@ -102,12 +111,12 @@ class StageCostTest(unittest.TestCase):
         self.assertGreater(cost.search_cost(100, deep=True).usd,
                            cost.search_cost(100).usd)
 
-    def test_free_stages_are_listed_rather_than_omitted(self) -> None:
+    def test_unmetered_stages_are_listed_rather_than_omitted(self) -> None:
         """"Not mentioned" reads as "not measured"."""
-        names = {s.stage for s in cost.free_stages()}
+        names = {s.stage for s in cost.unmetered_stages()}
         self.assertIn("ingest", names)
         self.assertTrue(any("correlate" in n for n in names))
-        self.assertTrue(all(s.usd == 0.0 for s in cost.free_stages()))
+        self.assertTrue(all(s.usd == 0.0 for s in cost.unmetered_stages()))
 
 
 class ConfidenceLabellingTest(unittest.TestCase):
@@ -261,10 +270,10 @@ class StandaloneScriptDriftTest(unittest.TestCase):
         self.assertEqual(self.values["RERANK_OUTPUT_TOKENS_PER_SEARCH"],
                          cost.TOKEN_RATIOS["rerank_output_tokens_per_search"])
 
-    def test_the_free_operations_agree_on_what_costs_nothing(self) -> None:
-        """A stage listed free in one and metered in the other is the bad case."""
-        listed = " ".join(self.values["FREE_OPERATIONS"]).lower()
-        for stage in cost.free_stages():
+    def test_both_files_agree_on_what_calls_no_model(self) -> None:
+        """A stage listed unmetered in one and metered in the other is the bad case."""
+        listed = " ".join(self.values["UNMETERED_OPERATIONS"]).lower()
+        for stage in cost.unmetered_stages():
             head = stage.stage.split()[0].lower()
             self.assertIn(head, listed,
                           f"{stage.stage} is free in muninn.cost but unlisted in the script")

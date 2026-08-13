@@ -34,7 +34,7 @@ is **not** always the best choice.
 
 | The user's question looks like | Use | Why |
 |---|---|---|
-| An exact identifier, error string, file path, function name, quoted phrase | `muninn search "..."` (lexical) | FTS5 matches the literal tokens; fastest and free |
+| An exact identifier, error string, file path, function name, quoted phrase | `muninn search "..."` (lexical) | FTS5 matches the literal tokens; fastest, and calls no model |
 | "I vaguely remember…", a paraphrase, a concept with no known wording | `muninn search "..." --semantic` | Vector similarity finds it without the exact words |
 | A hard ranking problem where the top hits are all plausible | `muninn search "..." --deep` | `--semantic` plus an LLM rerank of the top candidates |
 | "What else is like this session?" | `muninn correlate <id>` | Mean-vector neighbours; **calls no model, costs nothing** — see the note below |
@@ -73,9 +73,17 @@ matches a basename or path; `--tool` matches a tool the session used (`Read`,
   were these. If the user is hunting for something a *script* did, pass
   `--provenance tool-invoked` before concluding it does not exist.
 - **`--outcome` only works after enrichment has run.** `topic`, `outcome`,
-  `summary` and the facet fields are empty until `muninn enrich` populates them.
-  An empty `--outcome fixed` result means "no facets yet", not "nothing was
-  fixed". Check `muninn doctor` before reporting absence.
+  `summary` and the facet fields are empty until enrichment populates them. An
+  empty `--outcome fixed` result means "no facets yet", not "nothing was fixed".
+  `muninn doctor`'s **enrichment** section is the check: it prints facet coverage,
+  the pending count, and whether the daemon is allowed to enrich unattended.
+
+  `muninn serve` enriches in the background (spec 018), but **only through a model
+  that carries no incremental charge**. If the resolved provider bills per token the
+  daemon refuses and names it, so a backlog that never shrinks is usually that
+  refusal rather than a stuck worker — read `doctor`'s `auto` line rather than
+  guessing. `--enrich-metered` is how the user opts into spending; suggest it, do
+  not assume it.
 
 ## Machine-readable output
 
@@ -127,7 +135,13 @@ installed, so the fix is normally to wait, not to run `embed`.
 
 Use `survey` to answer "what would this cost". Its rates carry a confidence and
 any figure depending on an unverified rate is marked `~` — relay that caveat, do
-not launder it into a flat number. Most of Muninn is free: ingest, lexical search,
+not launder it into a flat number.
+
+**Do not call any of this "free" to the user.** Seat- or subscription-based model
+access carries no *incremental* charge but draws on a shared pool of tokens, so
+"free" invites treating a shared budget as unlimited. Say "no incremental charge"
+for a seat-licensed model, and "calls no model" for the stages that reach one at
+all. Most of Muninn is the latter: ingest, lexical search,
 `log`, `show`, `resume`, `correlate`, `doctor` and `survey` call no model at all.
 
 ## Maintenance commands
@@ -153,7 +167,7 @@ publishes no menu, so starting it is `muninn serve` or the login agent
 - **Do not run model-costing `embed` or `enrich` unless the user explicitly asks**,
   and say what a pass will cost first (`survey`, or `enrich --dry-run --json`).
   `enrich` is the expensive one: one LLM call per substantive session, hundreds of
-  sessions in a corpus. `embed` is cheap but not free, and the daemon usually does
+  sessions in a corpus. `embed` is cheap but not costless, and the daemon does
   it for you.
 - Report provenance and source-presence limits when they materially affect an
   answer; never infer a decision from a counter alone.

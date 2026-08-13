@@ -77,7 +77,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import embedder, indexer, paths, raven, ravenserve, store
+from . import embedder, enricher, indexer, paths, raven, ravenserve, store
 from .receipt import ImportReceipt
 
 logger = logging.getLogger("muninn.daemon")
@@ -594,6 +594,8 @@ class Daemon:
     def __init__(self, db_path: str | Path, roots: dict[str, Path], *,
                  menubar: bool = True,
                  embed: bool = True,
+                 enrich: bool = True,
+                 enrich_metered: bool = False,
                  publish_state: bool = True,
                  holder: str = HOLDER_SERVE,
                  state_file: Path | None = None,
@@ -613,6 +615,12 @@ class Daemon:
         # money against a hosted embedder would be a surprise in the one mode
         # someone runs to observe behaviour.
         self.embed = embed
+        # Separate from ``embed`` on purpose: they are different amounts of money.
+        # A user who wants automatic embedding (cents for a corpus) has not thereby
+        # asked for automatic enrichment (the one expensive stage), so the flags do
+        # not collapse into one.
+        self.enrich = enrich
+        self.enrich_metered = enrich_metered
         # ``muninn index --watch`` sets this False. A state file is a claim that
         # something can be supervised at that pid and port; a foreground watcher
         # publishes no port and expects no supervisor, and writing one anyway
@@ -625,6 +633,7 @@ class Daemon:
         self.announce = announce or (lambda _msg: None)
         self.port: int | None = None
         self.embedder: embedder.BackgroundEmbedder | None = None
+        self.enricher: enricher.BackgroundEnricher | None = None
         #: Set by :meth:`request_stop`. Read by the supervising loop in cli.py
         #: *after* ``run`` returns, which is why it outlives the ingest loop and
         #: why a restart gets a fresh ``Daemon`` rather than reusing this one.
@@ -698,6 +707,18 @@ class Daemon:
                 if worker.start():
                     self.embedder = worker
 
+            # The enricher after the embedder, and both before the ingest loop for
+            # the same reason. Order between the two barely matters — they are
+            # independent threads over independent backlogs — but embedding first
+            # is the useful one: a session becomes semantically searchable in
+            # seconds, and enrichment of the same session takes a model call.
+            if self.enrich:
+                facets = enricher.BackgroundEnricher(
+                    self.db_path, allow_metered=self.enrich_metered,
+                    announce=self.announce)
+                if facets.start():
+                    self.enricher = facets
+
             # 5. The state file last, so "the daemon is discoverable" implies
             #    everything it advertises is already true.
             if self.publish_state:
@@ -729,6 +750,12 @@ class Daemon:
             #                      whole teardown atomic from outside.
             if service is not None:
                 service.stop()
+            # The enricher before the embedder, so the slowest worker gets its
+            # timeout first rather than after the other has already spent one: both
+            # hold their own connection to the archive and both must stop writing
+            # before the lock is released to a successor daemon.
+            if self.enricher is not None:
+                self.enricher.stop()
             if self.embedder is not None:
                 self.embedder.stop()
             if self.publish_state:
