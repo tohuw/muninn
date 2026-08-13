@@ -407,7 +407,7 @@ wheels = [
 
 [[package]]
 name = "muninn-console"
-version = "2026.8.13.0"
+version = "2026.8.13.1"
 source = { editable = "." }
 dependencies = [
     { name = "corvidae" },
