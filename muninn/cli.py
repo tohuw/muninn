@@ -1271,7 +1271,7 @@ def _print_enrichment_section(st: store.Store, db: str) -> None:
         print("              start it with `--enrich-metered` to allow that, or run "
               "`muninn enrich` yourself")
     else:
-        print(f"  auto        allowed — {model} has no marginal token cost")
+        print(f"  auto        allowed — {model} carries no incremental charge")
 
 
 def _print_calibration_section(st: store.Store, db: str) -> None:
