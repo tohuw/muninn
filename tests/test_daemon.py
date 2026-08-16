@@ -358,12 +358,26 @@ class TerminationHandlerTest(unittest.TestCase):
                 cleaned.append("teardown ran")
         self.assertEqual(cleaned, ["teardown ran"])
 
-    def test_sigint_is_deliberately_not_claimed(self) -> None:
-        # It already raises KeyboardInterrupt, which unwinds. Claiming it would
-        # swap a working path for an untested one.
-        before = signal.getsignal(signal.SIGINT)
+    def test_sigint_is_claimed_too(self) -> None:
+        """It used not to be, on the theory that the default already unwinds.
+
+        The Linux job said otherwise, repeatedly: exit -2, which means killed by
+        the signal under the default disposition -- so no Python exception was
+        raised and there was nothing to catch. Catching KeyboardInterrupt in
+        cli.py's supervising loop did not fix it, which is the evidence that
+        none was being raised. Our own handler makes the outcome ours rather
+        than watchfiles'.
+        """
+        installed = daemon.install_termination_handlers()
+        self.assertIn("SIGINT", installed)
+        self.assertIs(signal.getsignal(signal.SIGINT), daemon._on_terminating_signal)
+
+    def test_sigint_unwinds_as_a_clean_exit_not_a_kill(self) -> None:
+        """A stop is 0. -2 tells a service manager the daemon crashed."""
         daemon.install_termination_handlers()
-        self.assertIs(signal.getsignal(signal.SIGINT), before)
+        with self.assertRaises(SystemExit) as caught:
+            signal.raise_signal(signal.SIGINT)
+        self.assertEqual(caught.exception.code, 0)
 
     def test_a_second_signal_during_teardown_is_ignored(self) -> None:
         # A supervisor that escalates TERM, TERM, KILL must not have its second

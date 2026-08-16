@@ -495,9 +495,24 @@ def install_termination_handlers() -> tuple[str, ...]:
     normal unwind, so the daemon's ``finally`` gets to withdraw the descriptor,
     remove the state file, and release the lock.
 
-    ``SIGINT`` is deliberately **not** installed: it already raises
-    ``KeyboardInterrupt``, which unwinds. Replacing a working path with an
-    untested one is the trade being declined.
+    ``SIGINT`` **is** installed, and used not to be. The original reasoning was
+    that it already raises ``KeyboardInterrupt``, which unwinds, so claiming it
+    would swap a working path for an untested one. The Linux CI job disagreed,
+    repeatedly: ``test_sigint_leaves_nothing_behind`` failed with ``-2 != 0``,
+    and -2 is specific -- it means the process was *killed by the signal* under
+    the default disposition, so no Python exception was raised at all.
+
+    A first attempt caught ``KeyboardInterrupt`` in the supervising loop in
+    ``cli.py``. That did not fix it, which is itself the evidence: if the
+    interrupt were being raised, that catch would have converted it. Something
+    below Python -- ``watchfiles``' Rust core is the only candidate holding a
+    signal handler here -- is taking SIGINT without leaving Python an exception
+    to unwind.
+
+    Installing our own handler removes the dependence on any of that. It raises
+    ``SystemExit(0)``, which ``run`` already catches beside
+    ``KeyboardInterrupt``, and which exits 0 even if it escapes -- where the
+    default disposition exits -2 and a service manager reads that as a crash.
 
     ## What ``watchfiles`` does with the same signal, and why it is not enough
 
@@ -548,7 +563,7 @@ def install_termination_handlers() -> tuple[str, ...]:
     _terminating = False
 
     installed: list[str] = []
-    for name in ("SIGTERM", "SIGHUP"):
+    for name in ("SIGTERM", "SIGHUP", "SIGINT"):
         sig = getattr(signal, name, None)
         if sig is None:
             continue
