@@ -21,9 +21,18 @@ def _runtime_installed() -> bool:
 
 class ProviderContractTest(unittest.TestCase):
     def test_available_does_no_io(self):
-        """Discovery runs this; a probe that touches the network is a hang."""
+        """Discovery runs this; a probe that touches the network is a hang.
+
+        The hub module is injected rather than patched in place, so this runs
+        without the [semantic] extra too -- patching a module that is not
+        installed is an error, and CI does not install it. What is asserted is
+        that available() never calls the downloader, which is as true of a
+        stand-in as of the real one.
+        """
         provider = ONNXEmbeddingProvider()
-        with patch("huggingface_hub.hf_hub_download") as download:
+        download = MagicMock()
+        with patch.dict(sys.modules,
+                        {"huggingface_hub": MagicMock(hf_hub_download=download)}):
             provider.available()
         download.assert_not_called()
 
@@ -45,9 +54,18 @@ class ProviderContractTest(unittest.TestCase):
         self.assertEqual(DEFAULT_DIM, 384)
 
     def test_the_policy_chokepoint_is_not_bypassed(self):
-        """An embedding call is still a model call."""
+        """An embedding call is still a model call.
+
+        available() is stubbed so the chokepoint is asserted on machines
+        without the extra as well. Otherwise embed() refuses at the
+        availability gate before reaching policy, and the security property
+        this defends would go unchecked exactly where it is least observed --
+        including CI. That check raises and the weights are never loaded is
+        also the ordering assertion: policy comes first.
+        """
         provider = ONNXEmbeddingProvider()
-        with patch("muninn.policy.check", side_effect=RuntimeError("checked")) as check:
+        with patch.object(provider, "available", return_value=None), \
+             patch("muninn.policy.check", side_effect=RuntimeError("checked")) as check:
             with self.assertRaises(RuntimeError):
                 provider.embed(["anything"])
         check.assert_called_once_with(DEFAULT_MODEL, provider.name)
