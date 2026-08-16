@@ -242,9 +242,14 @@ class NoProviderTest(_Archive):
         self.assertIn("--extra semantic", err)
 
     def test_resolve_provider_refuses_rather_than_inventing_a_fallback(self) -> None:
+        # Both local providers are blocked, not just MLX. Blocking one stopped
+        # proving anything once ONNX Runtime made a second one resolvable off
+        # Apple silicon — the assertion would then pass or fail on whether the
+        # host happened to have the [semantic] extra installed.
         with patch("muninn.plugins.discover_plugins") as discovered:
             discovered.return_value = type("R", (), {"specs": ()})()
-            with patch.dict(sys.modules, {"muninn.embed_mlx": None}):
+            with patch.dict(sys.modules, {"muninn.embed_mlx": None,
+                                          "muninn.embed_onnx": None}):
                 with self.assertRaises(embed.EmbeddingUnavailable):
                     embed.resolve_provider()
 

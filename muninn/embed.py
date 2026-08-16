@@ -439,22 +439,39 @@ def resolve_provider(name: str | None = None) -> EmbeddingProvider:
         if candidate.available() is None:
             return candidate
 
-    # Imported here, not at module scope: the local provider pulls MLX, which is
-    # not a default dependency (docs/specs/006, "imported lazily").
+    # Imported here, not at module scope: these pull model runtimes, which are
+    # not default dependencies (docs/specs/006, "imported lazily").
+    #
+    # MLX first, then ONNX. On Apple silicon MLX runs on the GPU and is the
+    # faster of the two, so it keeps priority where it works; ONNX Runtime is
+    # what makes semantic search exist at all on Windows and Linux, where MLX
+    # cannot run. Order is preference, not capability — either satisfies the
+    # protocol, and whichever answers writes its own model id into the vector
+    # key, so the two never mix.
+    locals_: list[EmbeddingProvider] = []
     try:
         from .embed_mlx import MLXEmbeddingProvider
     except ImportError:
-        MLXEmbeddingProvider = None    # noqa: N806 - a sentinel, not a class alias
-    if MLXEmbeddingProvider is not None:
-        local = MLXEmbeddingProvider()
-        if local.available() is None:
-            return local
-        reason = local.available()
+        pass
     else:
-        reason = "the [semantic] extra is not installed"
+        locals_.append(MLXEmbeddingProvider())
+    try:
+        from .embed_onnx import ONNXEmbeddingProvider
+    except ImportError:
+        pass
+    else:
+        locals_.append(ONNXEmbeddingProvider())
+
+    reasons = []
+    for local in locals_:
+        reason = local.available()
+        if reason is None:
+            return local
+        reasons.append(reason)
 
     raise EmbeddingUnavailable(
-        f"no embedding provider is available — {reason}. Install the local one "
-        f"with `uv sync --extra semantic`, or a plugin that contributes an "
-        f"EmbeddingProvider."
+        "no embedding provider is available — "
+        + ("; ".join(reasons) if reasons else "the [semantic] extra is not installed")
+        + ". Install a local one with `uv sync --extra semantic`, or a plugin "
+          "that contributes an EmbeddingProvider."
     )

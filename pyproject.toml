@@ -32,7 +32,16 @@ dependencies = [
 # See .valholl/articles/model-policy-chokepoint.md
 semantic = [
     "numpy>=2.0",
+    # Apple silicon only, and preferred there: it runs on the GPU.
     "mlx-embeddings>=0.0.3; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    # Everywhere else — and everywhere, so a Mac keeps working if MLX breaks.
+    # Prebuilt CPU wheels on every supported platform, no compiler and no torch.
+    # Without these the extra installed *nothing* off Apple silicon, so
+    # `uv sync --extra semantic` was advice that could not be followed: it
+    # resolved happily and left the user with no provider and no explanation.
+    "onnxruntime>=1.17",
+    "tokenizers>=0.15",
+    "huggingface-hub>=0.20",
 ]
 
 # The console (unbuilt). fastapi and uvicorn were declared as *runtime*
