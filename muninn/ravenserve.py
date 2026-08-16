@@ -399,6 +399,29 @@ class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+    def server_bind(self) -> None:
+        """Bind without the reverse DNS lookup ``http.server`` does by default.
+
+        ``HTTPServer.server_bind`` calls ``socket.getfqdn(host)`` to fill in
+        ``server_name``, which exists for CGI's ``SERVER_NAME`` variable. Nothing
+        in this handler reads it, and the lookup is a *blocking reverse DNS
+        query* made while the daemon is starting up.
+
+        On macOS that query can take tens of seconds when the resolver has
+        nothing useful to say about 127.0.0.1 — which is the state of a CI runner
+        and of plenty of laptops on a captive or VPN'd network. The daemon then
+        sat silent before its first log line, having bound nothing and published
+        nothing: indistinguishable from a hang, because it was one. It is why
+        every ``LiveLifecycleTest`` timed out on macOS while Linux passed.
+
+        The host address is a literal we chose; using it directly is both
+        correct and instant.
+        """
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
     def handle_error(self, request: object, client_address: object) -> None:
         """Log a dropped connection, never traceback it to stderr.
 

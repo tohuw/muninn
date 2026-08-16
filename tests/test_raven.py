@@ -485,6 +485,34 @@ class ServiceLifecycleTest(RavenTestCase):
         with ravenserve.serve(lambda: raven.build_menu(recent=[], sessions=0, chunks=0)) as svc:
             self.assertEqual(svc.server.server_address[0], "127.0.0.1")
 
+    def test_binding_never_asks_a_resolver_anything(self) -> None:
+        """The macOS startup hang.
+
+        ``http.server.HTTPServer.server_bind`` calls ``socket.getfqdn(host)`` to
+        fill in ``server_name`` for CGI's benefit. It is a blocking reverse DNS
+        query on the daemon's startup path, and on macOS it can take tens of
+        seconds when the resolver has nothing to say about 127.0.0.1 — a CI
+        runner, or a laptop behind a captive portal or VPN. The daemon sat
+        silent, bound nothing and published nothing, which is why every
+        LiveLifecycleTest timed out there while Linux passed.
+
+        Asserted as "does not call it" rather than "is fast", because a timing
+        assertion would pass on any machine whose resolver happens to answer
+        quickly — including every machine this is likely to be run on.
+        """
+        from unittest.mock import patch
+
+        def _forbidden(*_args, **_kwargs):
+            raise AssertionError("server_bind performed a name lookup")
+
+        with patch("socket.getfqdn", _forbidden), \
+             patch("socket.gethostbyaddr", _forbidden):
+            with ravenserve.serve(
+                lambda: raven.build_menu(recent=[], sessions=0, chunks=0)
+            ) as svc:
+                self.assertEqual(svc.server.server_name, "127.0.0.1")
+                self.assertEqual(svc.server.server_port, svc.port)
+
     def test_stop_releases_the_port_for_a_restart(self) -> None:
         """Without server_close() the socket stays bound and a restart fails."""
         first = ravenserve.serve(lambda: raven.build_menu(recent=[], sessions=0, chunks=0))
