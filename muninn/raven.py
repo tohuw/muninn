@@ -272,7 +272,48 @@ def descriptor(port: int, *, pid: int | None = None,
         # Omitting "action" is how a raven says it has nothing to be clicked;
         # Appistry renders link rows identically either way.
         "endpoints": endpoints,
+        # How a shared host may ask this platform's supervisor to start Muninn
+        # again. An identifier, never a command: the host must never execute a
+        # path named in a file anything running as this user can write. Omitted
+        # where the platform has no such mechanism, so the host draws no Start
+        # row rather than one that cannot work.
+        **({"launch": block} if (block := _launch_block()) else {}),
     }
+
+
+def _launch_block() -> dict | None:
+    """The descriptor's ``launch`` block, or None if it cannot be derived.
+
+    corvidae owns this mapping and Huginn already uses its helper, but corvidae
+    ships on its own cadence and the version Muninn's floor allows predates it.
+    So: use the shared helper when it is there, and derive the same three cases
+    locally when it is not. Forcing a corvidae release and a floor bump to land
+    one optional descriptor field would be the tail wagging the dog, and this
+    converges on the shared helper the moment the floor moves.
+
+    Never fatal. A raven that cannot say how to restart itself still publishes a
+    usable descriptor, and the host degrades to a reason with no Start row.
+    """
+    try:
+        from . import agent_install
+
+        spec = agent_install.spec()
+        try:
+            from corvidae.login_agent import launch_descriptor
+        except ImportError:
+            pass
+        else:
+            return launch_descriptor(spec)
+
+        if sys.platform == "darwin":
+            return {"kind": "launchd", "id": spec.label}
+        if sys.platform.startswith("linux"):
+            return {"kind": "systemd", "id": spec.unit_name}
+        if os.name == "nt":
+            return {"kind": "windows-run", "id": spec.run_value}
+        return None
+    except Exception:  # noqa: BLE001 - a diagnostic must not cost the descriptor
+        return None
 
 
 def publish(port: int, *, directory: Path | None = None,
