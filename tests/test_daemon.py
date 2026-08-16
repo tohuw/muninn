@@ -697,6 +697,24 @@ class LiveLifecycleTest(unittest.TestCase):
             self.proc.wait(timeout=10)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    def _child_output(self) -> str:
+        """Whatever the child said, without blocking if it is still running.
+
+        The pipe is never drained during a normal run, so on a timeout the
+        reason the daemon did not start was being thrown away -- the failure
+        read only "timed out", which is why this went undiagnosed. Killing it
+        first closes the write end so the read cannot hang.
+        """
+        if self.proc is None:
+            return "(no child was started)"
+        if self.proc.poll() is None:
+            self.proc.kill()
+        try:
+            out, _ = self.proc.communicate(timeout=10)
+        except Exception as exc:  # pragma: no cover - diagnostics must not mask
+            return f"(could not read child output: {exc!r})"
+        return out or "(the child wrote nothing)"
+
     def _start(self) -> subprocess.Popen:
         # start_new_session so the child leads its own process group: without it
         # a signal aimed at this test's group would hit pytest too, and the child
@@ -713,8 +731,18 @@ class LiveLifecycleTest(unittest.TestCase):
         # daemon's own state file is still sitting there, so the wait returns
         # instantly and every later assertion reads the corpse's pid. Wait for the
         # file to name *this* child.
-        _wait_for(lambda: (daemon.read_state(self.state) or {}).get("pid") == self.proc.pid,
-                  STARTUP_TIMEOUT_S, f"a state file naming pid {self.proc.pid}")
+        try:
+            _wait_for(
+                lambda: (daemon.read_state(self.state) or {}).get("pid") == self.proc.pid,
+                STARTUP_TIMEOUT_S, f"a state file naming pid {self.proc.pid}")
+        except AssertionError as exc:
+            exited = self.proc.poll()
+            raise AssertionError(
+                f"{exc}\n"
+                f"child exit status: {exited!r} "
+                f"({'still running' if exited is None else 'exited'})\n"
+                f"--- child output ---\n{self._child_output()}"
+            ) from None
         return self.proc
 
     def _stop(self, sig: int) -> int:
