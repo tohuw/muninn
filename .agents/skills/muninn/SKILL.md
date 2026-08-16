@@ -102,6 +102,11 @@ matches a basename or path; `--tool` matches a tool the session used (`Read`,
   `muninn doctor`'s **enrichment** section is the check: it prints facet coverage,
   the pending count, and whether the daemon is allowed to enrich unattended.
 
+  Enrichment selects on a **floor** — enough words for a summary to say
+  something, and both sides having spoken — not on a length gate, so short
+  sessions are enriched too. If you remember an older Muninn skipping them, that
+  is fixed; only genuine stubs are `below-floor`.
+
   `muninn serve` enriches in the background (spec 018), but **only through a model
   that carries no incremental charge**. If the resolved provider bills per token the
   daemon refuses and names it, so a backlog that never shrinks is usually that

@@ -326,6 +326,27 @@ which agent you favor. Derived gates on the same corpus landed at 4,046 and
 2,480 words respectively, both hitting ~85% text coverage. What is held fixed is
 the **coverage**; the word count is whatever your corpus needs to reach it.
 
+**Enrichment no longer uses that gate, and the reason is worth reading.**
+Deriving the threshold rather than guessing it was the right fight on the wrong
+axis. Word-coverage is a sound *budget* rule and a bad *discoverability* rule,
+because session cost scales with length: covering 85% of the words spends about
+80% of the budget to reach about 18% of the conversations, and the ones it turns
+down are the cheapest in the corpus. On a real archive that was 687 conversations
+skipped to save roughly a quarter of what the 152 selected ones cost.
+
+Length was standing in for value, and it is a bad proxy at the short end. A
+ten-turn session that fixed something is one model call to summarise — and it is
+exactly the session you will fail to remember later, which is when an archive is
+supposed to help. A skipped session has no topic and no outcome, so it cannot be
+found by subject, filtered by `--outcome`, or surfaced by `recall`.
+
+So enrichment selects on a **floor** instead: enough words that "what happened
+here?" has an answer, and both sides having spoken. That is a mechanical test,
+not a judgement about whether the session mattered — nothing here can make that
+judgement, which is why the old one was wrong. The derived gate is still
+computed and reported, as a description of your corpus rather than a rule
+applied to it.
+
 Every statistic is scoped to a provenance class, and the survey's first act is to
 report what is strange about your data — a tool-invoked majority, a source with
 no human sessions, sessions whose only copy is the archive.

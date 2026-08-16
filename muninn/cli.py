@@ -404,12 +404,13 @@ def cmd_enrich(args: argparse.Namespace) -> int:
                        shard=shard)
 
     if not plan.calibrated:
-        st.close()
-        print("no calibration.json beside this archive — the enrichment gate is "
-              "derived, not assumed.", file=sys.stderr)
-        print(f"  run `muninn survey` first ({survey.calibration_path(args.db)})",
-              file=sys.stderr)
-        return 2
+        # No longer fatal. Selection is a structural floor now, not a gate
+        # derived from this corpus, so an un-surveyed archive can be enriched —
+        # it just has no measured shape to report alongside the result.
+        print("note: no calibration.json beside this archive, so no corpus "
+              "statistics accompany this plan.", file=sys.stderr)
+        print(f"  `muninn survey` writes one "
+              f"({survey.calibration_path(args.db)})", file=sys.stderr)
 
     # `--dry-run` is what plans; `--json` only chooses the *shape* of the output.
     #

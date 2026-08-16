@@ -130,44 +130,71 @@ class GateTest(_Archive):
         plan = enrich.plan(self.st, self.calibrate(claude=1000), session_id=sid)
         self.assertEqual(plan.candidates, ())
 
-    def test_the_gate_honours_the_derived_threshold(self) -> None:
-        # Criterion 2.
-        self.add(words=900)
+    def test_a_short_session_is_enriched(self) -> None:
+        """The regression the floor exists to prevent.
+
+        Under the coverage gate this was skipped for being cheap — and a skipped
+        session has no topic and no outcome, so it cannot be found by subject,
+        filtered by ``--outcome``, or surfaced by ``recall``. Length was standing
+        in for value and it is a bad proxy at the short end: ten turns that fixed
+        something is exactly the session somebody later fails to remember.
+        """
+        short = self.add(words=200)
+        plan = enrich.plan(self.st, self.calibrate(claude=10_000))
+        self.assertEqual([c.session_id for c in plan.candidates], [short])
+        self.assertNotIn("below-gate", plan.skipped)
+
+    def test_the_derived_threshold_no_longer_selects(self) -> None:
+        """Still reported; no longer a rule applied to the corpus."""
+        small = self.add(words=900)
         big = self.add(words=1100)
         plan = enrich.plan(self.st, self.calibrate(claude=1000))
-        self.assertEqual([c.session_id for c in plan.candidates], [big])
-        self.assertEqual(plan.skipped["below-gate"], 1)
-
-    def test_the_gate_is_per_source_in_one_run(self) -> None:
-        # Criterion 3 — the whole point of deriving it. One constant cannot
-        # express a 1.6x spread between two sources.
-        claude_hit = self.add(source="claude", words=4500)
-        self.add(source="claude", words=3000)          # below claude's gate
-        codex_hit = self.add(source="codex", words=3000)  # above codex's
-        plan = enrich.plan(self.st, self.calibrate(claude=4046, codex=2480))
         self.assertEqual(sorted(c.session_id for c in plan.candidates),
-                         sorted([claude_hit, codex_hit]))
+                         sorted([small, big]))
+        self.assertEqual(plan.thresholds["claude"], 1000)
 
-    def test_an_explicit_session_id_bypasses_the_length_gate(self) -> None:
-        # The threshold is a cost heuristic, so "enrich this one" may override
-        # it — unlike provenance, above.
+    def test_a_stub_is_below_the_floor(self) -> None:
+        """Not a judgement about worth — there is nothing here to summarise."""
+        self.add(words=10)
+        plan = enrich.plan(self.st, self.calibrate(claude=1000))
+        self.assertEqual(plan.candidates, ())
+        self.assertEqual(plan.skipped["below-floor"], 1)
+
+    def test_a_prompt_nobody_answered_is_not_a_conversation(self) -> None:
+        """Both sides must have spoken, whatever the word count."""
+        sid = self.add(words=5000)
+        self.st.conn.execute(
+            "UPDATE sessions SET assistant_turns = 0 WHERE session_id = ?", (sid,))
+        self.st.commit()
+        plan = enrich.plan(self.st, self.calibrate(claude=1000))
+        self.assertEqual(plan.skipped["below-floor"], 1)
+
+    def test_an_explicit_session_id_bypasses_the_floor(self) -> None:
+        # The floor is mechanical, so "enrich this one" may override it —
+        # unlike provenance, above.
         small = self.add(words=10)
         plan = enrich.plan(self.st, self.calibrate(claude=1000), session_id=small)
         self.assertEqual([c.session_id for c in plan.candidates], [small])
 
-    def test_an_uncalibrated_archive_plans_nothing(self) -> None:
-        # Not a defaulted gate. Substituting a constant when calibration.json is
-        # missing would silently reintroduce exactly the hard-coded threshold
-        # spec 011 removed.
+    def test_an_uncalibrated_archive_still_enriches(self) -> None:
+        """A deliberate reversal, and the reason the old rule existed is gone.
+
+        That rule was right while the *gate* was derived: defaulting it when
+        ``calibration.json`` was missing would have silently reintroduced the
+        hard-coded threshold spec 011 removed. With a structural floor there is
+        no threshold to default, so refusing an un-surveyed archive would be
+        friction with nothing behind it.
+        """
         self.add(words=50_000)
         plan = enrich.plan(self.st, None)
         self.assertFalse(plan.calibrated)
-        self.assertEqual(plan.candidates, ())
+        self.assertEqual(len(plan.candidates), 1)
 
-    def test_a_source_with_no_calibration_is_skipped_by_name(self) -> None:
+    def test_an_uncalibrated_source_is_no_longer_skipped(self) -> None:
         self.add(source="codex", words=9000)
         plan = enrich.plan(self.st, self.calibrate(claude=1000))
-        self.assertEqual(plan.skipped["source-not-calibrated"], 1)
+        self.assertEqual(len(plan.candidates), 1)
+        self.assertNotIn("source-not-calibrated", plan.skipped)
 
     def test_idempotence_and_force(self) -> None:
         # Criterion 8.
@@ -686,10 +713,18 @@ class CliTest(_Archive):
         self.assertIn("planned  1 session", out)
         self.assertIn("model calls", out)
 
-    def test_an_uncalibrated_archive_exits_two_and_names_the_verb(self) -> None:
+    def test_an_uncalibrated_archive_plans_and_says_what_is_missing(self) -> None:
+        """Succeeds now, and still names the survey — as a note, not a refusal.
+
+        Enrichment stopped depending on the derived gate, so the only thing an
+        un-surveyed archive lacks is the corpus statistics printed beside the
+        plan. Exiting 2 for that would refuse work over a missing description of
+        it.
+        """
         self.add(words=5000)
-        code, _, err = self._run("--dry-run")
-        self.assertEqual(code, 2)
+        code, out, err = self._run("--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("planned  1 session", out)
         self.assertIn("muninn survey", err)
 
     def test_dry_run_json_is_parseable_and_makes_no_calls(self) -> None:

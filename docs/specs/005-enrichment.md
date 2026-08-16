@@ -14,6 +14,9 @@
 > - **An un-surveyed archive is refused, not defaulted** (exit 2, naming
 >   `muninn survey`). Substituting a constant would silently reintroduce the
 >   hard-coded gate spec 011 removed.
+>   **Superseded v2026.08.16.10** — selection is a floor, not a derived gate, so
+>   there is no threshold left to default and an un-surveyed archive enriches
+>   normally with a note. See "Selection is a floor" below.
 > - **Redaction runs on the way out, never on the way in.** The archive keeps
 >   the raw prose because it is the only copy; the provider call is the new
 >   exposure, so that is where the boundary sits.
@@ -131,6 +134,9 @@ Two rules, both from measurement:
    ≥4,046 words for Claude and ≥2,480 for Codex — a 1.6× difference that a fixed
    constant could not have expressed.
 
+   **Superseded v2026.08.16.10.** See "Selection is a floor" below. The derived
+   threshold is still computed and reported; it no longer selects.
+
 Long sessions exceed a single context window (p99 was 51k–90k words), so
 summarization is **recursive**: chunk → per-chunk partial → merge into the final
 structured output.
@@ -222,12 +228,47 @@ never appears in the text handed to the provider.
    with `--model`, a timeout, and **no shell=True**. Route through `policy.check()`.
 3. `muninn/enrich.py`: `extract_facets(text, provider)` for short sessions;
    `extract_facets_chunked()` for long ones (chunk → partials → merge).
-4. Gate: read `calibration.json`; enrich sessions above the per-source threshold
-   whose provenance is not `tool-invoked` and whose facets are absent or stale.
+4. Selection: enrich sessions clearing `enrich.FLOOR_WORDS` with turns from both
+   sides, whose provenance is not `tool-invoked` and whose facets are absent or
+   stale. (Originally: above the per-source derived threshold.)
 5. `muninn enrich [SESSION_ID] [--force] [--source X] [--limit N] [--dry-run]`.
    `--dry-run` prints what *would* be enriched and the estimated call count —
    important, since this is the one expensive operation in the tool.
 6. Tests with a `FakeProvider` returning canned JSON.
+
+## Selection is a floor (v2026.08.16.10)
+
+The derived gate was right about *deriving* and wrong about *what*. Enrichment
+cost scales with session length, so "the smallest set of sessions covering 85% of
+the text" spends ~80% of the budget to reach ~18% of the conversations — and
+declines the cheapest sessions in the corpus. Measured on a 2,163-session
+archive: 152 sessions above the gate, **687 below it**, the latter costing about
+a quarter again of the former in total.
+
+Length was standing in for value. What enrichment produces — `topic`, `outcome`,
+`summary` — is what makes a session *findable*, and findability is per
+conversation, not per word. A ten-turn session that fixed something is one model
+call and is exactly what a person fails to remember later; skipping it means it
+can never be found by subject, filtered by `--outcome`, or surfaced by spec
+019's `recall`.
+
+The replacement test is mechanical: `FLOOR_WORDS` of prose, and turns from both
+sides — a prompt nobody answered has no outcome to report. It deliberately makes
+no judgement about whether the session mattered, because nothing available can,
+which is the error the old gate embodied.
+
+Consequences:
+
+- `calibration.json` is no longer a precondition for enriching. `Plan.calibrated`
+  still reports whether a survey has run; `muninn enrich` notes its absence on
+  stderr instead of exiting 2.
+- The skip reason `below-gate` becomes `below-floor`.
+- `Plan.thresholds` is still populated and reported, as a description of the
+  corpus rather than a rule applied to it.
+
+See [`derived-calibration`](../../.valholl/articles/derived-calibration.md),
+"The axis was wrong".
+
 
 ## Acceptance criteria
 
@@ -235,9 +276,10 @@ never appears in the text handed to the provider.
 
 1. **Gate excludes tool-invoked** — assert zero calls for a tool-invoked session
    regardless of length.
-2. **Gate honors the derived threshold** — with a calibration setting the Claude
-   gate at 1,000 words, a 900-word session is skipped and a 1,100-word one is not.
-3. **Gate is per-source** — different thresholds per source are respected in one run.
+2. **Short sessions are enriched** — a 200-word session is selected even where a
+   derived threshold would have excluded it. *(Replaces: "a 900-word session is
+   skipped and a 1,100-word one is not".)*
+3. **Only stubs are excluded** — below `FLOOR_WORDS`, or with one side silent.
 4. **Recursive path triggers** — a session far over the chunk limit produces
    multiple provider calls and one merged result.
 5. **Redaction** — plant `sk-ant-api03-SECRET` and an AWS key in a transcript;

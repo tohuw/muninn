@@ -50,6 +50,42 @@ from .store import Store
 CHUNK_WORDS = 12_000
 CHUNK_OVERLAP_WORDS = 400
 
+#: The floor below which there is nothing for a model to say.
+#:
+#: **This replaced a coverage gate, and the difference is the point.** The gate
+#: selected the longest sessions covering 85% of the corpus's *words*, which
+#: sounds like thrift and is precisely backwards. Session cost scales with
+#: length, so "cover 85% of the words" spends ~80% of the budget to reach ~18%
+#: of the conversations — and the ones it declines are the cheapest ones there
+#: are. On the corpus this was measured against, 687 conversations sat below the
+#: gate and would have cost about a quarter again of what the 152 above it cost.
+#:
+#: The deeper fault is that length was standing in for value, and it is a bad
+#: proxy at the short end. A ten-turn session that fixed something is a single
+#: model call to summarise and is exactly the session someone will fail to find
+#: later, because they have forgotten it exists. Enrichment is what makes a
+#: session findable by topic and outcome; withholding it from the short ones
+#: means the archive can only surface work you could already describe.
+#:
+#: So the remaining test is mechanical rather than economic: is there enough
+#: here for "what happened?" to have an answer? A session needs prose from both
+#: sides — a prompt with no reply is not a conversation — and enough words that
+#: a summary would say something. It is deliberately *not* a judgement about
+#: whether the session mattered. Nothing here can make that judgement, which is
+#: why the old one was wrong.
+FLOOR_WORDS = 100
+
+
+def clears_floor(row: Any) -> bool:
+    """Whether a session has enough in it to be worth asking a model about."""
+    if (row["words"] or 0) < FLOOR_WORDS:
+        return False
+    # Both sides must have spoken. A prompt that was never answered has no
+    # outcome to report, and a transcript with no user turn is not a session
+    # somebody had.
+    return bool(row["user_turns"]) and bool(row["assistant_turns"])
+
+
 #: The closed vocabulary for ``outcome``. It is indexed and drives ``--outcome``,
 #: so a free-text value would make the filter unusable — and a model asked for
 #: an open string will invent a new synonym every tenth session.
@@ -366,9 +402,14 @@ class Plan:
     """What an enrichment run would do, before it does any of it.
 
     ``skipped`` is a per-reason tally rather than a bare count, because
-    "nothing to enrich" has four completely different meanings — no calibration,
-    all tool-invoked, all below the gate, all already done — and a number cannot
+    "nothing to enrich" has three completely different meanings — all
+    tool-invoked, all below the floor, all already done — and a number cannot
     distinguish them.
+
+    ``thresholds`` is retained and reported, but it no longer *selects*: since
+    the coverage gate became a floor it is a description of the corpus rather
+    than a rule applied to it. ``calibrated`` likewise reports whether a survey
+    has run, which is still worth knowing and is no longer a precondition.
     """
 
     candidates: tuple[Candidate, ...] = ()
@@ -415,16 +456,16 @@ def plan(st: Store, calibration: dict[str, Any] | None, *,
          shard: tuple[int, int] | None = None) -> Plan:
     """Which sessions to enrich, and why the rest were left out.
 
-    **An un-surveyed archive produces an empty plan, not a defaulted one.** The
-    gate's whole purpose is that it was derived from this corpus; substituting a
-    constant when ``calibration.json`` is missing would reintroduce exactly the
-    hard-coded threshold spec 011 removed, and would do it silently. The caller
-    reports ``calibrated=False`` and tells the user to run ``muninn survey``.
+    **Selection is a floor, not a coverage gate** (see :data:`FLOOR_WORDS`), so
+    this no longer depends on ``calibration.json``. The parameter is kept
+    because callers hold one and ``Plan.calibrated`` still reports whether the
+    corpus has been surveyed — that remains worth knowing, it is simply no
+    longer a precondition for enriching anything.
 
-    ``session_id`` names one session explicitly and bypasses the *threshold*
-    only — not the provenance rule. Asking to enrich a specific tool-invoked
-    session is still refused, because that rule is about what enrichment is for
-    rather than about cost.
+    ``session_id`` names one session explicitly and bypasses the *floor* only —
+    not the provenance rule. Asking to enrich a specific tool-invoked session is
+    still refused, because that rule is about what enrichment is for rather than
+    about cost.
 
     Candidates come back **shortest first**. A corpus pass is hours of work and
     the cost of a session is roughly its length, so cheapest-first banks the
@@ -433,13 +474,6 @@ def plan(st: Store, calibration: dict[str, Any] | None, *,
     a quarter of an hour on a single 622,232-word session before the first row
     was committed, and a watcher could not tell that from a hang.
     """
-    thresholds: dict[str, int] = {}
-    for src, report in (calibration or {}).get("sources", {}).items():
-        gate = report.get("enrichment_gate", {})
-        thresholds[src] = int(gate.get("threshold_words") or 0)
-    if calibration is None:
-        return Plan(calibrated=False)
-
     where = ["text != ''"]
     params: list[Any] = []
     if session_id:
@@ -450,7 +484,8 @@ def plan(st: Store, calibration: dict[str, Any] | None, *,
         params.append(source)
 
     rows = st.conn.execute(
-        f"SELECT session_id, source, provenance, words, topic "
+        f"SELECT session_id, source, provenance, words, topic, "
+        f"user_turns, assistant_turns "
         f"FROM sessions WHERE {' AND '.join(where)} "
         f"ORDER BY words ASC, session_id", params).fetchall()
 
@@ -468,12 +503,8 @@ def plan(st: Store, calibration: dict[str, Any] | None, *,
             skip("tool-invoked")
             continue
         words = row["words"] or 0
-        threshold = thresholds.get(row["source"])
-        if threshold is None:
-            skip("source-not-calibrated")
-            continue
-        if not session_id and words < threshold:
-            skip("below-gate")
+        if not session_id and not clears_floor(row):
+            skip("below-floor")
             continue
         if row["topic"] and not force:
             skip("already-enriched")
@@ -489,7 +520,12 @@ def plan(st: Store, calibration: dict[str, Any] | None, *,
         if limit is not None and len(candidates) >= limit:
             break
 
-    return Plan(candidates=tuple(candidates), skipped=skipped, thresholds=thresholds)
+    thresholds = {
+        src: int((report.get("enrichment_gate") or {}).get("threshold_words") or 0)
+        for src, report in (calibration or {}).get("sources", {}).items()
+    }
+    return Plan(candidates=tuple(candidates), skipped=skipped, thresholds=thresholds,
+                calibrated=calibration is not None)
 
 
 def load_calibration(db: str) -> dict[str, Any] | None:
