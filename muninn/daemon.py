@@ -77,7 +77,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import embedder, enricher, indexer, paths, raven, ravenserve, store
+from . import (calibrator, embedder, enricher, indexer, paths, raven,
+               ravenserve, store)
 from .receipt import ImportReceipt
 
 logger = logging.getLogger("muninn.daemon")
@@ -620,6 +621,7 @@ class Daemon:
                  embed: bool = True,
                  enrich: bool = True,
                  enrich_metered: bool = False,
+                 recalibrate: bool = True,
                  publish_state: bool = True,
                  holder: str = HOLDER_SERVE,
                  state_file: Path | None = None,
@@ -645,6 +647,12 @@ class Daemon:
         # not collapse into one.
         self.enrich = enrich
         self.enrich_metered = enrich_metered
+        # Keeping the derived gate describing the archive it was derived from
+        # (spec 011). On by default and, unlike the two above, safe to be: a
+        # survey is SQL aggregates and calls no model. It can *widen* what the
+        # enricher then enriches, but that spending still passes the enricher's
+        # own metered guard, so this flag adds no way to spend money.
+        self.recalibrate = recalibrate
         # ``muninn index --watch`` sets this False. A state file is a claim that
         # something can be supervised at that pid and port; a foreground watcher
         # publishes no port and expects no supervisor, and writing one anyway
@@ -658,6 +666,7 @@ class Daemon:
         self.port: int | None = None
         self.embedder: embedder.BackgroundEmbedder | None = None
         self.enricher: enricher.BackgroundEnricher | None = None
+        self.calibrator: calibrator.BackgroundCalibrator | None = None
         #: Set by :meth:`request_stop`. Read by the supervising loop in cli.py
         #: *after* ``run`` returns, which is why it outlives the ingest loop and
         #: why a restart gets a fresh ``Daemon`` rather than reusing this one.
@@ -743,6 +752,15 @@ class Daemon:
                 if facets.start():
                     self.enricher = facets
 
+            # After the enricher, and independent of it. The enricher exits its
+            # loop when spending is not allowed, so a metered archive would
+            # otherwise be the one whose gate went stale and stayed stale.
+            if self.recalibrate:
+                gate = calibrator.BackgroundCalibrator(
+                    self.db_path, roots=self.roots, announce=self.announce)
+                if gate.start():
+                    self.calibrator = gate
+
             # 5. The state file last, so "the daemon is discoverable" implies
             #    everything it advertises is already true.
             if self.publish_state:
@@ -782,6 +800,11 @@ class Daemon:
                 self.enricher.stop()
             if self.embedder is not None:
                 self.embedder.stop()
+            # Last: it holds a connection only while a survey is in flight, and
+            # a survey is aggregates rather than a provider round trip, so it is
+            # the one most likely to stop immediately.
+            if self.calibrator is not None:
+                self.calibrator.stop()
             if self.publish_state:
                 remove_state(self.state_file)
             st.close()

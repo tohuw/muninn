@@ -225,6 +225,10 @@ def _run_ingest_loop_once(args: argparse.Namespace, roots: dict[str, Path], *,
         # service-only rule: `index --watch` is a debug ingest loop and must not
         # start spending model calls because someone wanted to watch a sweep.
         enrich=(holder == daemon.HOLDER_SERVE and not getattr(args, "no_enrich", False)),
+        # Unlike the two above this is not a spending switch, so it is not
+        # limited to `serve`: `index --watch` benefits from an accurate gate
+        # too, and keeping it current costs a few aggregate queries an hour.
+        recalibrate=not getattr(args, "no_recalibrate", False),
         enrich_metered=getattr(args, "enrich_metered", False),
         # Only `serve` publishes a state file. A foreground watcher expects no
         # supervisor and advertises no port, so a state file would be a claim
@@ -1329,10 +1333,18 @@ def _print_calibration_section(st: store.Store, db: str) -> None:
     if not reasons:
         print("  drift       none — the thresholds still describe this corpus")
         return
+    # Reported as a finding, not as an instruction. A running daemon re-derives
+    # this on its own (spec 011), so telling every reader to run `muninn survey`
+    # would be advice that is usually already being followed -- and the reason
+    # drift is visible here at all is that it *was* only ever advice, which
+    # nobody was watching for.
     print(f"  WARNING: the calibration no longer describes this archive "
-          f"({len(reasons)} reason(s)); re-run `muninn survey`")
+          f"({len(reasons)} reason(s))")
     for reason in reasons:
         print(f"           - {reason}")
+    print("           `muninn serve` re-derives this within the hour; run "
+          "`muninn survey` to do it now,")
+    print("           or if the daemon was started with --no-recalibrate.")
 
 
 def _print_daemon_section() -> None:
@@ -1616,6 +1628,13 @@ def build_parser() -> argparse.ArgumentParser:
                          help="do not enrich in the background; --outcome and the "
                               "other facet filters then stay empty until you run "
                               "`muninn enrich` yourself (docs/specs/018)")
+    p_serve.add_argument("--no-recalibrate", action="store_true",
+                         help="do not re-derive the enrichment gate when the "
+                              "archive outgrows it. On by default because a "
+                              "survey calls no model: it is SQL aggregates, and "
+                              "the alternative is a gate that silently covers "
+                              "less of the corpus every week while enrichment "
+                              "keeps reporting 100% of eligible (docs/specs/011)")
     p_serve.add_argument("--enrich-metered", action="store_true",
                          help="allow background enrichment to use a model that bills "
                               "per token. Off by default: without it the worker "

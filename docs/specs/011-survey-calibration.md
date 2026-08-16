@@ -124,6 +124,36 @@ speaks up when something is wrong leaves a reader unable to tell "fine" from "no
 checked", so "current" is stated as a positive answer. Drift is reported *with
 its reasons* — "re-run survey" alone is an instruction, not a finding.
 
+### The daemon corrects the drift it detects
+
+Detection was the whole of the original design, and it was not enough. Observed
+on a real archive: the corpus tripled between surveys, the gate derived for 85%
+text coverage fell to 74%, and `doctor` printed the warning correctly for weeks
+while enrichment reported "100% of eligible" — which was *true*, and which is
+why nobody looked. The eligible set had shrunk underneath the number.
+
+A check whose only output is a line in a health report is a check that depends on
+somebody reading health reports. `muninn serve` therefore re-derives the gate
+when drift appears (`muninn/calibrator.py`), and derives a first one for an
+archive that has never been surveyed — which previously enriched nothing at all
+while looking installed and idle.
+
+Three constraints on doing this automatically:
+
+- **It must not be able to spend.** A survey is SQL aggregates; it reaches no
+  provider, and a test asserts that. Re-deriving *can* widen what the enricher
+  then enriches, but that pass still goes through the enricher's own metered
+  guard, so `--enrich-metered` remains the only switch that authorises spending.
+- **It must not live in the enricher**, which already re-reads the calibration
+  every pass and looks like the natural home. That worker exits its loop when
+  spending is not allowed, so a metered archive — the one whose owner is being
+  most careful — would be exactly the archive whose gate rotted.
+- **It must say what it did.** Silent self-correction trades one unexplained
+  behaviour for another, so each re-survey announces the drift reasons that
+  triggered it.
+
+`--no-recalibrate` turns it off for an operator who wants to pin a gate.
+
 ### The artifact lives beside the archive
 
 Not in a fixed state directory: it describes *that* corpus, and a second archive

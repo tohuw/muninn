@@ -296,6 +296,15 @@ Every statistic is scoped to a provenance class, and the survey's first act is t
 report what is strange about your data — a tool-invoked majority, a source with
 no human sessions, sessions whose only copy is the archive.
 
+**The daemon keeps it current.** A gate derived from your corpus is only right
+for the corpus it was derived from, and archives grow: on one real machine it
+tripled between surveys, and a gate chosen for 85% text coverage drifted to 74%
+while enrichment went on reporting "100% of eligible" — truthfully, because the
+eligible set had quietly shrunk. `muninn serve` re-derives the gate when the
+archive outgrows it, and derives a first one for an archive that has never been
+surveyed. A survey calls no model, so this is on by default; `--no-recalibrate`
+turns it off, and `muninn survey` still does it on demand.
+
 `muninn survey` also projects **what a full pass would cost**, per stage — and
 `tools/corpus-survey.py` does the same thing standalone, stdlib-only, on a
 machine that has never installed Muninn. See
