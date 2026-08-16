@@ -61,6 +61,25 @@ from corvidae.login_agent import (
 
 from muninn import agent_install, cli, daemon, paths
 
+
+def _require_symlinks(directory: Path) -> None:
+    """Skip unless this machine will actually create a symlink.
+
+    Windows supports symlinks but refuses to create them without Developer Mode
+    or elevation, and that is a property of the machine rather than of the OS —
+    so this asks by trying. The attack this defends against is real on NTFS, and
+    a developer who can make a link should get the coverage.
+    """
+    probe = directory / "_symlink-probe"
+    try:
+        probe.symlink_to(directory)
+    except (OSError, NotImplementedError) as exc:
+        raise unittest.SkipTest(
+            f"this machine cannot create symlinks ({exc.__class__.__name__})"
+        ) from exc
+    probe.unlink()
+
+
 # ── Huginn's values, as literal constants ─────────────────────────────────────
 #
 # Source: /Users/tohuw/Projects/huginn -> huginn/agent_install.py, at the commit
@@ -537,6 +556,7 @@ class SystemdTest(_TempState):
         # The unit path follows $XDG_CONFIG_HOME. A symlink there means the
         # installed agent is not the file we think it is, which is worth refusing
         # loudly rather than quietly tidying away.
+        _require_symlinks(self.tmp)
         elsewhere = self.tmp / "elsewhere"
         elsewhere.write_text("not ours")
         unit = self.tmp / "muninn.service"
@@ -911,6 +931,7 @@ class EnvironmentMismatchTest(unittest.TestCase):
         # mismatch always would refuse every install on every machine.
         self.assertFalse(agent_install.environment_mismatch(self._clean()))
 
+    @unittest.skipIf(sys.platform == "win32", "XDG_STATE_HOME is POSIX-only in paths.py")
     def test_a_redirected_state_home_moves_the_archive_and_the_descriptor(self) -> None:
         mismatch = agent_install.environment_mismatch(
             self._clean(XDG_STATE_HOME="/tmp/muninn-elsewhere"))
@@ -982,6 +1003,7 @@ class EnvironmentMismatchTest(unittest.TestCase):
         self.assertNotIn("LOCALAPPDATA", agent_install.BLIND_VARS)
         self.assertNotIn("USERPROFILE", agent_install.BLIND_VARS)
 
+    @unittest.skipIf(sys.platform == "win32", "XDG_STATE_HOME is POSIX-only in paths.py")
     def test_the_rendering_shows_both_sides_of_every_path(self) -> None:
         # "Your archive is elsewhere" is not actionable without both halves.
         mismatch = agent_install.environment_mismatch(
