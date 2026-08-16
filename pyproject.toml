@@ -1,6 +1,6 @@
 [project]
 name = "muninn-console"
-version = "2026.08.16.7"
+version = "2026.08.16.8"
 description = "A local-only console for AI agent history: search, correlate and resume past sessions"
 readme = "README.md"
 requires-python = ">=3.12"
