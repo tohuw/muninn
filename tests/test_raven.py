@@ -337,11 +337,25 @@ class DescriptorTest(RavenTestCase):
 
         Also catches the ``time.monotonic()`` mistake: a monotonic reading is not
         epoch-based, so the host's cross-check would reject every live process.
+
+        Compared against this process's *start* rather than against "now", which
+        is the whole point of the field. The old assertion allowed five seconds
+        of drift from ``time.time()`` and only held while ``started`` was
+        stamped at publish time; a suite that takes half a minute -- or the eight
+        the macOS job takes -- is far past that by the time this runs.
         """
         import time
+
+        from muninn.store import process_start_time
+
         payload = raven.descriptor(1)
-        self.assertAlmostEqual(payload["started"], time.time(), delta=5.0)
+        # Epoch-based, not monotonic: a monotonic reading counts from an
+        # arbitrary origin and is a far smaller number than this.
         self.assertGreater(payload["started"], 1_600_000_000)
+        self.assertLessEqual(payload["started"], time.time() + 5.0)
+        actual = process_start_time(os.getpid())
+        if actual:  # None on a platform that cannot answer; then the clock stands in
+            self.assertAlmostEqual(payload["started"], actual, delta=2.0)
 
     def test_started_is_read_from_the_os_not_the_wall_clock(self) -> None:
         from unittest.mock import patch
