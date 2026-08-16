@@ -655,15 +655,56 @@ def _now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
+def _windows_pid_alive(pid: int) -> bool:
+    """Ask Windows directly, because ``os.kill(pid, 0)`` cannot answer here.
+
+    ``os.kill`` is emulated on Windows and its errors do not mean what the
+    POSIX path assumes. Measured on Windows 11 / CPython 3.14: a **live** pid
+    raises ``OSError(22)`` with ``WinError 87`` (the parameter is incorrect),
+    while a pid that does not exist raises ``OSError(0)`` with ``WinError 11``.
+    Treating WinError 87 as "stale" therefore reported every live process as
+    dead -- which made the import lock consider a running holder stale and let
+    a second ingest loop proceed, and made ``doctor`` announce a crash for a
+    daemon that was serving normally.
+
+    ``OpenProcess`` plus a zero-timeout wait is the real question: the process
+    object stays unsignalled while the process runs, and is signalled the
+    moment it exits, so an exited-but-still-open handle is not mistaken for a
+    live process either.
+    """
+    import ctypes
+
+    SYNCHRONIZE = 0x0010_0000
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    ERROR_ACCESS_DENIED = 5
+    WAIT_TIMEOUT = 0x0000_0102
+
+    # use_last_error, so ctypes preserves the Win32 error across its own
+    # bookkeeping instead of leaving GetLastError to report something else.
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        # Owned by another user: it exists, which is all a lock-holder check
+        # needs. Anything else (no such pid, bad pid) is not a live holder.
+        return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+    try:
+        return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def pid_alive(pid: int | None) -> bool:
     """Is a process with this pid still running?
 
-    ``os.kill(pid, 0)`` sends no signal; it only asks the kernel whether the
-    process exists and is ours to signal. A stale lock (holder pid dead) may
-    be taken over; a live one must serialize the caller out.
+    On POSIX, ``os.kill(pid, 0)`` sends no signal; it only asks the kernel
+    whether the process exists and is ours to signal. A stale lock (holder pid
+    dead) may be taken over; a live one must serialize the caller out. Windows
+    cannot answer that way and is handled separately.
     """
-    if pid is None:
+    if pid is None or not isinstance(pid, int) or pid <= 0:
         return False
+    if os.name == "nt":
+        return _windows_pid_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -672,9 +713,6 @@ def pid_alive(pid: int | None) -> bool:
         # Exists, but owned by someone else. Still alive from our perspective.
         return True
     except OSError:
-        # Windows reports WinError 87, rather than ProcessLookupError, for a
-        # stale numeric pid. It is not a live holder, so never let it turn a
-        # stale lock or descriptor into an exception or an "unknown" owner.
         return False
     return True
 
