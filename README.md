@@ -341,8 +341,21 @@ resumable, committed per batch, and reported as a backlog by `muninn doctor` —
 an automatic process that spends money should not be silent about how much it
 has decided to do.
 
+Two local providers ship behind that extra, and both run entirely on your
+machine — no vectors, chunks or queries leave it. On Apple silicon
+`mlx-embeddings` runs `mlx-community/bge-small-en-v1.5-bf16` on the GPU and is
+preferred where it works. Everywhere else — Windows, Linux, Intel Macs — ONNX
+Runtime runs `BAAI/bge-small-en-v1.5` on the CPU: prebuilt wheels, no compiler,
+no torch, 133 MB fetched once and offline thereafter. Measured on Windows,
+3,395 chunks embed in 138 s.
+
+Their model ids differ because the vectors do: the MLX build is bf16 and the
+ONNX one fp32. `chunk_vectors` keys on the model id so the two spaces are never
+compared, which means moving an archive between platforms re-embeds rather than
+silently mixing them.
+
 ```sh
-uv sync --extra semantic        # the local Apple-silicon provider, plus numpy
+uv sync --extra semantic        # both local providers, plus numpy
 uv run muninn serve             # embeds in the background from here on
 uv run muninn embed --dry-run   # or do the backlog in the foreground, deliberately
 uv run muninn search "that time SSE kept dropping" --semantic

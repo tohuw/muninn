@@ -16,11 +16,56 @@ The workflow now pins `shell: bash` for the job. **If Windows CI ever goes red
 again, read the test summary before the traceback** — `OK` followed by exit 1
 means the harness is misreporting, not that the code is broken.
 
-## Never tested on a real Windows machine
+## First run on real Windows hardware
 
-Everything below comes from the GitHub Actions `windows-latest` runner. No part
-of Muninn has been exercised on real Windows hardware by a human. Treat Windows
-support as plausible, not proven.
+Until 2026-08-15 everything here came from the GitHub Actions `windows-latest`
+runner and no part of Muninn had been exercised on real Windows hardware by a
+human. It now has been, on Windows 11 / CPython 3.14, and the runner had been
+missing things a real desktop found immediately. Four defects, all of which CI
+was structurally unable to see:
+
+- **`pid_alive` was inverted.** `os.kill(pid, 0)` is emulated on Windows and its
+  errors do not carry POSIX meanings: a *live* pid raises `WinError 87`, a
+  missing one `WinError 11`. Treating any `OSError` as "gone" reported every
+  running process as dead — so `acquire_import_lock` read a live holder as stale
+  and would let a second ingest loop run against the archive of record.
+- **The single-instance lock hid its own holder.** Windows byte-range locks are
+  *mandatory*, and `acquire` locked byte 0 — exactly where the `<pid> <label>`
+  line is written — so nothing could read it back. `doctor` reported a healthy
+  daemon as "held by an unrecorded pid (unknown)". The lock now takes a sentinel
+  byte past the data.
+- **Provider pipes used the locale encoding.** `text=True` without `encoding`
+  means cp1252 here, and transcripts are full of characters it cannot encode.
+  The prompt write died on a writer thread, the parent blocked until timeout,
+  the model got a truncated prompt, and enrichment recorded `invalid-json` for
+  4 of 5 sessions while still exiting 0.
+- **Provider subprocesses opened windows.** `serve` runs under `pythonw` with no
+  console to inherit, and the provider CLIs are console-subsystem programs, so
+  Windows gave each invocation a console of its own. Automatic enrichment made
+  dozens of terminal windows appear unbidden. Fixed with `CREATE_NO_WINDOW`.
+
+A headless runner sees none of that: it has a console, a POSIX-ish shell, and no
+desktop. Treat Windows support as exercised now, but keep the same posture —
+what is written here is what is known, not what is intended.
+
+## Semantic search works here
+
+Embeddings were the one genuinely Windows-blocked feature, and not by a bug: the
+only local provider was `embed_mlx`, and MLX is Apple-silicon only. Worse, the
+`[semantic]` extra's only runtime was gated to `Darwin/arm64`, so the advice
+`--semantic` printed — "install the local one with `uv sync --extra semantic`" —
+resolved happily and installed no provider at all.
+
+`embed_onnx` closes that. ONNX Runtime has prebuilt CPU wheels on every platform
+this project runs on, needs no compiler and no torch, and runs
+`BAAI/bge-small-en-v1.5` (384-dim, the same family the MLX provider uses). It is
+local and offline: 133 MB fetched once, then cache-first, so a daemon start
+makes no network call. Measured on Windows 11: **3,395 chunks in 138 s**, and
+`muninn serve` then keeps up automatically.
+
+The two providers keep **separate model ids on purpose** — bf16 versus fp32 are
+near-identical and not identical, and `chunk_vectors` keys on the model id so the
+spaces are never compared. Moving an archive between platforms re-embeds.
 
 ## Known limitation: subprocess and thread-fan-out tests
 
