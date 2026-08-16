@@ -71,6 +71,10 @@ uv run muninn search "auth redirect" --since 2026-06 --repo muninn
 # What did I do last week, in order.
 uv run muninn log --since 2026-07
 
+# What do I already know about where I am working? Takes a place, not a question.
+uv run muninn recall
+uv run muninn recall --repo cyberwise
+
 # Read one session in full (id prefixes are fine).
 uv run muninn show a7efca23
 
@@ -279,6 +283,36 @@ reports is scoped to a provenance class.
 The archive-of-record guarantee covers human and subagent sessions.
 Tool-invoked prose is prunable — it is a reproducible byproduct of some other
 tool's call volume.
+
+### Recall takes a place, not a question
+
+Every other retrieval path here waits to be asked. `search`, `log`, `correlate`
+and `show` each answer a question, and each needs you to think of the question
+first — which is the wrong shape for the most valuable thing an archive holds,
+because the material you most need is the material you have *forgotten you
+have*. You do not search for it, because you do not know it is there.
+
+`muninn recall` takes a repository instead, defaulting to wherever your most
+recent session was working, and reports three kinds of knowing:
+
+- **Unfinished threads** — sessions enrichment judged `ongoing` or `abandoned`.
+  Nothing else surfaces these, and they are the most actionable thing in the
+  corpus: work you started, did not finish, and have no reminder of.
+- **Prior work here** — what else has happened in this repository.
+- **Related, from elsewhere** — nearest sessions in *other* repositories by
+  embedding. The non-obvious one: the time you solved this in another project.
+
+It calls no model. Unfinished and prior work are SQL; related is a dot product
+over vectors that already exist for search.
+
+The unfinished list also reaches the menu bar, so Roost shows it without being
+asked — the one section of Muninn's menu that asks something of you rather than
+reporting state. It is silent when there is nothing to say, because a permanent
+reassuring row is how a menu teaches people to stop reading it.
+
+Muninn works out where "now" is from its own ingest rather than by asking
+Huginn: the raven protocol forbids one raven presenting another's credential,
+and the most recently written session is a good enough answer for free.
 
 ### Thresholds are derived, never hard-coded
 

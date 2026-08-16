@@ -549,18 +549,29 @@ def menu_provider_for(db_path: str | Path,
     ``lifecycle`` is passed straight through to ``build_menu``, and the caller
     that sets it is the same one that supplies an action handler — see attach().
     """
-    from . import queue, store
+    from . import queue, recall, store
 
     def provide() -> dict[str, Any]:
         st = store.open_store(db_path)
         try:
             recent = st.log(limit=raven.RECENT_LIMIT)
+            # Two indexed queries, and no embeddings. ``recall.recall`` would
+            # also offer related-work-from-elsewhere, which loads the whole
+            # vector matrix -- fine for a CLI call, far outside the two-second
+            # budget this menu fetch has. The unfinished list is the part worth
+            # having here anyway: it is the only thing in this menu that asks
+            # the user for something rather than reporting state.
+            where = recall.current_repo(st)
+            unfinished = [r.to_dict() for r in
+                          recall.unfinished(st, where, raven.UNFINISHED_LIMIT)]
             return raven.build_menu(
                 recent=recent,
                 sessions=st.count_sessions(),
                 chunks=st.count_chunks(),
                 last_sweep=st.last_sweep_at(),
                 pending_jobs=queue.pending_count(),
+                unfinished=unfinished,
+                unfinished_repo=where,
                 lifecycle=lifecycle,
             )
         finally:

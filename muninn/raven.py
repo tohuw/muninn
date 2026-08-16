@@ -422,6 +422,11 @@ def _restrict(path: Path, mode: int) -> None:
 #: a hostile payload hanging the host's menu build, not a target to fill.
 RECENT_LIMIT = 8
 
+#: Unfinished threads shown in the menu. Deliberately smaller than RECENT_LIMIT:
+#: this section is a prompt to act, and a list long enough to scroll is one a
+#: reader treats as a backlog to ignore rather than a handful to pick up.
+UNFINISHED_LIMIT = 3
+
 #: A session id reaches a URL path, so it is constrained rather than escaped.
 #: Covers Claude Code / Codex uuid-shaped ids and export ids alike. Refusing an
 #: id that is not a plain token is simpler to be sure of than quoting one, and
@@ -502,6 +507,8 @@ def build_menu(*, recent: list[dict[str, Any]], sessions: int, chunks: int,
                lag: dict[str, dict[str, Any]] | None = None,
                last_sweep: str | None = None,
                pending_jobs: int = 0,
+               unfinished: list[dict[str, Any]] | None = None,
+               unfinished_repo: str | None = None,
                lifecycle: bool = False) -> dict[str, Any]:
     """Build the ``/api/menu`` payload from already-queried archive facts.
 
@@ -551,6 +558,41 @@ def build_menu(*, recent: list[dict[str, Any]], sessions: int, chunks: int,
             "detail": safe_label(" · ".join(detail_parts), MAX_DETAIL),
             "url": f"/session/{session_id}",
             "style": "muted",
+        })
+
+    # Before "Recent", because it is the only section here that is *about the
+    # user* rather than about the archive. Everything else in this menu reports
+    # state; this reports an obligation -- work started in the repository being
+    # worked in now, and never finished. Nothing else surfaces it, and nobody
+    # goes looking for a thread they have forgotten they left open.
+    #
+    # Silent when empty rather than saying "nothing unfinished". This section
+    # earns its place by being rare, and a permanent reassuring row is how a
+    # menu teaches people to stop reading it.
+    unfinished_items: list[dict[str, Any]] = []
+    for row in (unfinished or [])[:UNFINISHED_LIMIT]:
+        label = _session_label(row)
+        session_id = row.get("session_id")
+        if not label or not isinstance(session_id, str):
+            continue
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            continue
+        detail_parts = [p for p in (
+            safe_label(row.get("outcome"), 16),
+            _relative_when(row.get("started_at")),
+        ) if p]
+        unfinished_items.append({
+            "label": label,
+            "detail": safe_label(" · ".join(detail_parts), MAX_DETAIL),
+            "url": f"/session/{session_id}",
+            "style": "muted",
+        })
+    if unfinished_items:
+        where = safe_label(unfinished_repo, 40) if unfinished_repo else None
+        sections.append({
+            "id": "unfinished",
+            "title": f"Unfinished in {where}" if where else "Unfinished",
+            "items": unfinished_items,
         })
 
     if recent_items:

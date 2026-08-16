@@ -1236,6 +1236,66 @@ class MenuProviderTest(RavenTestCase):
         thread.join(timeout=30)
         self.assertEqual(result, ["Muninn"])
 
+    def _archive_with(self, *, topic: str, outcome: str) -> Path:
+        """One ingested session, then enriched — the two writes the real thing does.
+
+        Enrichment goes through ``set_facets`` rather than ``upsert_session``,
+        which carries ingest columns only. Building the row by hand here would
+        pass while the production path wrote the fields somewhere recall never
+        looks.
+        """
+        from muninn import store
+        db = self.tmp / "muninn.db"
+        st = store.open_store(db)
+        st.upsert_session({
+            "session_id": "sess0001", "source": "claude", "provenance": "human",
+            "cwd": "/a/b/proj", "started_at": "2026-08-01T09:00:00+00:00",
+            "text": "hello", "words": 1, "updated_at": "2026-08-01T09:00:00+00:00",
+            "user_turns": 1, "assistant_turns": 1, "tool_uses": 0, "tool_results": 0,
+            "source_present": 1, "origin": "raw",
+        })
+        st.conn.execute(
+            "UPDATE sessions SET topic = ?, outcome = ? WHERE session_id = ?",
+            (topic, outcome, "sess0001"))
+        st.conn.commit()
+        st.close()
+        return db
+
+    def test_a_loose_end_reaches_the_menu_through_the_provider(self) -> None:
+        """The seam: recall's SQL, the menu builder, and the raven parser agree.
+
+        Each half is tested alone in test_recall.py. This is the join, which is
+        the part that fails silently — a menu that simply omits a section looks
+        exactly like a menu with nothing to report.
+        """
+        db = self._archive_with(topic="the flaky retry", outcome="ongoing")
+        spec = parse_menu(ravenserve.menu_provider_for(db)())
+        section = next(s for s in spec["sections"] if s["id"] == "unfinished")
+        self.assertIn("proj", section["title"])
+        self.assertEqual([i["label"] for i in section["items"]], ["the flaky retry"])
+
+    def test_a_finished_session_draws_no_unfinished_section(self) -> None:
+        db = self._archive_with(topic="the flaky retry", outcome="fixed")
+        spec = parse_menu(ravenserve.menu_provider_for(db)())
+        self.assertNotIn("unfinished", [s["id"] for s in spec["sections"]])
+
+    def test_the_menu_does_not_pay_for_the_embedding_half(self) -> None:
+        """Related-work needs the whole vector matrix, far past a menu's budget.
+
+        Guarding this by timing would be flaky, so it asserts the real
+        constraint instead: the expensive entry point is never called.
+        """
+        from muninn import recall as recall_module
+        db = self._archive_with(topic="the flaky retry", outcome="ongoing")
+        called: list[object] = []
+        original = recall_module.recall
+        recall_module.recall = lambda *a, **k: called.append(a) or original(*a, **k)
+        try:
+            parse_menu(ravenserve.menu_provider_for(db)())
+        finally:
+            recall_module.recall = original
+        self.assertEqual(called, [])
+
 
 # ── Parity with the document this implements ──────────────────────────────────
 

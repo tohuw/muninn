@@ -26,6 +26,7 @@ from . import (
     providers,
     queue,
     raven,
+    recall,
     rerank,
     resume,
     store,
@@ -607,6 +608,67 @@ def cmd_survey(args: argparse.Namespace) -> int:
 
     _print_survey(doc, path, wrote=not args.dry_run)
     return 0
+
+
+def cmd_recall(args: argparse.Namespace) -> int:
+    """What the archive knows about where you are working (recall.py).
+
+    The one retrieval path that takes a *place* rather than a question. Every
+    other one waits to be asked, which is the wrong shape for the material a
+    person has forgotten they have: you do not search for it, because you do
+    not know it is there.
+    """
+    st = store.open_store(args.db)
+    model = None
+    try:
+        model = embed.resolve_provider(args.provider).model
+    except embed.EmbeddingUnavailable:
+        # Not fatal, and not worth a warning here: two of the three sections
+        # need no embeddings at all, and the third reports its own absence.
+        pass
+    try:
+        found = recall.recall(st, repo=args.repo, limit=args.limit, model=model)
+    finally:
+        st.close()
+
+    if args.json:
+        print(json.dumps(found.to_dict()))
+        return 0
+
+    where = found.repo or "this machine"
+    if not found:
+        print(f"nothing recalled for {where}")
+        for reason in found.unavailable.values():
+            print(f"  {reason}")
+        return 0
+
+    print(f"what the archive knows about {where}\n")
+    for heading, entries in (
+        ("unfinished — started and not finished", found.unfinished),
+        ("prior work here", found.prior),
+        ("related, from other repositories", found.related),
+    ):
+        if not entries:
+            continue
+        print(heading)
+        for item in entries:
+            score = f"  {item.score:.2f}" if item.score is not None else ""
+            label = item.topic or _first_line(item.summary) or item.cwd or item.source
+            print(f"  {item.session_id[:8]}  {str(item.started_at)[:10]}{score}  "
+                  f"{str(label)[:66]}")
+            if item.outcome:
+                print(f"            outcome: {item.outcome}")
+        print()
+    for reason in found.unavailable.values():
+        print(f"note: {reason}")
+    return 0
+
+
+def _first_line(text: str | None) -> str | None:
+    if not text:
+        return None
+    lines = str(text).splitlines()
+    return lines[0].strip() if lines else None
 
 
 def _print_survey(doc: dict, path: Path, *, wrote: bool) -> None:
@@ -1762,6 +1824,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_correlate.add_argument("--provider", help="embedding provider name")
     p_correlate.add_argument("--json", action="store_true")
     p_correlate.set_defaults(func=cmd_correlate)
+
+    p_recall = sub.add_parser(
+        "recall", help="what the archive knows about where you are working",
+        description="Takes a place rather than a question. Lists unfinished "
+                    "threads, prior work in the same repository, and related "
+                    "work from other repositories. Defaults to wherever the "
+                    "most recent session was working. Calls no model.")
+    p_recall.add_argument(
+        "--repo", help="repository to recall (default: the most recently active)")
+    p_recall.add_argument("--limit", type=int, default=recall.DEFAULT_LIMIT,
+                          help="entries per section")
+    p_recall.add_argument("--provider", help="embedding provider name")
+    p_recall.add_argument("--json", action="store_true")
+    p_recall.set_defaults(func=cmd_recall)
 
     p_show = sub.add_parser("show", help="print one session (id prefixes are fine)")
     p_show.add_argument("session_id")
