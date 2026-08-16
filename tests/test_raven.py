@@ -343,6 +343,35 @@ class DescriptorTest(RavenTestCase):
         self.assertAlmostEqual(payload["started"], time.time(), delta=5.0)
         self.assertGreater(payload["started"], 1_600_000_000)
 
+    def test_started_is_read_from_the_os_not_the_wall_clock(self) -> None:
+        from unittest.mock import patch
+
+        with patch("muninn.store.process_start_time", return_value=1_700_000_000.0):
+            self.assertEqual(raven.descriptor(1)["started"], 1_700_000_000.0)
+
+    def test_a_republish_reports_the_same_start_time(self) -> None:
+        """The Restart row does not start a new process.
+
+        ``cli._run_ingest_loop`` loops in place, so a restart republishes from a
+        process the OS says began long before. Stamping ``time.time()`` here made
+        the host's cross-check fail and declare a healthy Muninn gone — the empty
+        "its recorded process is gone" section, daemon still running. Two
+        descriptors from one process must agree about when that process began.
+        """
+        import time
+
+        first = raven.descriptor(1)["started"]
+        time.sleep(0.05)
+        self.assertEqual(raven.descriptor(2)["started"], first)
+
+    def test_started_falls_back_to_the_clock_when_the_os_cannot_answer(self) -> None:
+        """A descriptor with a weak ``started`` beats no descriptor at all."""
+        import time
+        from unittest.mock import patch
+
+        with patch("muninn.store.process_start_time", return_value=None):
+            self.assertAlmostEqual(raven.descriptor(1)["started"], time.time(), delta=5.0)
+
     def test_pid_names_this_process(self) -> None:
         self.assertEqual(raven.descriptor(1)["pid"], os.getpid())
 

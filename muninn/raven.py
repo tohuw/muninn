@@ -229,6 +229,14 @@ def descriptor_path() -> Path:
     return state_dir() / f"{NAME}.json"
 
 
+def _process_started(pid: int) -> float:
+    """``pid``'s start time per the OS, falling back to the wall clock."""
+    from .store import process_start_time
+
+    actual = process_start_time(pid)
+    return float(actual) if actual else time.time()
+
+
 def descriptor(port: int, *, pid: int | None = None,
                started: float | None = None,
                actions: bool = False) -> dict[str, Any]:
@@ -240,12 +248,26 @@ def descriptor(port: int, *, pid: int | None = None,
     without it a recycled PID passes as a live raven — so the user sees a Muninn
     section that is not backed by anything running.
 
-    ``time.time()`` rather than a real process-start reading, and the two-second
-    slack in Appistry's check is what makes that acceptable: this value is taken
-    within milliseconds of the process starting in every path that calls it.
-    Naming the mistake: ``time.monotonic()`` here would be worse than useless —
-    it is not epoch-based, so the cross-check would fail against every live
-    process rather than only against recycled PIDs.
+    Read from the OS rather than from the wall clock. This used to be
+    ``time.time()``, on the reasoning that publish happens within milliseconds of
+    the process starting so the two-second slack absorbs the difference. That
+    reasoning had one path wrong, and it is a path the user reaches from the
+    menu: a **Restart** does not start a new process. ``cli._run_ingest_loop``
+    loops in place, so the second pass republished with a fresh timestamp on a
+    process the OS says began minutes or hours earlier. The cross-check then
+    failed and the host declared a perfectly healthy Muninn gone — the empty
+    "its recorded process is gone" section, with the daemon still running.
+
+    Cold starts were the latent half of the same bug: publish comes after the
+    lock, the store open and the raven bind, so a slow disk could put it past
+    two seconds on a first run too.
+
+    ``store.process_start_time`` returns None where the OS cannot answer, and
+    then this falls back to the wall clock — a descriptor with no usable
+    ``started`` is still better than no descriptor. Naming the mistake:
+    ``time.monotonic()`` here would be worse than useless — it is not
+    epoch-based, so the cross-check would fail against every live process rather
+    than only against recycled PIDs.
 
     No ``token_path`` and no ``token_header``, which is a decision rather than an
     omission — see ravenserve.py and docs/specs/009.
@@ -259,15 +281,16 @@ def descriptor(port: int, *, pid: int | None = None,
     endpoints: dict[str, str] = {"menu": MENU_ENDPOINT}
     if actions:
         endpoints["action"] = ACTION_ENDPOINT
+    process_id = os.getpid() if pid is None else pid
     return {
         "api_version": API_VERSION,
         "min_api": MIN_API,
         "max_api": MAX_API,
         "name": NAME,
         "display": DISPLAY,
-        "pid": os.getpid() if pid is None else pid,
+        "pid": process_id,
         "port": port,
-        "started": time.time() if started is None else started,
+        "started": _process_started(process_id) if started is None else started,
         "host_priority": HOST_PRIORITY,
         # Omitting "action" is how a raven says it has nothing to be clicked;
         # Appistry renders link rows identically either way.

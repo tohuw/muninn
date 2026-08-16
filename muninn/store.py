@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import time
 from pathlib import Path
 from typing import Any, Iterable
@@ -715,6 +716,89 @@ def pid_alive(pid: int | None) -> bool:
     except OSError:
         return False
     return True
+
+
+def _windows_start_time(pid: int) -> float | None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(0x1000, False, int(pid))  # QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    created, exited = wintypes.FILETIME(), wintypes.FILETIME()
+    kernel, user = wintypes.FILETIME(), wintypes.FILETIME()
+    try:
+        if not kernel32.GetProcessTimes(
+            handle, ctypes.byref(created), ctypes.byref(exited),
+            ctypes.byref(kernel), ctypes.byref(user),
+        ):
+            return None
+    finally:
+        kernel32.CloseHandle(handle)
+    # FILETIME is 100ns units since 1601-01-01; shift to the Unix epoch.
+    ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+    return ticks / 10_000_000 - 11_644_473_600
+
+
+def _linux_start_time(pid: int) -> float | None:
+    with open(f"/proc/{pid}/stat", "rb") as handle:
+        raw = handle.read().decode("utf-8", "replace")
+    # The comm field is parenthesised and may itself contain spaces and
+    # parentheses, so the numeric fields start after the *last* ')'.
+    fields = raw[raw.rindex(")") + 2:].split()
+    hertz = os.sysconf("SC_CLK_TCK")
+    if not hertz:
+        return None
+    with open("/proc/stat", "rb") as handle:
+        for line in handle:
+            if line.startswith(b"btime "):
+                # starttime is field 22 overall, so index 19 of what follows ')'.
+                return float(line.split()[1]) + float(fields[19]) / hertz
+    return None
+
+
+def _darwin_start_time(pid: int) -> float | None:
+    import subprocess
+
+    # LC_ALL=C so the day and month names are the ones strptime is given.
+    result = subprocess.run(
+        ["ps", "-o", "lstart=", "-p", str(int(pid))],
+        capture_output=True, text=True, timeout=5,
+        env={**os.environ, "LC_ALL": "C"},
+    )
+    value = result.stdout.strip()
+    if not value:
+        return None
+    return dt.datetime.strptime(
+        value, "%a %b %d %H:%M:%S %Y").astimezone().timestamp()
+
+
+def process_start_time(pid: int) -> float | None:
+    """When the OS says ``pid`` began, in epoch seconds, or None if it cannot say.
+
+    Muninn had no such helper, which is why ``raven.descriptor`` stamped
+    ``started`` with ``time.time()`` at publish time instead. A host cross-checks
+    that field against this same OS record with two seconds of slack, so a value
+    taken at publish time rather than at process start reads as a recycled pid --
+    see the note on that field.
+
+    None means "cannot corroborate", never "dead": corvidae's
+    ``descriptor_is_live`` treats a missing answer as no evidence either way,
+    because reporting a running raven as gone is the worse of the two errors.
+    """
+    if pid is None or not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    try:
+        if os.name == "nt":
+            return _windows_start_time(pid)
+        if sys.platform.startswith("linux"):
+            return _linux_start_time(pid)
+        if sys.platform == "darwin":
+            return _darwin_start_time(pid)
+    except Exception:
+        return None
+    return None
 
 
 def chunk_text(text: str, chunk_words: int = DEFAULT_CHUNK_WORDS,
