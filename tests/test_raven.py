@@ -283,7 +283,9 @@ class StateDirTest(unittest.TestCase):
 class DescriptorTest(RavenTestCase):
     def test_fields_match_the_protocol(self) -> None:
         payload = raven.descriptor(47101, pid=4242, started=1785315600.5)
-        self.assertEqual(payload, {
+        # `launch` is platform-derived and absent where there is no supervisor,
+        # so it is asserted separately rather than pinned into this literal.
+        self.assertEqual({k: v for k, v in payload.items() if k != "launch"}, {
             "api_version": 1,
             "min_api": 1,
             "max_api": 1,
@@ -295,6 +297,21 @@ class DescriptorTest(RavenTestCase):
             "host_priority": 50,
             "endpoints": {"menu": "/api/menu"},
         })
+
+    def test_the_launch_block_names_a_service_never_a_command(self) -> None:
+        """The host executes nothing this file names, so it gets an identifier.
+
+        Absent is valid: a platform with no start-at-login mechanism publishes
+        no block, and the host then draws no Start row.
+        """
+        launch = raven.descriptor(47101).get("launch")
+        if launch is None:
+            self.skipTest("no start-at-login mechanism on this platform")
+        self.assertIn(launch["kind"], ("launchd", "systemd", "windows-run"))
+        identifier = launch["id"]
+        self.assertRegex(identifier, r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+        for forbidden in ("/", "\\", " ", ";", "$", "`"):
+            self.assertNotIn(forbidden, identifier)
 
     def test_declares_a_range_not_a_single_version(self) -> None:
         """tohuw/huginn#38: equality comparison silently disabled every plugin."""
