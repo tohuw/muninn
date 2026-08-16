@@ -171,7 +171,24 @@ def _run_ingest_loop(args: argparse.Namespace, roots: dict[str, Path], *,
     lifecycle question").
     """
     while True:
-        code = _run_ingest_loop_once(args, roots, menubar=menubar, holder=holder)
+        try:
+            code = _run_ingest_loop_once(args, roots, menubar=menubar, holder=holder)
+        except KeyboardInterrupt:
+            # Ctrl-C outside the window ``Daemon.run`` covers. SIGINT is
+            # deliberately not claimed by install_termination_handlers, so it
+            # arrives as a KeyboardInterrupt wherever the main thread happens to
+            # be -- and ``run``'s own try/except only spans the ingest loop. It
+            # can therefore land here: between a restart's teardown and the next
+            # iteration, or after run() has already returned.
+            #
+            # Escaping to the top level is not a harmless difference in tidiness.
+            # CPython restores SIG_DFL and re-raises SIGINT so the process
+            # *reports itself killed by the signal* -- exit -2, which a service
+            # manager reads as a crash rather than a stop. The teardown has
+            # already run either way, because it lives in a ``finally``; only
+            # the exit status was wrong. Ctrl-C on a daemon is a stop, and a stop
+            # is 0, exactly as SIGTERM gives.
+            return 0
         if code is not _RESTART:
             return code
         # The teardown in Daemon.run has already withdrawn the descriptor, stopped
