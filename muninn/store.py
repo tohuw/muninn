@@ -23,6 +23,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Iterable
@@ -855,6 +856,42 @@ def fts_query(raw: str) -> str:
 
 _OPEN_RETRY_ATTEMPTS = 8
 
+#: Records the schema version in one statement rather than SELECT-then-INSERT.
+#:
+#: The read took no lock, so two connections opening the same fresh archive both
+#: saw "no row" and both inserted -- the second raising ``UNIQUE constraint
+#: failed: meta.key`` out of what is merely *opening* the archive. Named rather
+#: than inlined so the property can be tested the way it actually breaks: two
+#: independent connections, which is what a daemon and a CLI invocation are.
+#: ``_OPEN_LOCK`` cannot help there; only the atomicity of this statement can.
+#:
+#: The WHERE keeps the old "never move the recorded version backwards" rule, so
+#: an older build opening a newer archive does not stamp its own number on it.
+#: CAST because meta.value is TEXT, where "10" would sort before "9".
+SCHEMA_VERSION_UPSERT = (
+    "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
+    "ON CONFLICT(key) DO UPDATE SET value = excluded.value "
+    "WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)"
+)
+
+#: Serialises *this process's* threads through connect-and-bootstrap.
+#:
+#: The retry loop below exists for the fresh-file ``PRAGMA journal_mode=WAL``
+#: race, which takes an exclusive lock ``busy_timeout`` does not smooth over.
+#: It was tuned against a 4-thread stress test; at six the backoff budget
+#: (~1.9s total) ran out and five of six threads surfaced "database is locked"
+#: from an *open*.
+#:
+#: Retrying harder would be treating the symptom. Threads inside one process
+#: have no reason to race each other here at all: the work is idempotent schema
+#: setup, so the second thread through gains nothing by arriving concurrently.
+#: Serialising them removes the stampede outright and leaves the retry loop for
+#: the case it was actually written for -- a *separate process* opening the same
+#: archive, where no in-process lock can help.
+#:
+#: Held across the open only, never across a query.
+_OPEN_LOCK = threading.Lock()
+
 
 def _connect_and_prepare(path: Path) -> sqlite3.Connection:
     """One attempt: connect, set pragmas, and ensure schema/ledger tables exist.
@@ -907,6 +944,11 @@ def open_store(path: str | Path) -> Store:
     """Open (creating if needed) the archive at ``path``."""
     path = Path(path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
+    with _OPEN_LOCK:
+        return _open_store_locked(path)
+
+
+def _open_store_locked(path: Path) -> Store:
     fresh = not path.exists()
 
     conn: sqlite3.Connection | None = None
@@ -926,16 +968,17 @@ def open_store(path: str | Path) -> Store:
     if conn is None:
         raise last_exc  # every attempt hit contention; surface it rather than hang forever
 
-    row = conn.execute(
-        "SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-    if row is None:
-        conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
-            (str(SCHEMA_VERSION),))
-    elif int(row["value"]) < SCHEMA_VERSION:
-        conn.execute(
-            "UPDATE meta SET value = ? WHERE key = 'schema_version'",
-            (str(SCHEMA_VERSION),))
+    # One statement, not SELECT-then-INSERT. The read took no lock, so two
+    # connections opening the same fresh archive both saw "no row" and both
+    # inserted -- the second raising ``UNIQUE constraint failed: meta.key`` out
+    # of what is merely *opening* the archive. The upsert idiom is the one
+    # ``record_sweep`` above already uses; this was the one place that did not.
+    #
+    # The WHERE keeps the old "never move the recorded version backwards" rule:
+    # an older build opening a newer archive must not stamp its own number on
+    # it. CAST because meta.value is TEXT, so a bare comparison would order
+    # "10" before "9".
+    conn.execute(SCHEMA_VERSION_UPSERT, (str(SCHEMA_VERSION),))
     conn.commit()
     if fresh:
         try:
