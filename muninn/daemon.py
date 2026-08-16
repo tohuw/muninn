@@ -826,7 +826,40 @@ class Daemon:
         response is already on the wire, so an exception here has nowhere useful
         to go and would only be logged as a request failure with a misleading
         shape.
+
+        ## Windows has no signal to deliver here
+
+        ``os.kill`` on Windows is not a signal for anything but the two console
+        CTRL events: for every other value it calls ``TerminateProcess``. So
+        ``os.kill(os.getpid(), SIGTERM)`` did not ask this process to stop, it
+        killed it outright -- no handler, no unwind, and none of the ``finally``
+        above. The descriptor survived naming a dead pid and the state file with
+        it, which is precisely the failure ``install_termination_handlers``
+        exists to prevent, arriving by the one route that bypasses it.
+
+        Worse for Restart specifically: there was no process left to come back,
+        so the menu's Restart row was a Quit that also left litter. A host then
+        showed "Not running (its recorded process is gone)" over a raven the
+        user had just asked to restart.
+
+        ``_thread.interrupt_main()`` is the Windows equivalent of what SIGTERM
+        buys on POSIX: it raises ``KeyboardInterrupt`` on the main thread, which
+        :meth:`run` already catches alongside ``SystemExit``. SIGINT is left
+        uninstalled on purpose (see :func:`install_termination_handlers`), so
+        nothing intercepts it. It lands at the next bytecode boundary -- during
+        the startup sweep that is immediate, and inside ``watchfiles`` it is at
+        most one ``rust_timeout`` tick, because the watcher is called with
+        ``yield_on_timeout=True`` and so returns to Python every couple of
+        seconds regardless of file activity.
         """
+        if os.name == "nt":
+            import _thread
+
+            try:
+                _thread.interrupt_main()
+            except Exception:
+                logger.warning("muninn: could not interrupt the main thread to stop")
+            return
         try:
             os.kill(os.getpid(), signal.SIGTERM)
         except OSError:

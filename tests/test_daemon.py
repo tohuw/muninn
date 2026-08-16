@@ -375,6 +375,59 @@ class TerminationHandlerTest(unittest.TestCase):
         signal.raise_signal(signal.SIGTERM)
 
 
+class StopSignalDeliveryTest(unittest.TestCase):
+    """How the menu's Quit and Restart reach the main thread, per platform.
+
+    Both branches are exercised on every OS by faking ``os.name``: the whole
+    point is that the Windows path was wrong and nobody running POSIX could see
+    it.
+    """
+
+    def _daemon(self):
+        service = daemon.Daemon(":memory:", {})
+        service._running = True
+        return service
+
+    def test_windows_interrupts_the_main_thread_and_never_calls_os_kill(self) -> None:
+        """os.kill on Windows is TerminateProcess, not a signal.
+
+        It killed the process outright: no handler, no unwind, so the descriptor
+        and the state file both survived naming a dead pid -- the exact failure
+        install_termination_handlers exists to prevent, arriving by the one route
+        that bypasses it. A Restart could not come back, because nothing was left
+        to come back.
+        """
+        import _thread
+        from unittest.mock import patch
+
+        service = self._daemon()
+        with patch.object(daemon.os, "name", "nt"), \
+             patch.object(daemon.os, "kill") as killed, \
+             patch.object(_thread, "interrupt_main") as interrupted:
+            service.deliver_stop_signal()
+        interrupted.assert_called_once_with()
+        killed.assert_not_called()
+
+    def test_posix_still_sends_itself_sigterm(self) -> None:
+        from unittest.mock import patch
+
+        service = self._daemon()
+        with patch.object(daemon.os, "name", "posix"), \
+             patch.object(daemon.os, "kill") as killed:
+            service.deliver_stop_signal()
+        killed.assert_called_once_with(os.getpid(), signal.SIGTERM)
+
+    def test_a_failure_to_deliver_is_logged_not_raised(self) -> None:
+        """This runs on a request thread whose response is already on the wire."""
+        import _thread
+        from unittest.mock import patch
+
+        service = self._daemon()
+        with patch.object(daemon.os, "name", "nt"), \
+             patch.object(_thread, "interrupt_main", side_effect=RuntimeError("no")):
+            service.deliver_stop_signal()   # must not raise
+
+
 @POSIX_ONLY
 class WiringTest(unittest.TestCase):
     """The handler existing is not the guarantee — ``run()`` installing it is.
