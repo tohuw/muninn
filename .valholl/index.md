@@ -2,7 +2,7 @@
 okf_version: "0.1"
 title: "Muninn knowledge base"
 description: "Architecture, durability, ingest, calibration, and governance knowledge for Muninn."
-updated: "2026-08-01"
+updated: "2026-08-16"
 ---
 
 # Muninn knowledge base
@@ -31,6 +31,10 @@ the code does.
 - [Embedding is not a chore](articles/embedding-is-not-a-chore.md) — why the daemon owns embedding, and why the automatic loop is written to quit rather than retry
 
 - [Superseding a predecessor](articles/superseding-a-predecessor.md) — a byte-verified backfill that was still missing four of six directories
+
+## Retrieval
+
+- [Retrieval that is not asked](articles/retrieval-that-is-not-asked.md) — every query interface is blind to what you have forgotten you have; why `recall` takes a place instead of a question, and why a surface that speaks unprompted has to be silent by default
 
 ## Data model
 

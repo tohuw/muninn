@@ -1,6 +1,6 @@
 ---
 name: muninn
-description: Search, inspect, correlate, resume and report on archived Claude and Codex sessions through Muninn. Use for questions about past agent work, decisions, transcripts, prior outcomes, what a session cost, archive health, or recovering a previous session; prefer this skill over reading raw transcript files or Muninn's SQLite archive.
+description: Search, inspect, correlate, recall, resume and report on archived Claude and Codex sessions through Muninn. Use for questions about past agent work, decisions, transcripts, prior outcomes, what a session cost, archive health, or recovering a previous session; also when starting work in a repository and asking what is already known about it or what was left unfinished there; prefer this skill over reading raw transcript files or Muninn's SQLite archive.
 ---
 
 # Muninn
@@ -41,6 +41,30 @@ is **not** always the best choice.
 | "What did I do last week / in June?" | `muninn log --since 2026-06` | Reverse-chronological, no query needed |
 | "Show me that session" | `muninn show <id-prefix>` | Full session; id prefixes are fine |
 | "Reopen it" | `muninn resume <id-prefix>` | Prints (or `--exec` runs) the right vendor command |
+| "What was I doing here?", "where did I leave off?", or **no question at all — you are starting work in a repo** | `muninn recall [--repo <name>]` | Takes a *place* instead of a query; calls no model |
+
+### `recall` is the one that does not wait to be asked
+
+Every other row above needs the question thought of first, which cannot reach
+the material the user has *forgotten they have* — they will not search for it,
+because they do not know it is there. `recall` takes a repository instead
+(defaulting to wherever the most recent session was working) and reports three
+things: **unfinished threads** (sessions enrichment judged `ongoing` or
+`abandoned`), **prior work** in that repo, and **related work from other
+repos** by embedding.
+
+Use it when picking up work somewhere, before concluding the archive has
+nothing on a repository, and whenever the user asks a "where was I" shaped
+question. Unfinished threads are the part nothing else surfaces: work started,
+not finished, with no reminder anywhere. Raising one is often the most useful
+thing this skill can do, and nobody will ever think to ask for it.
+
+Same empty-result trap as `--outcome`, and `recall` resolves it *for* you: an
+empty unfinished list means either "nothing loose" or "nothing has ever been
+judged", so it reports which in an `unavailable` map. Read that before saying
+the user has no loose ends — otherwise you are telling them their work is
+tidied up when nothing has looked. `related` is `unavailable` in the same way
+when no embedding provider is installed.
 
 `correlate` still needs an embedding provider *installed* and the archive
 embedded, even though it makes no model call — it reads the provider's model id as
@@ -92,7 +116,7 @@ the human tables.
 
 | Command | `--json` | `--dry-run` |
 |---|---|---|
-| `search`, `log`, `correlate`, `resume`, `index`, `import`, `backfill`, `survey`, `enrich` | yes | `survey`, `enrich`, `embed` |
+| `search`, `log`, `correlate`, `recall`, `resume`, `index`, `import`, `backfill`, `survey`, `enrich` | yes | `survey`, `enrich`, `embed` |
 | `show`, `doctor`, `embed` | no — human output only | — |
 
 **`enrich --json` performs the enrichment** and returns a receipt (`enriched`,
@@ -142,7 +166,8 @@ access carries no *incremental* charge but draws on a shared pool of tokens, so
 "free" invites treating a shared budget as unlimited. Say "no incremental charge"
 for a seat-licensed model, and "calls no model" for the stages that reach one at
 all. Most of Muninn is the latter: ingest, lexical search,
-`log`, `show`, `resume`, `correlate`, `doctor` and `survey` call no model at all.
+`log`, `show`, `resume`, `correlate`, `recall`, `doctor` and `survey` call no
+model at all.
 
 ## Maintenance commands
 
@@ -150,6 +175,11 @@ all. Most of Muninn is the latter: ingest, lexical search,
 `install-agent` / `uninstall-agent`, `import` (a claude.ai or ChatGPT export),
 `backfill` (a one-time claudex/codexdex migration). Run these only when asked —
 they change how the user's machine behaves.
+
+The daemon also publishes an **Unfinished in `<repo>`** section to the Roost menu
+bar — `recall`'s unfinished list, and the one section there that asks something
+of the user rather than reporting state. It is absent when there is nothing
+loose, so its absence is not a fault to investigate.
 
 **The user can stop or restart the daemon themselves** from the Roost menu bar:
 the Muninn section's last two rows are *Quit Muninn* and *Restart Muninn*. Prefer

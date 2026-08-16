@@ -27,6 +27,7 @@ wiki wins and the contradiction is a bug worth reporting.
 | [016 — Cost estimation](016-cost-estimation.md) | implemented | 011, 005, 006 |
 | [017 — Menu lifecycle actions](017-menu-lifecycle-actions.md) | implemented | 009, 010 |
 | [018 — Automatic enrichment](018-automatic-enrichment.md) | implemented | 014, 016, 011, 005 |
+| [019 — `muninn recall`](019-recall.md) | implemented | 005, 006, 009 |
 
 Specs 002 and 003 both modify `muninn/cli.py`, as do 004, 005, 010 and 011. Run
 overlapping specs sequentially, or in separate git worktrees, so they cannot
@@ -69,6 +70,12 @@ the default one. It reverses a decision spec 008's `resolve_provider` recorded �
 read 015's "Why" before concluding the old refusal still stands — and it changes
 nothing about which models are *permitted*: selection and permission stay
 separate, with `muninn.policy` the only chokepoint.
+
+Spec 019 is the first retrieval path that does not take a query, and it is the
+first consumer of `outcome` beyond a filter flag. It depends on 005 in a way the
+others do not: with enrichment unrun its main section is not merely empty but
+*unknowable*, which is why the payload distinguishes the two silences rather
+than leaving a caller to infer one.
 
 Later phases not yet spec'd: the console, the agent skill, and the Cisco
 distribution's plugins.

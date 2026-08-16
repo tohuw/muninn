@@ -1,7 +1,7 @@
 # Muninn — working notes for agents
 
-Muninn is a local-only console for **agent history**: search, correlate and resume
-past AI-agent sessions across Claude Code, Codex, and vendor data exports.
+Muninn is a local-only console for **agent history**: search, correlate, recall and
+resume past AI-agent sessions across Claude Code, Codex, and vendor data exports.
 Companion to [Huginn](https://github.com/tohuw/huginn) — Huginn is Thought (what
 agents are doing now), Muninn is Memory (what they did).
 

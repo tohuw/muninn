@@ -8,7 +8,7 @@ category: "overview"
 status: "current"
 updated: "2026-07-30"
 summary: "Muninn archives, searches, and correlates past AI-agent sessions. It is a companion to Huginn, which watches live sessions. Together they share one menubar surface."
-related: ["archive-of-record", "provenance-classification", "derived-calibration"]
+related: ["archive-of-record", "provenance-classification", "derived-calibration", "retrieval-that-is-not-asked"]
 ---
 
 # What Muninn is
@@ -16,7 +16,9 @@ related: ["archive-of-record", "provenance-classification", "derived-calibration
 Muninn is a local-only console for **agent history** — what your AI agents did,
 across Claude Code, Codex, and vendor data exports. It provides fast hybrid
 search, correlation of similar conversations, quick session resume, and
-context briefs that read equally well to humans and agents.
+context briefs that read equally well to humans and agents. It also volunteers
+what it knows about wherever you are working, without being asked a question —
+see [[retrieval-that-is-not-asked]].
 
 In the Norse pairing, Huginn is **Thought** and Muninn is **Memory**. That maps
 cleanly onto the software: [Huginn](https://github.com/tohuw/huginn) answers
