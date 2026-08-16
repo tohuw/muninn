@@ -1101,12 +1101,23 @@ class ActionEndpointTest(RavenTestCase):
         self.assertEqual(self.calls, [raven.QUIT])
 
     def test_the_reply_is_written_before_the_followup_runs(self) -> None:
-        """A quit that drops the connection reads as a wedged raven, not a quit."""
+        """A quit that drops the connection reads as a wedged raven, not a quit.
+
+        The two halves are asserted differently on purpose. That the reply comes
+        first is proved synchronously: this client read a complete 200 before
+        looking. That the followup then runs is *waited* for, because it runs on
+        the server thread after the flush -- so demanding it be finished the
+        instant the client returns asserts the opposite ordering to the one
+        claimed, and races. It read as a pass only because binding used to take
+        tens of seconds on macOS; making that instant exposed it.
+        """
+        import time
+
         status, _body = self.post(json.dumps({"id": raven.QUIT}).encode())
         self.assertEqual(status, 200)
-        # The response completed and was read by this client; only then may the
-        # process-stopping followup have run. Ordering is the claim, so both
-        # halves are asserted.
+        deadline = time.monotonic() + 10.0
+        while not self.followups and time.monotonic() < deadline:
+            time.sleep(0.01)
         self.assertEqual(self.followups, ["ran"])
 
     def test_a_refused_action_answers_409_not_200(self) -> None:
