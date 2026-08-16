@@ -32,6 +32,7 @@ element. Even without a shell, a megabyte of prose in argv would hit
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
 from typing import Protocol
@@ -47,6 +48,44 @@ DEFAULT_MODEL = "claude-haiku-4-5"
 #: The provider name policies match against. A distribution restricting Muninn
 #: to an approved endpoint writes ``require_provider="claude-cli"``.
 PROVIDER_NAME = "claude-cli"
+
+#: Keep provider subprocesses from opening a window, on every platform.
+#:
+#: ``muninn serve`` runs under ``pythonw`` so nothing appears at login, which
+#: leaves it with no console for a child to inherit. The provider CLIs are
+#: console-subsystem programs, so Windows handed each invocation a console of
+#: its own — and automatic enrichment invokes one per session, so enabling the
+#: enrichment gate made dozens of terminal windows appear unbidden. A daemon
+#: must never put a window on the user's screen.
+def _no_window_kwargs() -> dict:
+    """Popen kwargs that suppress a console window, or nothing off Windows.
+
+    A function rather than an inline conditional so both branches are reachable
+    from a test on any host: the Windows branch is the entire point of the fix,
+    and asserting it only when the suite happens to run on Windows leaves it
+    unguarded on the machines it is usually developed on. ``creationflags`` is
+    not a POSIX concept, so the other branch must stay empty.
+    """
+    if os.name != "nt":
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+
+
+_NO_WINDOW = _no_window_kwargs()
+
+#: Text-mode pipe settings for every provider subprocess.
+#:
+#: ``text=True`` alone encodes with the *locale* encoding, which on Windows is
+#: cp1252 — and a transcript is full of characters cp1252 has no code for. The
+#: prompt write then died with ``UnicodeEncodeError: 'charmap' codec can't
+#: encode character '→'`` on a writer thread, so the provider received a
+#: truncated prompt, answered with something that was not JSON, and enrichment
+#: recorded ``invalid-json`` for 4 of 5 sessions while still exiting 0.
+#:
+#: ``errors="replace"`` on top, because losing one glyph out of a transcript is
+#: a strictly better outcome than losing the whole session's enrichment — and
+#: the model never sees the raw bytes anyway.
+_PIPE_TEXT = {"encoding": "utf-8", "errors": "replace"}
 
 #: The Codex CLI's model, when that provider is selected. ``gpt-5.6-luna`` is
 #: Codex's own replacement for GPT-5.4 Mini — its cheap tier — which is the
@@ -152,10 +191,11 @@ class ClaudeCLIProvider:
                 argv,
                 input=prompt,          # stdin, never argv — see the module docstring
                 capture_output=True,
-                text=True,
                 timeout=timeout,
                 shell=False,           # the default; stated because the mistake is invisible
                 check=False,
+                **_PIPE_TEXT,
+                **_NO_WINDOW,
             )
         except FileNotFoundError as exc:
             raise ProviderError(f"{self.binary!r} not found on PATH") from exc
@@ -254,10 +294,11 @@ class CodexCLIProvider:
                     argv,
                     input=prompt,          # stdin, never argv
                     capture_output=True,
-                    text=True,
                     timeout=timeout,
                     shell=False,
                     check=False,
+                    **_PIPE_TEXT,
+                    **_NO_WINDOW,
                 )
             except FileNotFoundError as exc:
                 raise ProviderError(f"{self.binary!r} not found on PATH") from exc
