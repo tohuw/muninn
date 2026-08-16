@@ -251,6 +251,11 @@ def remove_state(path: Path | None = None) -> bool:
 
 # ── The single-instance lock ──────────────────────────────────────────────────
 
+#: Where the Windows lock sentinel byte lives. Any offset past the holder line
+#: works; this one is far enough out that the line can never reach it.
+_LOCK_SENTINEL_OFFSET = 1 << 30
+
+
 def _try_lock(fd: int) -> bool | None:
     """Take an exclusive non-blocking lock. ``None`` = no primitive available.
 
@@ -287,12 +292,25 @@ def _try_lock(fd: int) -> bool | None:
     except ImportError:
         return None
     try:
-        # Byte-range lock on the first byte; works past EOF, so an empty lock
-        # file is fine. Best-effort like everything else Windows-shaped here —
-        # see WINDOWS.md.
+        # A sentinel byte far past the holder line — NOT byte 0. Windows
+        # byte-range locks are *mandatory*, not advisory: locking a byte the
+        # file actually contains makes that byte unreadable to everyone else,
+        # so locking byte 0 made `_read_lock_holder` fail with PermissionError
+        # and every probe reported a running daemon as `(None, "unknown")`.
+        # `doctor` then said "held by an unrecorded pid" about a healthy
+        # daemon, and `muninn index --watch` could never be named as the
+        # holder. Locking past EOF is supported and does not grow the file.
+        os.lseek(fd, _LOCK_SENTINEL_OFFSET, os.SEEK_SET)
         msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
     except OSError:
         return False
+    finally:
+        # acquire() writes the holder line through this same descriptor, so the
+        # offset must not be left out at the sentinel.
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+        except OSError:
+            pass
     return True
 
 
@@ -310,9 +328,15 @@ def _unlock(fd: int) -> None:
     try:
         import msvcrt
 
+        os.lseek(fd, _LOCK_SENTINEL_OFFSET, os.SEEK_SET)
         msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
     except (ImportError, OSError):
         pass
+    finally:
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+        except OSError:
+            pass
 
 
 class SingleInstance:
