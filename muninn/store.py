@@ -763,9 +763,13 @@ def _darwin_start_time(pid: int) -> float | None:
     import subprocess
 
     # LC_ALL=C so the day and month names are the ones strptime is given.
+    # LC_ALL=C already forces an ASCII answer, so the explicit encoding is
+    # belt-and-braces rather than a fix -- but text=True would decode with the
+    # locale, and "the locale happens to agree today" is how the other three of
+    # these got through review.
     result = subprocess.run(
         ["ps", "-o", "lstart=", "-p", str(int(pid))],
-        capture_output=True, text=True, timeout=5,
+        capture_output=True, timeout=5, encoding="utf-8", errors="replace",
         env={**os.environ, "LC_ALL": "C"},
     )
     value = result.stdout.strip()

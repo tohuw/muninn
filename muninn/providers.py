@@ -311,7 +311,23 @@ class CodexCLIProvider:
                 raise ProviderError(f"{self.binary!r} exited {proc.returncode}")
 
             try:
-                out = open(out_path, encoding="utf-8").read().strip()
+                # A `with`, and errors="replace", for two separate reasons.
+                #
+                # The handle has to be closed before the finally below unlinks
+                # the file: on Windows, deleting a file that is still open fails,
+                # and that unlink swallows OSError -- so the leak would be
+                # silent and permanent. Relying on refcounting to close it is
+                # relying on an implementation detail to keep a temp directory
+                # clean.
+                #
+                # And a strict decode raises UnicodeDecodeError, which is not an
+                # OSError and would escape this handler entirely -- reaching the
+                # enricher as an unhandled exception rather than the
+                # ProviderError it knows how to record. A provider's output is
+                # model text; assuming it is clean UTF-8 is the assumption that
+                # has been wrong all day.
+                with open(out_path, **_PIPE_TEXT) as handle:
+                    out = handle.read().strip()
             except OSError as exc:
                 raise ProviderError(
                     f"{self.binary!r} wrote no last-message file "
