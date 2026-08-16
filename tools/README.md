@@ -144,19 +144,22 @@ dictionary-attacked, and cannot be correlated across runs or across people.
 
 ## Cost projection
 
-The report includes a `cost_projection` section, and the summary prints it: what a
-full Muninn pass over *your* corpus would cost, before you install anything.
+The report includes a `cost_projection` section, and the summary prints it: the
+**token volumes** a full Muninn pass over *your* corpus would consume, before you
+install anything — one-time and per month.
 
-Two scenarios, because the honest answer depends on what you already have and this
-script cannot know: a local embedding model with seat-based text access (zero), or
-metered Bedrock Titan embeddings with Claude Haiku enrichment. Per-unit figures
-too — dollars per 1,000 sessions enriched and per 1M words embedded.
+**No dollar figures, deliberately.** This script cannot see how you pay for a
+model, and subscription, enterprise, reseller and metered API access all produce
+different real numbers for an identical call. It is also offline by design, so it
+cannot look a rate up either. A price baked in here would be one author's reading
+of one vendor's page on one date, rendered to two decimal places on a stranger's
+machine and wrong without ever saying so. The volumes are measured and true
+everywhere; multiply them by whatever rates apply to your account.
 
-The token ratios are measured rather than assumed (Titan's own token counts over
-real chunks; Bedrock usage over real enrichment calls) and are far above the
-familiar ~1.3 tokens/word, which describes English prose rather than transcripts
-dense with code and JSON. Rates carry a confidence, and any figure depending on an
-unverified one is marked `~`.
+The token ratios behind those volumes are measured rather than assumed (the
+providers' own reported token counts, over real chunks and real enrichment calls)
+and are far above the familiar ~1.3 tokens/word, which describes English prose
+rather than transcripts dense with code and JSON.
 
 Scope note: this script counts **human-provenance sessions only**, so its numbers
 are lower than `muninn survey`'s, which also enriches subagent sessions. Same

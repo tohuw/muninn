@@ -78,12 +78,19 @@ class MeteredGuardTest(unittest.TestCase):
         and blocks everybody.
         """
         self.assertTrue(cost.bills_per_token("claude-haiku-4-5"),
-                        "precondition: the rate table considers this metered")
+                        "precondition: with no rate on file this fails closed")
         w = self._worker(FakeProvider(model="claude-haiku-4-5", metered=False))
         self.assertTrue(w._spending_allowed())
 
     def test_no_opinion_falls_back_to_the_rate_table(self) -> None:
-        allowed = self._worker(FakeProvider(model="gpt-5.6-luna", metered=None))
+        """With no shipped prices, only local inference clears this on its own.
+
+        That is the intended shape rather than a gap: a hosted model with no
+        rate on file and a provider with no opinion is precisely the case where
+        nobody has established that a call is free, so the guard refuses.
+        """
+        allowed = self._worker(FakeProvider(
+            model="mlx-community/bge-small-en-v1.5-bf16", metered=None))
         refused = self._worker(FakeProvider(model="claude-sonnet-5", metered=None))
         self.assertTrue(allowed._spending_allowed())
         self.assertFalse(refused._spending_allowed())
@@ -106,9 +113,16 @@ class MeteredGuardTest(unittest.TestCase):
         w = self._worker(Broken())
         self.assertFalse(w._spending_allowed())
 
-    def test_the_rate_table_helper_treats_seat_access_as_not_billing(self) -> None:
-        self.assertFalse(cost.bills_per_token("gpt-5.6-luna"))
+    def test_local_inference_does_not_bill_and_everything_else_is_unknown(self) -> None:
+        """No prices ship, so the only thing this can rule out is local inference.
+
+        Nothing leaves the box, so there is nothing to bill — that is a fact
+        about where the work runs, not a price anyone looked up. Every hosted
+        model is unknown until the reader supplies a rates.json, and unknown
+        fails closed.
+        """
         self.assertFalse(cost.bills_per_token("mlx-community/bge-small-en-v1.5-bf16"))
+        self.assertFalse(cost.bills_per_token("BAAI/bge-small-en-v1.5"))
         self.assertTrue(cost.bills_per_token("claude-sonnet-5"))
         self.assertTrue(cost.bills_per_token("nothing-priced-here"))
 

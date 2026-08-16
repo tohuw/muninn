@@ -298,7 +298,13 @@ def _cost_section(doc: dict[str, Any], st: Store) -> dict[str, Any]:
     Above-gate words and call counts come from the same per-source gate the rest
     of this document derives, so the estimate moves with the corpus rather than
     being pinned to a number someone measured once.
+
+    Prices come from ``rates.json`` beside the archive, if one is there. This
+    repo ships none, so with no such file the model-side stages report their
+    measured token volumes and no price at all — see ``muninn/cost.py`` for why
+    a shipped price is worse than an absent one.
     """
+    cost_model.load_rates(st.path)
     above_words = 0
     above_sessions = 0
     above_calls = 0

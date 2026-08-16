@@ -339,16 +339,43 @@ archive outgrows it, and derives a first one for an archive that has never been
 surveyed. A survey calls no model, so this is on by default; `--no-recalibrate`
 turns it off, and `muninn survey` still does it on demand.
 
-`muninn survey` also projects **what a full pass would cost**, per stage — and
+`muninn survey` also projects **what a full pass would consume**, per stage — and
 `tools/corpus-survey.py` does the same thing standalone, stdlib-only, on a
 machine that has never installed Muninn. See
-[spec 016](docs/specs/016-cost-estimation.md). Volumes are measured from your
-corpus; rates are declared with a source and a confidence, and any figure
-depending on an unverified rate is marked. Measured on a real 680-session
+[spec 016](docs/specs/016-cost-estimation.md). Measured on a real 680-session
 archive: **1.76 tokens per word** for embedding and **2.02** for enrichment —
 well above the ~1.3 that describes English prose, because agent transcripts are
 dense with code and identifiers. Ingest, lexical search and `correlate` are
 listed at zero rather than omitted, because most of the tool costs nothing.
+
+**No prices ship with Muninn.** A rate baked into a source file is one person's
+reading of one vendor's page on one date, and it then renders to two decimal
+places on your machine long after it stopped being true — while also asserting
+something about *your* billing that no code here can see. Subscription,
+enterprise, reseller and metered API access all produce different real numbers
+for an identical call.
+
+So the model-side stages report their **measured token volumes** and say
+`unpriced`. To get money back, write a `rates.json` beside the archive — the
+natural job for an agent that can go and read current pricing:
+
+```json
+{
+  "claude-haiku-4-5": {
+    "input": 1.00, "output": 5.00,
+    "source": "https://…, read 2026-08-16",
+    "as_of": "2026-08-16",
+    "seat_licensed": false
+  }
+}
+```
+
+`source` and `as_of` are required, so a figure always carries where it came from
+and when — and anything older than 90 days is reported back to you as worth
+re-checking. Every money figure is labelled as an understanding of **published
+list pricing**, never as a quote. Inference that runs on your own machine is the
+one built-in zero, and it is a statement about where the work happens rather
+than a price anyone looked up.
 
 `muninn doctor` recommends re-surveying when the corpus shape drifts: the corpus
 doubles, a source appears, the source mix shifts, or the stored gate stops doing

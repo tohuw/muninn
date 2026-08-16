@@ -154,20 +154,54 @@ installed, so the fix is normally to wait, not to run `embed`.
   installed plugins and which text provider is the declared default. Read this
   before diagnosing anything.
 - `muninn survey` — measures the corpus, derives the enrichment gate, and
-  **projects what each model-side stage would cost**, per stage and per unit.
+  **projects what each model-side stage would consume**, per stage and per unit.
   `--dry-run` computes without writing `calibration.json`.
 
-Use `survey` to answer "what would this cost". Its rates carry a confidence and
-any figure depending on an unverified rate is marked `~` — relay that caveat, do
-not launder it into a flat number.
+### Pricing is your job, and "I don't know" is a valid answer
+
+**Muninn ships no prices.** A rate in a source file is one person's reading of
+one vendor's page on one date, and it also asserts something about the user's
+billing — subscription, enterprise, reseller, metered API — that no code can
+observe. So the model-side stages report **measured token volumes** and print
+`unpriced`, and totals are `null` rather than a sum of the parts someone
+happened to know.
+
+When the user asks what something costs:
+
+1. Run `muninn survey --dry-run --json` and read the token volumes. They are
+   measured and true regardless of pricing.
+2. If a `rates.json` exists beside the archive, `survey` uses it and the output
+   is already priced. Check `stale_rates` — anything over 90 days old should be
+   re-checked before you quote it.
+3. Otherwise **go and look up current published pricing** for the models named
+   in `unpriced_models`, then write `rates.json` beside the archive:
+   `{"<model-id>": {"input": <usd per 1M>, "output": <usd per 1M>, "source":
+   "<url, and when you read it>", "as_of": "<ISO date>"}}`. `source` and `as_of`
+   are required — an entry missing either is skipped, not defaulted.
+4. **If you cannot find a current rate, say so and give the volumes.** Do not
+   reconstruct a price from memory. A number you half-remember is exactly the
+   failure this design removed, and it will be quoted back later as though
+   somebody checked it.
+
+Say **"published list pricing"**, never "your cost". And never call a
+seat-licensed model's zero "free": it draws on a shared pool of tokens. Only set
+`seat_licensed` in `rates.json` when the *user* has told you their access works
+that way — it is a fact about their account, not something to infer.
+
+`doctor`'s `auto` line is a related but different claim: it reports what the
+resolved **provider says about itself**, which is why background enrichment can
+run while `survey` still reports the same model as unpriced. Those two are not
+in conflict — one is the provider's statement about billing per token, the other
+is the absence of a list price on file.
 
 **Do not call any of this "free" to the user.** Seat- or subscription-based model
 access carries no *incremental* charge but draws on a shared pool of tokens, so
 "free" invites treating a shared budget as unlimited. Say "no incremental charge"
-for a seat-licensed model, and "calls no model" for the stages that reach one at
-all. Most of Muninn is the latter: ingest, lexical search,
-`log`, `show`, `resume`, `correlate`, `recall`, `doctor` and `survey` call no
-model at all.
+for access the user has told you is seat-licensed, and "calls no model" for the
+stages that never reach one. Most of Muninn is the latter: ingest, lexical
+search, `log`, `show`, `resume`, `correlate`, `recall`, `doctor` and `survey`
+call no model at all. Embedding through a local model is a third case — it
+consumes nothing shared, because nothing leaves the machine.
 
 ## Maintenance commands
 

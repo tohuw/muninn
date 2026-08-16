@@ -26,26 +26,34 @@ account-specific.
 
 ## Scope
 
-**In:** a cost model (`muninn/cost.py`) with measured token ratios and declared,
-attributed rates; a `cost` section in the calibration document and in `survey`'s
-printed output; per-unit metrics; every stage listed, including free ones.
+**In:** a cost model (`muninn/cost.py`) with measured token ratios; a `cost`
+section in the calibration document and in `survey`'s printed output; per-unit
+metrics; every stage listed, including free ones.
 
 **Out:** live rate fetching (a network call in a local read-only command);
 per-account billing integration; changing any operation's actual cost.
+
+**Amended (v2026.08.16.9): no rates ship.** See "Prices are not ours to
+declare" below. The original spec shipped an attributed rate table; that is
+reversed, and the attribution requirement moved onto the reader's own file.
 
 ## The two kinds of number
 
 | | Source | Changes when |
 |---|---|---|
 | **Token ratios** (`TOKEN_RATIOS`) | Measured with real providers over the real corpus, method and date recorded | The corpus's character changes, or a tokenizer does |
-| **Rates** (`RATES`) | Declared, each with `source`, `as_of`, `confidence` | A vendor changes a price, or your account negotiates one |
+| **Rates** (`RATES`) | **Absent by default.** Loaded from the reader's `rates.json`, each entry requiring `source` and `as_of` | A vendor changes a price, or the reader's account negotiates one |
 
 Measured on a 680-session archive of Claude Code and Codex transcripts:
 
-- **embedding: 1.764 tokens/word** — Titan's own `inputTextTokenCount` over 40
-  random real chunks.
-- **enrichment: 2.020 input tokens/word, 1,048 output tokens/call** — Bedrock
-  `usage` over 15 real calls spanning the gate threshold to the largest session.
+- **embedding: 1.764 tokens/word** — the embedding provider's own reported
+  input-token count over 40 random real chunks.
+- **enrichment: 2.020 input tokens/word, 1,048 output tokens/call** — the text
+  provider's reported `usage` over 15 real calls spanning the gate threshold to
+  the largest session.
+
+These are properties of how transcripts tokenize, not of anyone's pricing, which
+is why they stay in the repo while prices do not.
 
 **Both are far above the familiar ~1.3 tokens/word.** That figure describes
 English prose; agent transcripts are dense with code, paths, identifiers and JSON.
@@ -57,28 +65,67 @@ Short sessions measure *worse* per word (2.52) than long ones (1.75), because ea
 call pays the ~700-token instruction block. The aggregate is the right figure for
 a corpus projection, and `calls` rather than `sessions` is what drives output cost.
 
-## Rates carry their own trustworthiness
+## Prices are not ours to declare
 
-Every rate has a `confidence`. A projection that depends on a `low` one is marked
-`~` in the printed output and lists the responsible model. This is not decoration:
-the Titan embedding rate here is a commonly published figure that **has not been
-verified** against an invoice or the AWS pricing page (fetching that page returned
-no usable Anthropic or Titan rows). Saying so is the difference between an
-estimate and a number that gets quoted.
+**Amended v2026.08.16.9.** The original design shipped a rate table with a
+`source` and a `confidence` per entry, on the reasoning that an attributed
+number beats an unattributed one. That is true and it was not enough.
 
-Two rates are `seat_licensed` rather than zero: local MLX embedding and Codex.
-Their marginal cost genuinely is nothing, but "free because there is no meter" and
-"zero because nobody priced it" must not render identically.
+A price in a source file is checked once, by one person, against one vendor's
+page, on one date — and then renders to two decimal places on somebody else's
+machine for as long as the file exists. Nothing watches it. The `as_of` field
+records when it was true without doing anything when it stops being true.
+
+It is also a claim about *the reader's* account that this process cannot see.
+Subscription, enterprise agreement, reseller and metered API access produce
+different real numbers for an identical call, and picking one is guessing about
+somebody's contract.
+
+The original table carried a third problem specific to this repo: it priced an
+`amazon.titan-embed-text-v2:0` that specs 005, 006 and 008 all place **outside**
+this distribution. The repo forbade the provider and shipped its price.
+
+So:
+
+- `RATES` ships **only** models that run on the reader's own machine, where the
+  zero is structural — nothing is billed per token because nothing leaves the
+  box. That is a statement about where inference happens, not a price.
+- Everything else is loaded from `rates.json` beside the archive, each entry
+  requiring `source` and `as_of`. A malformed entry is skipped, never defaulted:
+  defaulting a price is how a typo becomes a confident number.
+- A rate older than `STALE_AFTER_DAYS` (90) is named back to the reader as worth
+  re-checking. Refreshing them is an agent's job — it can read a pricing page,
+  which this process deliberately cannot.
+- `seat_licensed` may only come from the reader's file. Nothing shipped declares
+  how somebody pays for a hosted model.
+
+### Unpriced is a value, not a zero
+
+`StageCost.usd` is `float | None`, and `None` means *nobody has priced this*. The
+previous shape had no way to say that: an unknown model resolved to a zero-priced
+stand-in flagged only by `confidence: low`, so an unpriced stage rendered
+`$0.00` and read as "no charge" — the exact failure the module's own docstring
+warned about two screens above the code that did it.
+
+A total containing an unpriced stage is itself `None`. Summing the priced stages
+would understate the total by precisely the part nobody has checked, which is the
+wrong direction to be wrong in.
+
+### Every money figure says what kind of number it is
+
+`PRICING_CAVEAT` travels in the payload and is printed above the table: these are
+an understanding of **published list pricing** at the dates shown, not a quote.
+
+### Model ids still normalise
 
 `rate_for()` normalises platform prefixes and version suffixes, because the same
 model wears different ids per platform and **the ids are not internally
-consistent** — verified live: `us.anthropic.claude-sonnet-5` resolves while
-`us.anthropic.claude-haiku-4-5` does not, since Haiku requires the dated
-`us.anthropic.claude-haiku-4-5-20251001-v1:0`. A table keyed on exact ids would
-miss whichever form the caller holds, and a missed lookup projects **zero**, which
-is the worst available way to be wrong about money.
+consistent** — one platform resolves `…claude-sonnet-5` bare while requiring a
+dated `…claude-haiku-4-5-20251001-v1:0`. One `rates.json` entry therefore serves
+every platform reselling the same model, and a lookup cannot miss merely because
+the caller holds a different spelling.
 
-An unknown model resolves to `None` and is reported as unverified, never as free.
+An unknown model resolves to `None` and is reported as unpriced, never as free.
 
 ## Free stages are printed
 

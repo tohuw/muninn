@@ -129,10 +129,14 @@ COVERAGE_TARGET_PCT = 85.0
 # repo (tests/test_cost.py) fails if these values stop matching, which is the same
 # trade muninn/cost.py itself makes to mirror enrich's chunking constants.
 #
-# The ratios are measured, not assumed: Titan's own inputTextTokenCount over 40
-# real chunks, and Bedrock usage over 15 real enrichment calls spanning a corpus.
-# Both are far above the familiar ~1.3 tokens/word, which describes English prose
-# rather than transcripts dense with code, paths and JSON.
+# The ratios are measured, not assumed: the embedding provider's own reported
+# input-token count over 40 real chunks, and the text provider's reported usage
+# over 15 real enrichment calls spanning a corpus. Both are far above the
+# familiar ~1.3 tokens/word, which describes English prose rather than
+# transcripts dense with code, paths and JSON.
+#
+# These describe how transcripts *tokenize*, which is a property of the prose and
+# the tokenizer. That is why they are here and why prices are not.
 EMBED_TOKENS_PER_WORD = 1.764
 ENRICH_INPUT_TOKENS_PER_WORD = 2.020
 ENRICH_OUTPUT_TOKENS_PER_CALL = 1048
@@ -170,23 +174,18 @@ UNMETERED_OPERATIONS = [
 ASSUMED_SEARCHES_PER_MONTH = 100
 ASSUMED_DEEP_SHARE = 0.10
 
-# USD per 1M tokens. `confidence: low` marks a rate nobody here has verified
-# against an invoice; a projection that uses one says so in its output, because a
-# cost figure whose inputs cannot be ranked by trustworthiness gets quoted as
-# though all of it were measured.
-COST_RATES = {
-    "titan-embed": {"input": 0.02, "output": None, "confidence": "low",
-                    "source": "commonly published on-demand figure; not verified"},
-    "claude-haiku-4-5": {"input": 1.00, "output": 5.00, "confidence": "high",
-                         "source": "Anthropic first-party API rates"},
-    "claude-sonnet-5": {"input": 3.00, "output": 15.00, "confidence": "high",
-                        "source": "Anthropic first-party API rates"},
-    "seat-licensed-or-local": {"input": 0.0, "output": 0.0, "confidence": "high",
-                               "source": "local inference, or seat/subscription "
-                                         "access — no incremental charge. Seat "
-                                         "access still draws on a shared token "
-                                         "pool, so this is not the same as costless"},
-}
+# No prices live in this script, and that is deliberate.
+#
+# This file runs on a stranger's machine. A rate baked in here is a number the
+# author checked once, against one vendor's public page, for one billing
+# arrangement -- and it then renders to two decimal places on the machine of
+# somebody whose subscription, enterprise agreement or reseller makes it wrong.
+# It cannot be looked up from here either: this script is offline by design.
+#
+# So the report carries the *token volumes*, which are measured and true
+# everywhere, and whoever knows the applicable rates applies them. See
+# `cost_projection`.
+
 AGE_BUCKET_DAYS = 10
 
 PERCENTILES: tuple[int, ...] = (10, 25, 50, 75, 90, 95, 99)
@@ -272,11 +271,6 @@ def enrich_calls(words: int) -> int:
         return 0
     stride = max(ENRICH_CHUNK_WORDS - ENRICH_CHUNK_OVERLAP_WORDS, 1)
     return max(1, -(-words // stride))
-
-
-def _tokens_usd(rate: dict, input_tokens: float, output_tokens: float = 0.0) -> float:
-    return (input_tokens / 1_000_000 * rate["input"]
-            + output_tokens / 1_000_000 * (rate.get("output") or 0.0))
 
 
 def derive_enrichment_gate(word_counts: Sequence[int],
@@ -1237,18 +1231,16 @@ class Aggregator:
         me" arrives before the decision to install, and a number you can only get
         after installing is a number nobody asks for.
 
-        Two scenarios rather than one, because the honest answer depends on what a
-        person already has and this script cannot know:
+        **No dollar figures.** This script cannot know how the reader pays for a
+        model -- subscription, enterprise agreement, reseller and metered API
+        access all produce different real numbers for an identical call -- and it
+        is offline, so it cannot look a rate up either. It therefore reports the
+        token volumes a pass would consume, which are measured and true on every
+        machine, and leaves the multiplication to whoever knows the rates.
 
-        - ``seat_licensed_or_local`` — a local embedding model and a text model
-          reached through seat or subscription access, which carries no
-          *incremental* charge. Reported as $0.00, and that is deliberately not
-          called "free": seat access draws on a shared pool of tokens, so a reader
-          should not take it as unlimited.
-        - ``metered_titan_and_haiku`` — Bedrock Titan embeddings plus Claude Haiku
-          for enrichment: the path that bills per token.
-        - ``metered_titan_and_sonnet`` — the same, on a more expensive text model,
-          for the spread between fallback tiers.
+        Ingest, lexical search, correlate and the reports call no model at all,
+        so they consume no model capacity at any volume. That is a stronger
+        statement than "cheap" and it is listed rather than omitted.
 
         Privacy: every value below is a count, a token estimate or a dollar figure
         derived from them. No prose, no paths, no identifiers — the same contract
@@ -1310,54 +1302,6 @@ class Aggregator:
         median_chunks = (estimate_chunks(median_words) if median_words else 0)
 
         searches = ASSUMED_SEARCHES_PER_MONTH
-        deep_searches = int(searches * ASSUMED_DEEP_SHARE)
-
-        free = COST_RATES["seat-licensed-or-local"]
-        titan = COST_RATES["titan-embed"]
-        haiku = COST_RATES["claude-haiku-4-5"]
-        sonnet = COST_RATES["claude-sonnet-5"]
-
-        def scenario(embed_rate: dict, text_rate: dict) -> dict[str, Any]:
-            embed_usd = _tokens_usd(embed_rate, embed_tokens)
-            enrich_usd = _tokens_usd(text_rate, enrich_in, enrich_out)
-
-            # Ongoing: new sessions each month, plus query-time costs.
-            m_embed = _tokens_usd(embed_rate,
-                                  median_chunks * CHUNK_TARGET_WORDS
-                                  * EMBED_TOKENS_PER_WORD)
-            m_enrich = _tokens_usd(text_rate,
-                                   median_words * ENRICH_INPUT_TOKENS_PER_WORD,
-                                   median_calls * ENRICH_OUTPUT_TOKENS_PER_CALL)
-            m_semantic = _tokens_usd(embed_rate, searches * QUERY_TOKENS_PER_SEARCH)
-            m_deep = _tokens_usd(text_rate,
-                                 deep_searches * RERANK_INPUT_TOKENS_PER_SEARCH,
-                                 deep_searches * RERANK_OUTPUT_TOKENS_PER_SEARCH)
-            return {
-                "one_time": {
-                    "embed_usd": round(embed_usd, 4),
-                    "enrich_usd": round(enrich_usd, 4),
-                    "total_usd": round(embed_usd + enrich_usd, 4),
-                },
-                "ongoing_monthly": {
-                    "embed_new_sessions_usd": round(m_embed, 4),
-                    "enrich_new_sessions_usd": round(m_enrich, 4),
-                    "semantic_search_usd": round(m_semantic, 4),
-                    "deep_search_usd": round(m_deep, 4),
-                    "total_usd": round(m_embed + m_enrich + m_semantic + m_deep, 4),
-                },
-                "per_unit": {
-                    "usd_per_1000_sessions_enriched": round(
-                        (enrich_usd / above_sessions * 1000) if above_sessions else 0.0, 4),
-                    "usd_per_1m_words_embedded": round(
-                        (embed_usd / total_words * 1_000_000) if total_words else 0.0, 4),
-                    "usd_per_1000_semantic_searches": round(
-                        _tokens_usd(embed_rate, 1000 * QUERY_TOKENS_PER_SEARCH), 6),
-                    "usd_per_1000_deep_searches": round(
-                        _tokens_usd(text_rate,
-                                    1000 * RERANK_INPUT_TOKENS_PER_SEARCH,
-                                    1000 * RERANK_OUTPUT_TOKENS_PER_SEARCH), 4),
-                },
-            }
 
         return {
             "note": "One-time per session. Ingest, lexical search, correlate and "
@@ -1385,28 +1329,26 @@ class Aggregator:
                 "enrich_input_tokens": int(enrich_in),
                 "enrich_output_tokens": int(enrich_out),
             },
-            "rates_used": {"titan-embed": titan, "claude-haiku-4-5": haiku,
-                           "seat-licensed-or-local": free},
+            "pricing": {
+                "usd": None,
+                "why": "this script does not know your billing arrangement and "
+                       "cannot reach a pricing page; multiply the token volumes "
+                       "above by whatever rates apply to your account",
+            },
             "operations_calling_no_model": list(UNMETERED_OPERATIONS),
             "ongoing_basis": {
                 "complete_months_observed": complete_months,
                 "median_enrichable_sessions_per_month": median_sessions,
                 "median_enrichable_words_per_month": median_words,
+                "median_new_chunks_per_month": median_chunks,
+                "median_enrichment_calls_per_month": median_calls,
                 "assumed_searches_per_month": searches,
                 "assumed_deep_share": ASSUMED_DEEP_SHARE,
-                "note": "Session volume is measured from complete months only — the "
+                "note": "Session volume is measured from complete months only -- the "
                         "current partial month is excluded, and the median is used so "
                         "one heavy month does not set the expectation. Search volume "
                         "is a guess; this script cannot know how often you will search.",
             },
-            "scenarios": {
-                "seat_licensed_or_local": scenario(free, free),
-                "metered_titan_and_haiku": scenario(titan, haiku),
-                "metered_titan_and_sonnet": scenario(titan, sonnet),
-            },
-            "low_confidence_rates": sorted(
-                name for name, rate in COST_RATES.items()
-                if rate["confidence"] == "low"),
         }
 
 
@@ -1747,60 +1689,37 @@ def render_summary(report: dict[str, Any], out_path: Path | None) -> str:
             f"{inputs['conversation_words']:,} words")
         add("  Scope is human-provenance sessions only, so these counts are lower "
             "than `muninn survey`'s,")
-        add("  which also enriches subagent sessions. Same rates, wider corpus.")
+        add("  which also enriches subagent sessions. Same corpus rules, wider scope.")
         add("")
-        add("  seat_licensed_or_local shows $0.00 because seat or subscription access")
-        add("  carries no incremental charge. It still draws on a shared pool of tokens,")
-        add("  so read it as budgeted rather than unlimited.")
+        add("  No dollar figures: this script cannot see how you pay for a model, and")
+        add("  cannot reach a pricing page to look one up. Multiply the token volumes")
+        add("  below by whatever rates apply to your account.")
         add("")
-        add("  one-time backfill (embed the corpus, enrich what clears the gate)")
-        for name, scenario in cost["scenarios"].items():
-            mark = "~" if cost["low_confidence_rates"] and "metered" in name else " "
-            one = scenario["one_time"]
-            add(f"  {name:27}{mark}${one['total_usd']:>9,.2f}   "
-                f"embed {mark}${one['embed_usd']:.2f} + "
-                f"enrich {mark}${one['enrich_usd']:.2f}")
+        add(f"  embed          {inputs['embed_tokens']:>15,} tokens, one-time")
+        add(f"  enrich in      {inputs['enrich_input_tokens']:>15,} tokens, one-time")
+        add(f"  enrich out     {inputs['enrich_output_tokens']:>15,} tokens, one-time")
+        add(f"  enrich calls   {inputs['estimated_enrichment_calls']:>15,} "
+            f"over {inputs['above_gate_sessions']:,} sessions")
 
         basis = cost["ongoing_basis"]
         add("")
         if basis["complete_months_observed"]:
-            add(f"  ongoing, per month — {basis['median_enrichable_sessions_per_month']:,} "
-                f"new enrichable sessions/month "
+            add(f"  ongoing — {basis['median_enrichable_sessions_per_month']:,} new "
+                f"enrichable sessions/month "
                 f"(median of {basis['complete_months_observed']:,} complete months),")
+            add(f"  {basis['median_enrichable_words_per_month']:,} words, "
+                f"{basis['median_enrichment_calls_per_month']:,} enrichment calls, "
+                f"{basis['median_new_chunks_per_month']:,} new chunks")
             add(f"  plus an assumed {basis['assumed_searches_per_month']:,} searches/month, "
-                f"{basis['assumed_deep_share']:.0%} of them `--deep`")
-            for name, scenario in cost["scenarios"].items():
-                mark = "~" if cost["low_confidence_rates"] and "metered" in name else " "
-                ongoing = scenario["ongoing_monthly"]
-                add(f"  {name:27}{mark}${ongoing['total_usd']:>9,.2f}   "
-                    f"embed {mark}${ongoing['embed_new_sessions_usd']:.2f} + "
-                    f"enrich {mark}${ongoing['enrich_new_sessions_usd']:.2f} + "
-                    f"search {mark}${ongoing['semantic_search_usd'] + ongoing['deep_search_usd']:.2f}")
+                f"{basis['assumed_deep_share']:.0%} of them `--deep` (a guess)")
         else:
             add("  ongoing, per month: not estimated — no complete calendar month of "
                 "history yet.")
 
         add("")
-        add("  per unit, so you can rescale any of this yourself")
-        for name, scenario in cost["scenarios"].items():
-            mark = "~" if cost["low_confidence_rates"] and "metered" in name else " "
-            unit = scenario["per_unit"]
-            add(f"  {name:27}{mark}${unit['usd_per_1000_sessions_enriched']:>9,.2f} "
-                f"per 1,000 sessions enriched")
-            add(f"  {'':27}{mark}${unit['usd_per_1m_words_embedded']:>9,.2f} "
-                f"per 1M words embedded")
-            add(f"  {'':27}{mark}${unit['usd_per_1000_deep_searches']:>9,.2f} "
-                f"per 1,000 `--deep` searches "
-                f"({mark}${unit['usd_per_1000_semantic_searches']:.4f} per 1,000 plain "
-                f"`--semantic`)")
-
-        add("")
         add("  calls no model — consumes no model capacity at any volume:")
         for item in cost["operations_calling_no_model"]:
             add(f"    {item}")
-        if cost["low_confidence_rates"]:
-            add(f"  [~] depends on an unverified rate: "
-                f"{', '.join(cost['low_confidence_rates'])}")
 
     if report["anomalies"]:
         add("## Anomalies")

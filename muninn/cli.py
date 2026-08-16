@@ -712,7 +712,7 @@ def _print_survey(doc: dict, path: Path, *, wrote: bool) -> None:
     print(f"\n{'wrote' if wrote else 'would write'}  {path}")
 
 
-def _print_cost(cost: dict | None) -> None:
+def _print_cost(report: dict | None) -> None:
     """What a full pass over this corpus would cost, per stage.
 
     Stages that call no model are printed rather than filtered out. A cost table
@@ -726,30 +726,58 @@ def _print_cost(cost: dict | None) -> None:
     Rates are printed with their confidence, and a ``~`` marks any figure that
     depends on an unverified one. A projection whose inputs a reader cannot rank
     by trustworthiness will be quoted as though all of it were measured.
+
+    An **unpriced** stage prints its token volume and the word "unpriced" — never
+    a number. This project ships no rates, so that is the default state, and it
+    is the honest one: the volumes are measured here, the prices are not ours to
+    assert. See ``muninn/cost.py`` and ``rates.json``.
     """
-    if not cost:
+    if not report:
         return
-    print("\ncost estimate (model-side only; override rates for your account)")
-    priced = [s for s in cost["stages"] if s["usd"] or s["model"]]
-    unmetered = [s for s in cost["stages"] if not s["model"]]
+    print("\ncost estimate (model-side only)")
+    print(f"  {report.get('caveat', '')}")
+    # Split on *whether a model is involved*, not on whether a figure is
+    # present. Keying off ``usd`` put the no-model stages in both lists once an
+    # unpriced stage could carry ``None``.
+    priced = [s for s in report["stages"] if s["model"]]
+    unmetered = [s for s in report["stages"] if not s["model"]]
+
+    def money(value: float | None, mark: str) -> str:
+        return "  unpriced" if value is None else f"{mark}${value:>9,.2f}"
+
     for stage in priced:
         mark = "~" if stage["confidence"] == "low" else " "
-        seat = " (seat-licensed: no incremental charge; draws on shared capacity)" if (
-            stage["usd"] == 0 and stage["model"] and "seat" in stage["note"]) else ""
-        print(f"  {stage['stage']:20} {mark}${stage['usd']:>9,.2f}  "
-              f"{stage['model'] or ''}{seat}")
-        print(f"  {'':20}  {mark}${stage['per_unit_usd']:>9,.2f} per {stage['unit']}")
+        seat = " (you declared this seat-licensed: no incremental charge; draws "
+        seat += "on shared capacity)"
+        suffix = seat if (stage["usd"] == 0 and stage["model"]
+                          and "seat-licensed" in stage["note"]) else ""
+        print(f"  {stage['stage']:20} {money(stage['usd'], mark)}  "
+              f"{stage['model'] or ''}{suffix}")
+        if stage["usd"] is None:
+            volumes = ", ".join(f"{k}={v:,}" for k, v in stage["inputs"].items()
+                                if isinstance(v, int))
+            print(f"  {'':20}   {stage['unpriced_reason']} — measured: {volumes}")
+        else:
+            print(f"  {'':20}  {mark}${stage['per_unit_usd']:>9,.2f} "
+                  f"per {stage['unit']}")
     for stage in unmetered:
         print(f"  {stage['stage']:20}  {'no model':>10}  {stage['note']}")
-    print(f"  {'one-time total':20} {'~' if cost['low_confidence_models'] else ' '}"
-          f"${cost['one_time_usd']:>9,.2f}  embed + enrich, once per session")
-    print(f"  {'recurring':20} {'~' if cost['low_confidence_models'] else ' '}"
-          f"${cost['recurring_monthly_usd']:>9,.2f}/month  at "
-          f"{cost['assumptions']['searches_per_month']:,} searches, "
-          f"{cost['assumptions']['deep_share']:.0%} deep (a guess — yours will differ)")
-    if cost["low_confidence_models"]:
+    low = "~" if report["low_confidence_models"] else " "
+    print(f"  {'one-time total':20} {money(report['one_time_usd'], low)}"
+          f"  embed + enrich, once per session")
+    print(f"  {'recurring':20} {money(report['recurring_monthly_usd'], low)}"
+          f"/month  at {report['assumptions']['searches_per_month']:,} searches, "
+          f"{report['assumptions']['deep_share']:.0%} deep (a guess — yours will differ)")
+    if report["low_confidence_models"]:
         print(f"  [~] depends on an unverified rate: "
-              f"{', '.join(cost['low_confidence_models'])}")
+              f"{', '.join(report['low_confidence_models'])}")
+    if report.get("unpriced_models"):
+        print(f"  no rate on file for: {', '.join(report['unpriced_models'])}")
+        print("      ask your agent to look up current list pricing and write "
+              "rates.json beside the archive")
+    if report.get("stale_rates"):
+        print(f"  rates older than {cost.STALE_AFTER_DAYS} days, worth "
+              f"re-checking: {', '.join(report['stale_rates'])}")
 
 
 def cmd_embed(args: argparse.Namespace) -> int:
@@ -1353,8 +1381,19 @@ def _print_enrichment_section(st: store.Store, db: str) -> None:
               f"enrich unattended")
         print("              start it with `--enrich-metered` to allow that, or run "
               "`muninn enrich` yourself")
+    elif declared is not None:
+        # The provider said so; this line reports *that* and does not upgrade it
+        # into a claim about the reader's billing. The same model id on a
+        # subscription and on metered API access is one string at opposite ends
+        # of "does this cost anything", and only the provider knows which it is
+        # holding. Saying "carries no incremental charge" here asserted something
+        # about somebody's account that nothing in this process can see.
+        print(f"  auto        allowed — the {model} provider reports it does not "
+              f"bill per token")
+        print("              your own billing arrangement is not visible from "
+              "here; `muninn survey` projects list prices only")
     else:
-        print(f"  auto        allowed — {model} carries no incremental charge")
+        print(f"  auto        allowed — no per-token rate is on file for {model}")
 
 
 def _print_calibration_section(st: store.Store, db: str) -> None:
