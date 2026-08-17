@@ -210,6 +210,99 @@ class GateTest(_Archive):
         self.assertEqual(len(plan.candidates), 2)
 
 
+class StalenessTest(_Archive):
+    """Facets that outlive the prose they describe.
+
+    Spec 005 always said "absent or **stale**"; only "absent" was implemented,
+    so a session that kept growing kept the summary of its first hour forever.
+    Found on a real archive: three days of work carrying a topic that named only
+    the first day, with none of twelve probe terms from the later work appearing
+    anywhere in its facets — and 314 enriched sessions judged `ongoing`, which
+    means still open, which means still growing.
+
+    Worse than an empty summary, because an empty one is visibly empty while a
+    stale one reads as a complete account.
+    """
+
+    def _grow(self, sid: str, words: int) -> None:
+        """Extend a session's prose the way continued ingest would."""
+        body = "word " * words
+        self.st.conn.execute(
+            "UPDATE sessions SET text = ?, words = ? WHERE session_id = ?",
+            (body, len(body.split()), sid))
+        self.st.commit()
+
+    def _plan(self):
+        return enrich.plan(self.st, self.calibrate(claude=1000))
+
+    def test_a_session_that_grew_is_enriched_again(self):
+        sid = self.add(words=4_000)
+        self.st.set_facets(sid, Facets(topic="the first hour"))
+        self.st.commit()
+        self.assertEqual(self._plan().candidates, ())     # nothing changed yet
+
+        self._grow(sid, 40_000)
+        self.assertEqual([c.session_id for c in self._plan().candidates], [sid])
+
+    def test_a_trivial_addition_does_not_re_enrich(self):
+        """Otherwise every "thanks" costs a model call on a long session."""
+        sid = self.add(words=40_000)
+        self.st.set_facets(sid, Facets(topic="settled"))
+        self.st.commit()
+        self._grow(sid, 41_000)
+        self.assertEqual(self._plan().candidates, ())
+
+    def test_growth_must_clear_both_the_ratio_and_the_floor(self):
+        """A big session growing 3% is not stale; a tiny one doubling is."""
+        big = self.add(words=100_000)
+        self.st.set_facets(big, Facets(topic="big"))
+        self.st.commit()
+        self._grow(big, 103_000)                     # +3%, well over the floor
+        self.assertEqual(self._plan().candidates, ())
+
+        self._grow(big, 130_000)                     # +30%
+        self.assertEqual([c.session_id for c in self._plan().candidates], [big])
+
+    def test_enrichment_records_what_it_summarised(self):
+        sid = self.add(words=5_000)
+        self.st.set_facets(sid, Facets(topic="x"))
+        self.st.commit()
+        row = self.st.conn.execute(
+            "SELECT enriched_words, enriched_at FROM sessions WHERE session_id = ?",
+            (sid,)).fetchone()
+        self.assertEqual(row["enriched_words"], 5_000)
+        self.assertTrue(row["enriched_at"])
+
+    def test_re_enriching_moves_the_baseline(self):
+        """Or the same session is stale forever and re-enriched every pass."""
+        sid = self.add(words=4_000)
+        self.st.set_facets(sid, Facets(topic="first"))
+        self.st.commit()
+        self._grow(sid, 40_000)
+        self.assertEqual(len(self._plan().candidates), 1)
+
+        self.st.set_facets(sid, Facets(topic="second"))
+        self.st.commit()
+        self.assertEqual(self._plan().candidates, ())
+
+    def test_an_unknown_baseline_is_not_treated_as_stale(self):
+        """A pre-migration row knows nothing; re-deriving it all costs money."""
+        sid = self.add(words=4_000)
+        self.st.set_facets(sid, Facets(topic="legacy"))
+        self.st.conn.execute(
+            "UPDATE sessions SET enriched_words = NULL WHERE session_id = ?", (sid,))
+        self.st.commit()
+        self._grow(sid, 400_000)
+        self.assertEqual(self._plan().candidates, ())
+
+    def test_force_still_overrides_everything(self):
+        sid = self.add(words=4_000)
+        self.st.set_facets(sid, Facets(topic="settled"))
+        self.st.commit()
+        plan = enrich.plan(self.st, self.calibrate(claude=1000), force=True)
+        self.assertEqual([c.session_id for c in plan.candidates], [sid])
+
+
 # ── Criterion 5: redaction is a hard gate ─────────────────────────────────────
 
 class ShardTest(_Archive):

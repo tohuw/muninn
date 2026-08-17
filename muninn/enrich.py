@@ -86,6 +86,45 @@ def clears_floor(row: Any) -> bool:
     return bool(row["user_turns"]) and bool(row["assistant_turns"])
 
 
+#: How much a session must grow before its facets are re-derived. Both apply:
+#: the ratio stops a long session being re-summarised over a rounding error, and
+#: the floor stops a short one churning every time somebody says "thanks".
+RESTALE_RATIO = 0.25
+RESTALE_MIN_WORDS = 2_000
+
+
+def is_stale(row: Any) -> bool:
+    """Whether a session has outgrown the facets recorded for it.
+
+    **Spec 005 always said "absent or stale"; only "absent" was implemented.**
+    Enrichment skipped anything with a topic, forever, so a session that ran for
+    three days kept the summary of its first morning — confidently, with no
+    signal that anything was missing. That is worse than an empty summary: an
+    empty one is visibly empty, while a stale one reads as a complete account
+    and is wrong about everything that happened after it was written.
+
+    Measured on the archive this was found in: the session holding three days of
+    work carried a topic naming only its first day, and none of twelve probe
+    terms drawn from the later work appeared anywhere in its facets. 314
+    enriched sessions were judged ``ongoing`` — still open, therefore still
+    growing, therefore describing a snapshot.
+
+    A NULL ``enriched_words`` means the archive predates the column and no
+    baseline was ever taken. Not stale, because the honest answer is "unknown"
+    and re-deriving every legacy session to find out costs real money — see
+    ``store._add_missing_session_columns``.
+    """
+    try:
+        seen = row["enriched_words"]
+    except (IndexError, KeyError):
+        return False
+    if seen is None:
+        return False
+    words = row["words"] or 0
+    grown = words - seen
+    return grown >= RESTALE_MIN_WORDS and grown >= seen * RESTALE_RATIO
+
+
 #: The closed vocabulary for ``outcome``. It is indexed and drives ``--outcome``,
 #: so a free-text value would make the filter unusable — and a model asked for
 #: an open string will invent a new synonym every tenth session.
@@ -485,7 +524,7 @@ def plan(st: Store, calibration: dict[str, Any] | None, *,
 
     rows = st.conn.execute(
         f"SELECT session_id, source, provenance, words, topic, "
-        f"user_turns, assistant_turns "
+        f"user_turns, assistant_turns, enriched_words "
         f"FROM sessions WHERE {' AND '.join(where)} "
         f"ORDER BY words ASC, session_id", params).fetchall()
 
@@ -506,7 +545,7 @@ def plan(st: Store, calibration: dict[str, Any] | None, *,
         if not session_id and not clears_floor(row):
             skip("below-floor")
             continue
-        if row["topic"] and not force:
+        if row["topic"] and not force and not is_stale(row):
             skip("already-enriched")
             continue
         if shard is not None and shard_of(row["session_id"], shard[1]) != shard[0]:

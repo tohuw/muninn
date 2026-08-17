@@ -120,5 +120,78 @@ class OpenSerializationTests(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class AddedColumnsTest(unittest.TestCase):
+    """An archive created before a column existed must gain it on open.
+
+    `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so
+    every column added after archives were in the wild needs an ALTER. Getting
+    this wrong does not fail loudly -- it fails on the next query naming the
+    column, in whichever background worker happens to run first.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="muninn-alter-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.db = self.tmp / "old.db"
+
+    def _make_old_archive(self, **session) -> None:
+        """An archive whose sessions table predates the enrichment baseline."""
+        st = store.open_store(self.db)
+        row = {"session_id": "s1", "source": "claude", "provenance": "human",
+               "cwd": "/w/repo", "started_at": "2026-08-01T00:00:00Z",
+               "text": "prose", "words": 5_000, "user_turns": 2,
+               "assistant_turns": 2, "origin": "raw", "source_present": 1,
+               "tool_uses": 0, "tool_results": 0}
+        st.upsert_session(row | session)
+        st.commit()
+        st.close()
+        conn = sqlite3.connect(self.db)
+        for name, _ in store._ADDED_SESSION_COLUMNS:
+            conn.execute(f"ALTER TABLE sessions DROP COLUMN {name}")
+        conn.commit()
+        conn.close()
+
+    def test_the_columns_are_added_on_open(self) -> None:
+        self._make_old_archive()
+        st = store.open_store(self.db)
+        self.addCleanup(st.close)
+        present = {r["name"] for r in st.conn.execute("PRAGMA table_info(sessions)")}
+        for name, _ in store._ADDED_SESSION_COLUMNS:
+            self.assertIn(name, present)
+
+    def test_an_already_enriched_row_gets_a_baseline(self) -> None:
+        """Otherwise it can never be found stale, only re-enriched by force."""
+        self._make_old_archive()
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE sessions SET topic = 'known' WHERE session_id = 's1'")
+        conn.commit()
+        conn.close()
+
+        st = store.open_store(self.db)
+        self.addCleanup(st.close)
+        row = st.conn.execute(
+            "SELECT enriched_words FROM sessions WHERE session_id = 's1'").fetchone()
+        self.assertEqual(row["enriched_words"], 5_000)
+
+    def test_an_unenriched_row_gets_no_baseline(self) -> None:
+        """Never summarised, so there is nothing for a baseline to be of."""
+        self._make_old_archive()
+        st = store.open_store(self.db)
+        self.addCleanup(st.close)
+        row = st.conn.execute(
+            "SELECT enriched_words FROM sessions WHERE session_id = 's1'").fetchone()
+        self.assertIsNone(row["enriched_words"])
+
+    def test_opening_twice_is_harmless(self) -> None:
+        """This runs on every open, including the concurrent ones above."""
+        self._make_old_archive()
+        for _ in range(3):
+            store.open_store(self.db).close()
+        st = store.open_store(self.db)
+        self.addCleanup(st.close)
+        self.assertEqual(
+            st.conn.execute("SELECT COUNT(*) c FROM sessions").fetchone()["c"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -270,6 +270,42 @@ See [`derived-calibration`](../../.valholl/articles/derived-calibration.md),
 "The axis was wrong".
 
 
+## Staleness (v2026.08.17.1)
+
+This spec has always said selection covers facets that are "absent **or
+stale**". Only *absent* was ever implemented: `plan()` skipped anything with a
+non-null `topic`, permanently. A session that kept growing kept the summary of
+its first hour, and nothing anywhere could notice.
+
+That is worse than an empty summary. An empty one is visibly empty; a stale one
+reads as a complete, confident account of a session and is wrong about
+everything that happened after it was written. Found on a real archive: the
+session holding three days of work carried a topic naming only its first day,
+and **none of twelve probe terms** drawn from the later work appeared anywhere
+in its facets. 314 enriched sessions were judged `ongoing` — still open,
+therefore still growing, therefore describing a snapshot.
+
+`sessions` gains `enriched_at` and `enriched_words`. `set_facets` records both,
+reading the word count from the row so it can never disagree with the prose that
+was actually summarised. A session is stale when it has grown since — by at
+least `RESTALE_RATIO` (25%) **and** `RESTALE_MIN_WORDS` (2,000). Both, because
+the ratio alone churns on short sessions and the floor alone re-summarises a
+300,000-word session over a rounding error.
+
+**The migration states a baseline; it does not reconstruct history.** An archive
+predating these columns gets `enriched_words = words` for rows that already have
+facets — their present size, recorded as though that is what was summarised.
+For a session that already drifted this is untrue, and nothing on disk can
+recover the real number. The alternative, treating unknown as stale, re-derives
+every previously enriched session at real cost to learn something the archive
+does not know. So drift that happened *before* the column existed is not
+retroactively detectable, and `muninn enrich --force <id>` is the remedy for a
+session known to have drifted.
+
+A NULL baseline is therefore never stale, and re-enriching moves the baseline —
+without that, a stale session is re-enriched on every pass forever.
+
+
 ## Acceptance criteria
 
 `tests/test_enrich.py` — **no test may make a real LLM call**:

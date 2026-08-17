@@ -138,6 +138,15 @@ matches a basename or path; `--tool` matches a tool the session used (`Read`,
   sessions are enriched too. If you remember an older Muninn skipping them, that
   is fixed; only genuine stubs are `below-floor`.
 
+- **Facets describe a session as of when they were derived.** A long-running
+  session is re-enriched once it grows 25% past its last summary, so between
+  those points its `topic` and `summary` lag the tail of the conversation. For a
+  session still in progress — including the one you are in — read the facets as
+  a description of its earlier part, and go to `search` or `show` for what
+  happened most recently. Archives that predate this have no baseline recorded
+  and cannot report drift at all; `muninn enrich --force <id>` re-derives one
+  session when you know it has moved on.
+
   `muninn serve` enriches in the background (spec 018), but **only through a model
   that carries no incremental charge**. If the resolved provider bills per token the
   daemon refuses and names it, so a backlog that never shrinks is usually that

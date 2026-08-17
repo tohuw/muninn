@@ -72,7 +72,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     topic            TEXT,
     outcome          TEXT,
     summary          TEXT,
-    facets_json      TEXT
+    facets_json      TEXT,
+    -- When the facets above were derived, and how much prose they were derived
+    -- *from*. Without the second one there is no way to notice that a session
+    -- has grown since it was summarised, and a long-running session keeps
+    -- facets describing its first hour for the rest of its life.
+    enriched_at      TEXT,
+    enriched_words   INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source     ON sessions(source);
@@ -373,10 +379,14 @@ class Store:
         written to protect irreplaceable prose would read that as data loss and
         keep the stale three.
         """
+        # ``enriched_words`` is read from the row rather than passed in, so it
+        # can never disagree with the prose the caller actually summarised.
         self.conn.execute(
-            "UPDATE sessions SET topic = ?, outcome = ?, summary = ?, facets_json = ? "
+            "UPDATE sessions SET topic = ?, outcome = ?, summary = ?, "
+            "facets_json = ?, enriched_at = ?, enriched_words = words "
             "WHERE session_id = ?",
-            (facets.topic, facets.outcome, facets.summary, facets.to_json(), session_id),
+            (facets.topic, facets.outcome, facets.summary, facets.to_json(),
+             _now(), session_id),
         )
 
     def get_facets(self, session_id: str) -> dict[str, Any] | None:
@@ -941,7 +951,48 @@ def _connect_and_prepare(path: Path) -> sqlite3.Connection:
     # no data touched. Existing sessions, chunks, and ingest_state are
     # untouched by this call.
     conn.executescript(_LEDGER_SCHEMA)
+    _add_missing_session_columns(conn)
     return conn
+
+
+#: Columns added to ``sessions`` after archives existed in the wild. Every entry
+#: is applied with ``ALTER TABLE ... ADD COLUMN``, which SQLite does in constant
+#: time without rewriting the table, so this is safe to run on every open.
+#: ``CREATE TABLE IF NOT EXISTS`` cannot add a column to a table that already
+#: exists, which is why the schema above is not enough on its own.
+_ADDED_SESSION_COLUMNS = (
+    ("enriched_at", "enriched_at TEXT"),
+    ("enriched_words", "enriched_words INTEGER"),
+)
+
+
+def _add_missing_session_columns(conn: sqlite3.Connection) -> None:
+    """Bring an older archive's ``sessions`` table up to the current shape.
+
+    **The backfill states a baseline rather than reconstructing history.** A
+    session already carrying facets gets ``enriched_words = words``: its present
+    size, recorded as though that is what was summarised. For a session that has
+    grown since, that is not true, and nothing on disk can recover the number
+    that was. The alternative — leaving it NULL and treating unknown as stale —
+    would re-enrich every previously enriched session at real cost to say
+    something the archive does not know.
+
+    So drift that happened *before* this column existed is not retroactively
+    detectable, and `muninn enrich --force <id>` is how you fix a specific
+    session known to have drifted. Drift from here on is caught.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+    added = False
+    for name, ddl in _ADDED_SESSION_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE sessions ADD COLUMN {ddl}")
+            added = True
+    if added:
+        conn.execute(
+            "UPDATE sessions SET enriched_words = words, enriched_at = updated_at "
+            "WHERE topic IS NOT NULL AND TRIM(topic) != '' "
+            "  AND enriched_words IS NULL")
+        conn.commit()
 
 
 def open_store(path: str | Path) -> Store:
