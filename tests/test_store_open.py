@@ -135,20 +135,65 @@ class AddedColumnsTest(unittest.TestCase):
         self.db = self.tmp / "old.db"
 
     def _make_old_archive(self, **session) -> None:
-        """An archive whose sessions table predates the enrichment baseline."""
-        st = store.open_store(self.db)
+        """An archive whose sessions table predates the enrichment baseline.
+
+        The table is *built* without those columns rather than built and then
+        stripped. ``ALTER TABLE ... DROP COLUMN`` re-parses the stored schema
+        text, and dropping the last column leaves this schema's trailing
+        comment dangling: SQLite on Ubuntu refuses with "error in table
+        sessions after drop column: incomplete input", while the build bundled
+        with Windows Python accepts it. CI found that; the local suite could
+        not.
+
+        The column list is read from a real archive, so this cannot drift into
+        testing a shape the code no longer produces.
+        """
+        probe = self.tmp / "probe.db"
+        st = store.open_store(probe)
+        columns = [(r["name"], r["type"], r["notnull"], r["dflt_value"])
+                   for r in st.conn.execute("PRAGMA table_info(sessions)")]
+        st.close()
+
+        legacy = {name for name, _ in store._ADDED_SESSION_COLUMNS}
+        defs = []
+        for name, ctype, notnull, default in columns:
+            if name in legacy:
+                continue
+            piece = f"{name} {ctype or 'TEXT'}"
+            if name == "session_id":
+                piece += " PRIMARY KEY"
+            if notnull:
+                piece += " NOT NULL"
+            if default is not None:
+                piece += f" DEFAULT {default}"
+            defs.append(piece)
+
+        # Written with a bare connection, never `open_store`: opening is what
+        # runs the migration, so using it here would add the columns back
+        # before the test could observe them missing.
         row = {"session_id": "s1", "source": "claude", "provenance": "human",
                "cwd": "/w/repo", "started_at": "2026-08-01T00:00:00Z",
                "text": "prose", "words": 5_000, "user_turns": 2,
                "assistant_turns": 2, "origin": "raw", "source_present": 1,
                "tool_uses": 0, "tool_results": 0}
-        st.upsert_session(row | session)
-        st.commit()
-        st.close()
+        row.update(session)
+
         conn = sqlite3.connect(self.db)
-        for name, _ in store._ADDED_SESSION_COLUMNS:
-            conn.execute(f"ALTER TABLE sessions DROP COLUMN {name}")
+        conn.execute(f"CREATE TABLE sessions ({', '.join(defs)})")
+        names = [n for n in row if n in {c[0] for c in columns}]
+        conn.execute(
+            f"INSERT INTO sessions ({', '.join(names)}) "
+            f"VALUES ({', '.join('?' for _ in names)})",
+            [row[n] for n in names])
         conn.commit()
+
+        # Asserted in the fixture, not only in the tests: if this ever stops
+        # producing an old-shaped table, every test below would pass while
+        # exercising nothing at all, which is the failure mode a migration test
+        # can least afford.
+        present = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+        for name, _ in store._ADDED_SESSION_COLUMNS:
+            assert name not in present, f"fixture is not an old archive: {name}"
         conn.close()
 
     def test_the_columns_are_added_on_open(self) -> None:
