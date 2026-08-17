@@ -1921,10 +1921,11 @@ def build_parser() -> argparse.ArgumentParser:
         "recall", help="what the archive knows about where you are working",
         description="Takes a place rather than a question. Lists unfinished "
                     "threads, prior work in the same repository, and related "
-                    "work from other repositories. Defaults to wherever the "
-                    "most recent session was working. Calls no model.")
+                    "work from other repositories. Defaults to the current "
+                    "directory, falling back to wherever the most recent "
+                    "session was working. Calls no model.")
     p_recall.add_argument(
-        "--repo", help="repository to recall (default: the most recently active)")
+        "--repo", help="repository to recall (default: the current directory)")
     p_recall.add_argument("--limit", type=int, default=recall.DEFAULT_LIMIT,
                           help="entries per section")
     p_recall.add_argument("--provider", help="embedding provider name")

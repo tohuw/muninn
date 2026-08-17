@@ -101,15 +101,27 @@ uv run muninn doctor
 
 ### Agent access
 
-Agents should prefer an installed `muninn` command. A checkout is also a
-complete, no-global-install fallback:
+Agents should prefer an installed `muninn` command, and **installing it is
+worth doing**:
+
+```sh
+uv tool install --editable /path/to/muninn
+```
+
+An uninstalled CLI is indistinguishable from a missing feature. Observed
+behaviour: an agent runs `muninn search`, gets `command not found`, and greps
+the source instead — permanently, after one failure — which cannot answer a
+history question at all while returning something plausible enough that the
+substitution goes unnoticed.
+
+A checkout remains a complete, no-global-install fallback:
 
 ```sh
 uv run --directory /path/to/muninn muninn search "extension point"
 ```
 
-Use that form when an agent's shell cannot resolve `muninn`; it preserves the
-CLI as the archive boundary without changing the user's `PATH`.
+Use that form when changing `PATH` is not wanted; it preserves the CLI as the
+archive boundary either way.
 
 Coming from `claudex` or `codexdex`? `uv run muninn backfill` ingests their prose
 indexes — see [Superseding the predecessors](#superseding-the-predecessors).
@@ -295,8 +307,9 @@ first — which is the wrong shape for the most valuable thing an archive holds,
 because the material you most need is the material you have *forgotten you
 have*. You do not search for it, because you do not know it is there.
 
-`muninn recall` takes a repository instead, defaulting to wherever your most
-recent session was working, and reports three kinds of knowing:
+`muninn recall` takes a repository instead — where you are standing, falling
+back to wherever your most recent session was working when the archive has
+nothing on the current directory — and reports three kinds of knowing:
 
 - **Unfinished threads** — sessions enrichment judged `ongoing` or `abandoned`.
   Nothing else surfaces these, and they are the most actionable thing in the

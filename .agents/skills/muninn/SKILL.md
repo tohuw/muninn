@@ -64,10 +64,10 @@ is **not** always the best choice.
 Every other row above needs the question thought of first, which cannot reach
 the material the user has *forgotten they have* — they will not search for it,
 because they do not know it is there. `recall` takes a repository instead
-(defaulting to wherever the most recent session was working) and reports three
-things: **unfinished threads** (sessions enrichment judged `ongoing` or
-`abandoned`), **prior work** in that repo, and **related work from other
-repos** by embedding.
+(the current directory, falling back to the most recently active session when
+the archive has nothing on it) and reports three things: **unfinished threads**
+(sessions enrichment judged `ongoing` or `abandoned`), **prior work** in that
+repo, and **related work from other repos** by embedding.
 
 Use it when picking up work somewhere, before concluding the archive has
 nothing on a repository, and whenever the user asks a "where was I" shaped
