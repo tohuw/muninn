@@ -221,6 +221,28 @@ PATs, Slack tokens, `sk-ant-`/`sk-proj-`/`xai-`, JWTs, bearer tokens,
 This is a hard gate, not best-effort: a test must assert that a planted secret
 never appears in the text handed to the provider.
 
+**Added v2026.08.17.3: `secret-manager`.** Agents read credentials through
+`pass-cli`, `op`, `bw` and `vault kv get` precisely because the alternative is
+plaintext in a file, so that output arrives in transcripts by design. Proton
+Pass serialises a concealed field as `"Hidden": "<value>"`, which the assignment
+rule cannot see: it keys on a secret-ish *name*, and the `"name": "API Key"`
+line above it does not help because that character class allows `_` and `-` but
+not a space.
+
+A named rule rather than a wider name list, and that choice is the substance.
+Adding `hidden` to the assignment alternatives is the obvious fix and would
+misfire across a corpus of technical prose — the `:` branch does not consult
+`_secret_shaped`, so it would blank the next word after every "hidden cost:".
+Requiring JSON quoting *and* a whitespace-free value of real length keeps it
+narrow, and its own name means `counts` says why it fired.
+
+**Scope worth stating, because a reader will assume otherwise.** Redaction is
+the model boundary only; the archive stores prose verbatim. What limits exposure
+is that tool output never enters the archive at all — the parser keeps `text`
+blocks and discards `tool_result` content — so a credential read through a CLI
+is counted and dropped, while one typed or quoted into a message is stored. On
+the corpus this was found against, zero `"Hidden": "<opaque>"` fields existed.
+
 ## Build order
 
 1. `muninn/policy.py` + tests (pure logic, no provider).
