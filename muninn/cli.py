@@ -1250,12 +1250,27 @@ def cmd_install_agent(args: argparse.Namespace) -> int:
     ingests a different archive than the one the operator just named, which is
     the same failure as a redirected variable arriving by a different route.
     """
-    return agent_install.install(force=args.force, db=args.db)
+    result = agent_install.install(force=args.force, db=args.db)
+    if result == 0:
+        from . import app_bundle
+        try:
+            bundle = app_bundle.install()
+        except (OSError, RuntimeError) as exc:
+            print(f"muninn: application bundle not installed: {exc}", file=sys.stderr)
+            return 1
+        if bundle is not None:
+            print(f"application: {bundle}")
+    return result
 
 
 def cmd_uninstall_agent(args: argparse.Namespace) -> int:
     """Remove the login agent. Same exit-code discipline as install-agent."""
-    return agent_install.uninstall()
+    result = agent_install.uninstall()
+    if result == 0:
+        from . import app_bundle
+        if app_bundle.uninstall():
+            print(f"removed application: {app_bundle.bundle_path()}")
+    return result
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:

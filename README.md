@@ -198,6 +198,11 @@ uv run muninn install-agent      # macOS: a LaunchAgent; Linux: a systemd user u
 uv run muninn uninstall-agent    # removes it, and stops the daemon it supervises
 ```
 
+On macOS, `install-agent` also builds `~/Applications/Muninn.app`. It is a
+managed Finder/Spotlight entry for this checkout; it starts the same local
+service and is removed by `uninstall-agent`. Muninn refuses to replace an
+unrelated bundle at that path.
+
 The mechanism is the shared [`corvidae`](https://pypi.org/project/corvidae/)
 package, so Huginn and Muninn share one implementation rather than each carrying a
 copy. **Both ravens can be installed at once** — that is the point of a shared
