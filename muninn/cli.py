@@ -1308,6 +1308,36 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         for row in failures:
             print(f"  {row['source']:7} {row['category']:24} {row['count']:,}")
 
+        # The totals above are a rate; these are the sessions. Without them a
+        # reader is told sixteen things went wrong and given no way to find,
+        # re-run, or even confirm any of them — which is this repo's own rule
+        # about counts, broken where it mattered most.
+        recent = st.recent_failures(limit=8)
+        if not recent:
+            # Counted but not enumerated. Saying so distinguishes "the log is
+            # empty" from "the log is broken", and stops a reader hunting for
+            # sessions that were never recorded against these totals.
+            print("  (counted before failures were enumerated; the sessions "
+                  "behind these totals were not recorded)")
+        else:
+            print("\n  most recent, and whether the session recovered")
+            for row in recent:
+                if row["session_id"] is None:
+                    state = "no session recorded"
+                elif row["missing"]:
+                    state = "session no longer in the archive"
+                elif row["enriched"]:
+                    state = "since enriched — nothing to do"
+                else:
+                    state = "still unenriched — `muninn enrich <id> --force`"
+                sid = (row["session_id"] or "-")[:8]
+                print(f"    {str(row['at'])[:19]}  {row['source']:7} "
+                      f"{row['category']:16} {sid:8}  {state}")
+            unresolved = [r for r in recent
+                          if r["session_id"] and not r["enriched"] and not r["missing"]]
+            if not unresolved:
+                print("    every logged failure has since resolved on its own")
+
     print("\nimport ledger (last 5)")
     tail = st.ledger_tail(5)
     if not tail:

@@ -213,6 +213,14 @@ installed, so the fix is normally to wait, not to run `embed`.
   coverage and pending backlog, calibration drift, daemon state, model policy,
   installed plugins and which text provider is the declared default. Read this
   before diagnosing anything.
+
+  Its **parse failures** section gives both a lifetime total per category and
+  the recent failures by session id, each marked *since enriched* or *still
+  unenriched*. An enrichment failure writes no facets and is retried on the next
+  pass, so most resolve on their own — report the ones marked still-unenriched,
+  not the raw total, and re-run just those with `muninn enrich <id> --force`.
+  A total with no enumerated failures beneath it means they predate the log, not
+  that the log is broken; doctor says so explicitly.
 - `muninn survey` — measures the corpus, derives the enrichment gate, and
   **projects what each model-side stage would consume**, per stage and per unit.
   `--dry-run` computes without writing `calibration.json`.

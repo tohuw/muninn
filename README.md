@@ -244,6 +244,16 @@ a counted parse failure, never an exception. Parse-failure rates are reported so
 a format change shows up as a rising rate rather than as silently missing
 history.
 
+Failures are also **enumerated**, not only counted. A total can say *sixteen
+enrichment failures* and nothing more — the affected sessions cannot be found,
+re-run, or even confirmed to still be broken, so diagnosing one meant opening the
+SQLite file by hand. `muninn doctor` now names the recent ones and says whether
+each has since recovered, because an enrichment failure writes no facets and is
+retried on the next pass, so most heal on their own and reporting them all as
+outstanding sends you chasing finished work. Both records are kept: the totals
+are lifetime and answer "is this getting worse", the log is bounded and answers
+"which ones, and do I still care".
+
 ### The indexing pipeline
 
 Indexing runs in three layers, cheapest first, because the source deletes itself

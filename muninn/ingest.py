@@ -145,7 +145,8 @@ def _upsert_parsed(st: Store, parsed: sources.ParsedSession, path: Path, source:
     st.set_tools(parsed.session_id, parsed.tools)
 
     for category, count in parsed.failures.items():
-        st.record_parse_failure(source, category, count)
+        st.record_parse_failure(source, category, count,
+                                session_id=parsed.session_id)
 
     st.save_ingest_state(str(path), parsed.session_id, stat.st_size,
                          stat.st_mtime, offset, now)

@@ -33,6 +33,12 @@ from .receipt import Delta, Outcome, SourceFacts
 
 SCHEMA_VERSION = 3
 
+#: Enumerated failures kept per source. Large enough that a normal run's
+#: failures all survive to be acted on, small enough that a pathological ingest
+#: cannot grow the archive without bound. The lifetime totals live in
+#: ``parse_failures``, which is not trimmed.
+FAILURE_LOG_LIMIT = 500
+
 # Chunking defaults. Real values come from calibration; these are fallbacks so
 # the store works before a survey has ever run.
 DEFAULT_CHUNK_WORDS = 400
@@ -116,13 +122,37 @@ CREATE TABLE IF NOT EXISTS ingest_state (
     last_seen_at TEXT
 );
 
--- Parse failures by category (never message text).
+-- Parse failures by category (never message text). Lifetime totals, which is
+-- what makes "a rising rate suggests an upstream format change" answerable.
 CREATE TABLE IF NOT EXISTS parse_failures (
     source   TEXT NOT NULL,
     category TEXT NOT NULL,
     count    INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (source, category)
 );
+
+-- The same failures, enumerated. The table above can say *sixteen enrichment
+-- failures* and nothing more, so the affected sessions cannot be found, re-run,
+-- or even confirmed to still be broken — which is this repo's own stated rule
+-- (docs/specs/README.md: "a count cannot be audited after the fact") violated
+-- in the one place it matters most.
+--
+-- Bounded, because a bad ingest run can fail thousands of times and this is
+-- diagnostic rather than a record of account. The aggregate above keeps the
+-- lifetime totals that this deliberately cannot.
+--
+-- Still never message text: `category` is a closed vocabulary and `session_id`
+-- is an identifier the archive already holds.
+CREATE TABLE IF NOT EXISTS failure_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    at         TEXT NOT NULL,
+    source     TEXT NOT NULL,
+    category   TEXT NOT NULL,
+    count      INTEGER NOT NULL DEFAULT 1,
+    session_id TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_failure_log_source ON failure_log(source, id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
     session_id UNINDEXED,
@@ -315,12 +345,53 @@ class Store:
                 (session_id, tool, uses),
             )
 
-    def record_parse_failure(self, source: str, category: str, count: int = 1) -> None:
+    def record_parse_failure(self, source: str, category: str, count: int = 1,
+                             session_id: str | None = None) -> None:
+        """Count it, and record *which* one — the second half was missing.
+
+        Both, not one: the aggregate carries lifetime totals so a rising rate is
+        visible, and the log names the affected sessions so somebody can act on
+        them. Neither substitutes for the other, and having only the first meant
+        "16 enrichment failures" could not be traced to a single session.
+        """
         self.conn.execute(
             "INSERT INTO parse_failures (source, category, count) VALUES (?, ?, ?) "
             "ON CONFLICT(source, category) DO UPDATE SET count = count + excluded.count",
             (source, category, count),
         )
+        self.conn.execute(
+            "INSERT INTO failure_log (at, source, category, count, session_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (_now(), source, category, count, session_id),
+        )
+        # Trimmed against a high-water mark rather than by counting rows: one
+        # indexed delete per insert, and failures are rare enough that the cost
+        # never shows up. AUTOINCREMENT keeps ids monotonic, so subtracting from
+        # the maximum is a valid window even after earlier trims.
+        self.conn.execute(
+            "DELETE FROM failure_log WHERE source = ? AND id <= "
+            "(SELECT MAX(id) - ? FROM failure_log WHERE source = ?)",
+            (source, FAILURE_LOG_LIMIT, source),
+        )
+
+    def recent_failures(self, source: str | None = None,
+                        limit: int = 20) -> list[sqlite3.Row]:
+        """Recent failures, newest first, with whether the session recovered.
+
+        `enriched` answers the question that follows every failure report: an
+        enrichment failure writes no facets and is retried on the next pass, so
+        most of them heal on their own. Reporting them without saying which ones
+        already resolved sends somebody chasing work that is already done.
+        """
+        clause, params = ("", []) if source is None else (" WHERE f.source = ?", [source])
+        return self.conn.execute(
+            f"SELECT f.at, f.source, f.category, f.count, f.session_id, "
+            f"       (s.topic IS NOT NULL AND TRIM(s.topic) != '') AS enriched, "
+            f"       (s.session_id IS NULL) AS missing "
+            f"FROM failure_log f "
+            f"LEFT JOIN sessions s ON s.session_id = f.session_id"
+            f"{clause} ORDER BY f.id DESC LIMIT ?",
+            [*params, limit]).fetchall()
 
     def save_ingest_state(self, source_path: str, session_id: str | None,
                           size_bytes: int, mtime: float, offset_bytes: int,

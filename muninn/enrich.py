@@ -618,7 +618,8 @@ def enrich_sessions(st: Store, candidates: Iterable[Candidate],
         except EnrichmentFailed as exc:
             result.failed += 1
             result.failures[exc.category] = result.failures.get(exc.category, 0) + 1
-            st.record_parse_failure("enrich", exc.category)
+            st.record_parse_failure("enrich", exc.category,
+                                    session_id=candidate.session_id)
             st.commit()
             continue
         st.set_facets(candidate.session_id, facets)
