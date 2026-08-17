@@ -121,14 +121,35 @@ _SELECT = ("SELECT session_id, source, cwd, started_at, words, topic, outcome, s
            "FROM sessions")
 
 
-def current_repo(st: Store) -> str | None:
-    """The repository of the most recently active session, or None.
+def current_repo(st: Store, *, cwd: str | None = None) -> str | None:
+    """Where "here" is: the caller's own directory, else the newest session's.
 
-    Muninn's own ingest is the source here. It watches transcripts continuously,
-    so the newest one is the work in progress, and its ``cwd`` is where that
-    work is happening -- no other component has to be running and no credential
-    has to cross between ravens for this to be true.
+    **The caller's directory wins whenever the archive knows anything about
+    it.** Whoever ran this is standing somewhere, and that states what they mean
+    by "here" far better than a guess from ingest can. Ranking ingest first
+    produced exactly the confusion you would predict: ``muninn recall`` run
+    inside one repository answered about a different one, because an unrelated
+    session elsewhere had been written to a moment earlier.
+
+    The most-recent-session heuristic remains the fallback, for a caller with no
+    useful directory — a menu fetch, a home directory, a checkout the archive
+    has never seen. It is also why this asks Muninn's own ingest rather than
+    Huginn: the raven protocol forbids one raven presenting another's
+    credential, and the newest transcript answers it for free.
+
+    Note the asymmetry with ``why``, which refuses ``cwd`` outright. There it
+    would be *attribution* — claiming a session did work in a repository — and
+    an agent launched in one repo routinely edits another. Here it is only
+    intent, and a person's own location is the best evidence of that.
     """
+    here = os.path.basename(os.path.abspath(cwd or os.getcwd()).rstrip("/\\"))
+    if here:
+        clause, params = _repo_clause(here)
+        known = st.conn.execute(
+            f"SELECT 1 FROM sessions WHERE provenance IN (?, ?){clause} LIMIT 1",
+            (*RECALLABLE, *params)).fetchone()
+        if known:
+            return here
     row = st.conn.execute(
         f"{_SELECT} WHERE provenance IN (?, ?) AND cwd IS NOT NULL AND cwd != '' "
         "ORDER BY started_at DESC LIMIT 1", RECALLABLE).fetchone()

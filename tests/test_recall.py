@@ -50,7 +50,25 @@ class RecallTests(unittest.TestCase):
         """
         _session(self.st, "a", cwd="/w/old", started="2026-01-01T00:00:00Z")
         _session(self.st, "b", cwd="/w/current", started="2026-08-01T00:00:00Z")
-        self.assertEqual(recall.current_repo(self.st), "current")
+        self.assertEqual(recall.current_repo(self.st, cwd="/nowhere/unknown"),
+                         "current")
+
+    def test_where_the_caller_is_standing_beats_the_newest_session(self):
+        """Observed: `recall` inside one repo answered about a different one.
+
+        An unrelated session elsewhere had been written to a moment earlier, and
+        ingest-recency outranked the caller's own location. Whoever ran the
+        command is standing somewhere; that is what they mean by "here".
+        """
+        _session(self.st, "here", cwd="/w/roost", started="2026-01-01T00:00:00Z")
+        _session(self.st, "elsewhere", cwd="/w/sims4", started="2026-08-01T00:00:00Z")
+        self.assertEqual(recall.current_repo(self.st, cwd="/w/roost"), "roost")
+
+    def test_a_directory_the_archive_has_never_seen_falls_back(self):
+        """Otherwise standing in an unindexed checkout reports nothing at all."""
+        _session(self.st, "b", cwd="/w/known", started="2026-08-01T00:00:00Z")
+        self.assertEqual(recall.current_repo(self.st, cwd="/tmp/brand-new"),
+                         "known")
 
     def test_tool_invoked_work_is_not_where_you_are_working(self):
         """A `claude -p` byproduct is not a place a person is sitting."""
