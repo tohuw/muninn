@@ -28,6 +28,7 @@ wiki wins and the contradiction is a bug worth reporting.
 | [017 — Menu lifecycle actions](017-menu-lifecycle-actions.md) | implemented | 009, 010 |
 | [018 — Automatic enrichment](018-automatic-enrichment.md) | implemented | 014, 016, 011, 005 |
 | [019 — `muninn recall`](019-recall.md) | implemented | 005, 006, 009 |
+| [020 — `muninn why`](020-why.md) | implemented | 005, 019 |
 
 Specs 002 and 003 both modify `muninn/cli.py`, as do 004, 005, 010 and 011. Run
 overlapping specs sequentially, or in separate git worktrees, so they cannot
@@ -76,6 +77,13 @@ first consumer of `outcome` beyond a filter flag. It depends on 005 in a way the
 others do not: with enrichment unrun its main section is not merely empty but
 *unknowable*, which is why the payload distinguishes the two silences rather
 than leaving a caller to infer one.
+
+Spec 020 joins the archive to git: `git blame` answers who and when, and the
+reasoning that produced a line lives in a conversation. It is the second path
+after 019 to take a *thing* rather than a question, and it records two
+measurements worth reading before writing anything that attributes work to a
+session — session lifetimes span four orders of magnitude, and `cwd` is not the
+repository.
 
 Later phases not yet spec'd: the console, the agent skill, and the Cisco
 distribution's plugins.

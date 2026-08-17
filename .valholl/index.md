@@ -2,7 +2,7 @@
 okf_version: "0.1"
 title: "Muninn knowledge base"
 description: "Architecture, durability, ingest, calibration, and governance knowledge for Muninn."
-updated: "2026-08-16"
+updated: "2026-08-17"
 ---
 
 # Muninn knowledge base
@@ -34,6 +34,7 @@ the code does.
 
 ## Retrieval
 
+- [Decisions outlive diffs](articles/decisions-outlive-diffs.md) — version control keeps what changed and discards why; joining git to the conversations that produced it, and the two measurements that bound the join
 - [Retrieval that is not asked](articles/retrieval-that-is-not-asked.md) — every query interface is blind to what you have forgotten you have; why `recall` takes a place instead of a question, and why a surface that speaks unprompted has to be silent by default
 
 ## Data model

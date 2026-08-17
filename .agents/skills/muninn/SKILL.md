@@ -1,6 +1,6 @@
 ---
 name: muninn
-description: Search, inspect, correlate, recall, resume and report on archived Claude and Codex sessions through Muninn. Use for questions about past agent work, decisions, transcripts, prior outcomes, what a session cost, archive health, or recovering a previous session; also when starting work in a repository and asking what is already known about it or what was left unfinished there; prefer this skill over reading raw transcript files or Muninn's SQLite archive.
+description: Search, inspect, correlate, recall, resume and report on archived Claude and Codex sessions through Muninn, and explain why a file is the way it is by joining its git history to the sessions that wrote it. Use for questions about past agent work, decisions, transcripts, prior outcomes, what a session cost, archive health, or recovering a previous session; also when starting work in a repository and asking what is already known about it or what was left unfinished there, or when asking why a piece of code, a file or a commit is the way it is; prefer this skill over reading raw transcript files or Muninn's SQLite archive.
 ---
 
 # Muninn
@@ -42,6 +42,7 @@ is **not** always the best choice.
 | "Show me that session" | `muninn show <id-prefix>` | Full session; id prefixes are fine |
 | "Reopen it" | `muninn resume <id-prefix>` | Prints (or `--exec` runs) the right vendor command |
 | "What was I doing here?", "where did I leave off?", or **no question at all — you are starting work in a repo** | `muninn recall [--repo <name>]` | Takes a *place* instead of a query; calls no model |
+| "Why is this code like this?", "what was this change for?", anything a `git blame` prompts | `muninn why <path>` | Joins the file's commits to the sessions that wrote them; calls no model |
 
 ### `recall` is the one that does not wait to be asked
 
@@ -65,6 +66,36 @@ judged", so it reports which in an `unavailable` map. Read that before saying
 the user has no loose ends — otherwise you are telling them their work is
 tidied up when nothing has looked. `related` is `unavailable` in the same way
 when no embedding provider is installed.
+
+### `muninn why` for anything a `git blame` would prompt
+
+Reach for it whenever the question is why code is the way it is, why a change
+was made, or what a commit was really about. It walks the file's recent commits
+and names the session live when each landed, with that session's topic, outcome
+and decisions — the reasoning git never kept.
+
+Three answers it gives that you must relay rather than smooth over:
+
+- **"no session was open when this landed"** — plenty of commits are written by
+  hand. Report it as a fact, not as a tool failure.
+- **the `uncommitted` list** — sessions that edited the file and committed
+  nothing: exploration, a reverted attempt, work still in the tree. Frequently
+  the half that explains the shape of what did land.
+- **`unavailable`** — outside a git work tree, or no file records for the path.
+  File lists come from an agent's own tool calls, so anything edited by hand
+  leaves none, and absence of records is not absence of history.
+
+Attribution carries a `confidence` of `touched-this-file` or
+`touched-this-repo`. Say which. A session that worked elsewhere in the repo is a
+weaker claim than one that edited the file, and presenting both as "the session
+that made this change" overstates what the archive knows.
+
+**Do not fall back to matching sessions by `cwd`** when `why` returns little.
+`cwd` is where an agent was launched, not where the work landed — on the corpus
+this was built against, *zero* sessions had a `cwd` under a repository whose
+entire recent history they had written. The same caveat applies to `--repo`
+filters and `recall`'s scoping: work done in one repo from a shell rooted in
+another is filed under the wrong name.
 
 `correlate` still needs an embedding provider *installed* and the archive
 embedded, even though it makes no model call — it reads the provider's model id as
@@ -121,7 +152,7 @@ the human tables.
 
 | Command | `--json` | `--dry-run` |
 |---|---|---|
-| `search`, `log`, `correlate`, `recall`, `resume`, `index`, `import`, `backfill`, `survey`, `enrich` | yes | `survey`, `enrich`, `embed` |
+| `search`, `log`, `correlate`, `recall`, `why`, `resume`, `index`, `import`, `backfill`, `survey`, `enrich` | yes | `survey`, `enrich`, `embed` |
 | `show`, `doctor`, `embed` | no — human output only | — |
 
 **`enrich --json` performs the enrichment** and returns a receipt (`enriched`,
@@ -204,7 +235,7 @@ access carries no *incremental* charge but draws on a shared pool of tokens, so
 "free" invites treating a shared budget as unlimited. Say "no incremental charge"
 for access the user has told you is seat-licensed, and "calls no model" for the
 stages that never reach one. Most of Muninn is the latter: ingest, lexical
-search, `log`, `show`, `resume`, `correlate`, `recall`, `doctor` and `survey`
+search, `log`, `show`, `resume`, `correlate`, `recall`, `why`, `doctor` and `survey`
 call no model at all. Embedding through a local model is a third case — it
 consumes nothing shared, because nothing leaves the machine.
 

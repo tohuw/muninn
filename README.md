@@ -75,6 +75,9 @@ uv run muninn log --since 2026-07
 uv run muninn recall
 uv run muninn recall --repo cyberwise
 
+# Why is this file the way it is? Its commits, and the work behind each one.
+uv run muninn why src/auth.py
+
 # Read one session in full (id prefixes are fine).
 uv run muninn show a7efca23
 
@@ -313,6 +316,43 @@ reassuring row is how a menu teaches people to stop reading it.
 Muninn works out where "now" is from its own ingest rather than by asking
 Huginn: the raven protocol forbids one raven presenting another's credential,
 and the most recently written session is a good enough answer for free.
+
+### `git blame` answers who; this answers why
+
+`muninn why <file>` walks the commits touching a file and, for each one, names
+the session that was live when it landed — with what that session was about,
+what it decided, and how it ended.
+
+The reasoning behind a line of code happened in a conversation. Git kept the
+result and threw away the argument; this archive kept the argument. Joining them
+is the only place either becomes an answer to *"why on earth is it done this
+way?"*
+
+Attribution is by **time overlap**, and it is bounded on purpose. A session must
+have actually touched the file, or something else in the same repository, before
+it is offered as an explanation. An earlier version also offered any session
+merely *open* at the time, which sounds reasonable and measured terribly:
+session length spans four orders of magnitude on a real corpus — a 12-minute
+median against a 27-day 95th percentile — so a session parked for a month
+overlaps every commit made that month. At one arbitrary commit instant, eight
+sessions were "open". The first live run put three Cyberpunk-modding sessions
+under a change to the cost module.
+
+Two things it will tell you that git cannot:
+
+- **Work with no commit behind it** — exploration, a reverted attempt, or
+  changes still in the tree. Invisible to git by construction, and often the
+  half that explains the shape of what did land.
+- **Nothing at all**, plainly, when a commit has no conversation behind it.
+  Plenty of commits are written by hand, and saying so beats an empty section
+  that reads like a failure.
+
+Matching uses the repository-relative path *including the repo's own directory
+name*, so a checkout at a different root — another machine, another platform —
+still lines up, while a same-named file in an unrelated project does not get
+somebody else's decisions filed under it.
+
+Calls no model: it is git plus SQL.
 
 ### Thresholds are derived, never hard-coded
 

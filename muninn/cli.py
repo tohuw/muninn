@@ -32,6 +32,7 @@ from . import (
     store,
     survey,
 )
+from . import why as why_module
 from .hooks import install as hooks_install
 from .paths import DB_PATH, QUEUE_DIR, STATE_DIR, default_roots
 from .plugins import discover_plugins
@@ -670,6 +671,57 @@ def _first_line(text: str | None) -> str | None:
         return None
     lines = str(text).splitlines()
     return lines[0].strip() if lines else None
+
+
+_CONFIDENCE_NOTE = {
+    why_module.TOUCHED_FILE: "edited this file",
+    why_module.TOUCHED_REPO: "worked in this repo",
+}
+
+
+def cmd_why(args: argparse.Namespace) -> int:
+    """Why a file is the way it is (why.py).
+
+    `git blame` answers who and when. The reasoning lives in a conversation,
+    and this is the only place that holds both.
+    """
+    st = store.open_store(args.db)
+    try:
+        found = why_module.explain(st, args.path, limit=args.limit)
+    finally:
+        st.close()
+
+    if args.json:
+        print(json.dumps(found.to_dict()))
+        return 0
+
+    print(f"why {found.path} is the way it is\n")
+    for change in found.changes:
+        print(f"{change.when[:10]}  {change.sha[:8]}  {change.subject[:60]}")
+        if not change.sessions:
+            # Said out loud. A silent gap reads as "the tool found nothing",
+            # when the true answer is usually "a person wrote this by hand".
+            print("          no session was open when this landed")
+        for session in change.sessions:
+            note = _CONFIDENCE_NOTE.get(session.confidence, session.confidence)
+            label = session.topic or _first_line(session.summary) or session.source
+            print(f"          {session.session_id[:8]}  ({note})  {str(label)[:52]}")
+            if session.outcome:
+                print(f"                    outcome: {session.outcome}")
+            for decision in session.decisions[:args.decisions]:
+                print(f"                    · {decision[:70]}")
+        print()
+
+    if found.uncommitted:
+        print("edited this file, but committed nothing — exploration, a reverted")
+        print("attempt, or work still in the tree:\n")
+        for session in found.uncommitted:
+            label = session.topic or _first_line(session.summary) or session.source
+            print(f"  {session.session_id[:8]}  {str(label)[:66]}")
+        print()
+    for reason in found.unavailable.values():
+        print(f"note: {reason}")
+    return 0
 
 
 def _print_survey(doc: dict, path: Path, *, wrote: bool) -> None:
@@ -1878,6 +1930,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_recall.add_argument("--provider", help="embedding provider name")
     p_recall.add_argument("--json", action="store_true")
     p_recall.set_defaults(func=cmd_recall)
+
+    p_why = sub.add_parser(
+        "why", help="why a file is the way it is: its commits, and the work behind them",
+        description="git blame answers who and when. This answers why: each "
+                    "recent commit touching the file, matched to the session "
+                    "that was live when it landed, with what that session was "
+                    "about and what it decided. Calls no model.")
+    p_why.add_argument("path", help="file to explain")
+    p_why.add_argument("--limit", type=int, default=why_module.DEFAULT_COMMITS,
+                       help="how many commits back to walk")
+    p_why.add_argument("--decisions", type=int, default=3,
+                       help="decisions to print per session")
+    p_why.add_argument("--json", action="store_true")
+    p_why.set_defaults(func=cmd_why)
 
     p_show = sub.add_parser("show", help="print one session (id prefixes are fine)")
     p_show.add_argument("session_id")
