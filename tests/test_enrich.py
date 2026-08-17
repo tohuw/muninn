@@ -442,6 +442,47 @@ class RedactionTest(_Archive):
         self.assertIn("null", cleaned)
         self.assertIn("changeme", cleaned)
 
+    def test_a_secret_manager_concealed_field_is_redacted(self) -> None:
+        """The gap a real leak found, reported from a session in another repo.
+
+        An agent read a vault item with `pass-cli item view --output json`.
+        Proton Pass serialises a concealed field as `"Hidden": "<value>"`, and
+        the catch-all keys on a secret-ish *name* -- password, api_key, token --
+        which "Hidden" is not. The `"name": "API Key"` line directly above it
+        does not rescue it either: that character class allows `_` and `-` but
+        not a space, so `API Key` never matches the api-key alternative.
+
+        Same-shape fake, never a real value.
+        """
+        fake = "3gia06JIPKYj4AudEI0NcQgNYZL5kMpjWfBpPPBygP4M--Cs0vswJUs4Bk678O=="
+        cleaned, counts = redact.redact(f'            "Hidden": "{fake}"')
+        self.assertNotIn(fake, cleaned)
+        self.assertEqual(counts.get("secret-manager"), 1)
+
+    def test_a_concealed_field_holding_a_flag_is_left_alone(self) -> None:
+        """`"hidden": true` in a config dump is not a credential.
+
+        This is why the fix is a named rule requiring JSON quoting and a
+        whitespace-free value of real length, rather than adding `hidden` to the
+        catch-all's name list -- which would have blanked the next word after
+        every "hidden cost:" in the corpus.
+        """
+        cleaned, counts = redact.redact('"hidden": "true"')
+        self.assertIn("true", cleaned)
+        self.assertNotIn("secret-manager", counts)
+
+    def test_ordinary_prose_about_hidden_things_survives(self) -> None:
+        text = "the hidden cost: about forty hours of rework"
+        cleaned, counts = redact.redact(text)
+        self.assertEqual(cleaned, text)
+        self.assertEqual(counts, {})
+
+    def test_the_rule_is_named_for_what_it_found(self) -> None:
+        """`counts` is the only thing a caller may report, so it must say why."""
+        fake = "Xk39fJqL2mNp8QrS5tUvWxYz01234567"
+        _, counts = redact.redact(f'"concealed": "{fake}"')
+        self.assertEqual(list(counts), ["secret-manager"])
+
     def test_redaction_counts_name_kinds_never_values(self) -> None:
         _, counts = redact.redact("sk-ant-api03-SECRETSECRETSECRETSECRET")
         self.assertEqual(list(counts), ["anthropic-key"])

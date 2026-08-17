@@ -305,6 +305,19 @@ session 16× shorter, which in turn produced wrong retention estimates, wrong
 growth rates, and a badly mis-tuned enrichment threshold. Every statistic Muninn
 reports is scoped to a provenance class.
 
+**The archive stores transcripts verbatim, secrets included.** Redaction runs at
+the model boundary — enrichment, and `--deep` rerank — never on ingest, because a
+redacting ingest would destroy the only surviving copy of a session to protect a
+credential the vendor already wrote to the same disk in plaintext. Do not read
+the archive as a sanitising layer; it is a system of record.
+
+Two things bound that in practice. **Tool output never enters the archive** —
+only user and assistant prose does — so a credential read through a secret
+manager is counted and its content discarded; one typed or quoted into a message
+is stored. And if a credential does land in a transcript, **rotate it**: the
+value would sit in the vendor's `.jsonl`, the archive and the FTS index, and
+regenerating it invalidates all three at once, which scrubbing cannot.
+
 The archive-of-record guarantee covers human and subagent sessions.
 Tool-invoked prose is prunable — it is a reproducible byproduct of some other
 tool's call volume.

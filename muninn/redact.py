@@ -74,6 +74,29 @@ _RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("stripe-key", re.compile(r"\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}\b")),
     ("npm-token", re.compile(r"\bnpm_[A-Za-z0-9]{30,}\b")),
 
+    # -- secret-manager CLI output -----------------------------------------
+    # Agents read credentials through `pass-cli`, `op`, `bw`, `vault kv get`
+    # precisely *because* the alternative is plaintext in a file, so this shape
+    # arrives in transcripts by design rather than by accident, and it is
+    # growing. Reported under its own name because "assignment" would say
+    # nothing about why it fired.
+    #
+    # Found from a real leak: Proton Pass serialises a concealed field as
+    # ``"Hidden": "<value>"``. The catch-all below keys on a secret-ish *name*
+    # — `password`, `api_key`, `token` — and "Hidden" is none of those. Nor did
+    # the ``"name": "API Key"`` line above it help: that class allows `_` and
+    # `-` but not a space, so `API Key` does not match `api[_\-]?key`.
+    #
+    # Not solved by adding `hidden` to that name list, which was the obvious
+    # move: `hidden` appears constantly in ordinary technical prose ("hidden
+    # files", "hidden cost:") and the catch-all's `:` branch does not consult
+    # :func:`_secret_shaped`, so it would blank the next word in a sentence.
+    # Requiring JSON quoting *and* a whitespace-free value of real length is
+    # what keeps this narrow enough to be safe.
+    ("secret-manager", re.compile(
+        r"(?i)\"(?:hidden|concealed|totp|otp[_\-]?secret|credential)\"\s*:\s*"
+        r"\"[^\s\"]{12,}\"")),
+
     # -- structured credentials --------------------------------------------
     # A JWT is three base64url segments; the leading `eyJ` is the encoded `{"`.
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b")),
