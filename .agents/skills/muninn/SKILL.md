@@ -23,6 +23,21 @@ immediately from a checkout without mutating the user's shell configuration or
 installing a global tool. Do not substitute direct archive/database access just
 because the bare shell command is unavailable.
 
+**One `command not found` is not a reason to fall back to grep**, and in
+practice it has been the main one. An uninstalled CLI looks identical to a
+missing feature, so the reflex after a single failure is to grep the code
+instead — which cannot answer a history question at all, and returns something
+plausible enough that nobody notices the substitution. If the command is
+genuinely absent, the fix is one line, worth suggesting rather than working
+around:
+
+```sh
+uv tool install --editable <muninn-checkout>
+```
+
+The skill directory is usually a link into that checkout, so its own path
+resolves to the answer.
+
 An internal distribution may wrap this as a different binary (for example
 `muninn-cisco`), with the same subcommands. If `muninn` is missing, check for such
 a wrapper before reporting the tool unavailable.
