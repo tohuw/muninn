@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import plistlib
 import tempfile
 import unittest
@@ -19,7 +20,14 @@ class ApplicationBundleTest(unittest.TestCase):
             with (bundle / "Contents" / "Info.plist").open("rb") as stream:
                 self.assertEqual(plistlib.load(stream)["CFBundleIdentifier"], app_bundle.BUNDLE_ID)
             launcher = bundle / "Contents" / "MacOS" / "Muninn"
-            self.assertTrue(launcher.stat().st_mode & 0o111)
+            # The bundle is a macOS artefact and the test fakes `sys.platform`
+            # to build one anywhere, but the *filesystem* is not faked: NTFS has
+            # no POSIX execute bit, so `chmod` cannot set one and this assertion
+            # failed on every Windows run. Everything else here is
+            # platform-independent and worth checking on Windows, so the guard is
+            # on the one assertion rather than on the whole test.
+            if os.name != "nt":
+                self.assertTrue(launcher.stat().st_mode & 0o111)
             self.assertIn("muninn.cli serve", launcher.read_text())
             self.assertTrue(app_bundle.uninstall())
             self.assertFalse(bundle.exists())
