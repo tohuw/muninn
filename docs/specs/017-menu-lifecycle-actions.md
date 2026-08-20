@@ -105,6 +105,13 @@ a failure and start racing the process that is already coming back.
 
 ## Security: the token decision, revisited and unchanged
 
+**Amended by 021, for POSIX only: the browser-threat argument two paragraphs
+down no longer applies, because there is no `Host`/`Origin` to check on a Unix
+socket — but the conclusion (no token) is re-derived there on different
+grounds, not carried over unexamined.** Windows gained a token this section
+did not anticipate, for reasons specific to that platform's named-pipe ACLs
+rather than to what these two actions do; see 021.
+
 009 required that the token decision be reopened in the same change that added an
 action. It is, here, and the answer is the same — for one reason specific to these
 two actions:
@@ -155,12 +162,18 @@ indexer its ingest".
 5. POST: valid id → 200; refused action → 409 (not 200 with `ok:false`); malformed
    or absent body → 400 with a reason; over the cap → 413 without reaching the
    parser; wrong path → 404; guards run before routing; a raising handler → 500,
-   never a dropped connection.
+   never a dropped connection. **Amended by 021:** "POST"/status codes are the
+   HTTP-era shape; the current transport reports the same outcomes as
+   `{"ok": true/false, ...}` in the reply body, not as a status code, and there
+   is no "wrong path" to 404 on a transport with no URL space.
 6. Live process: the Quit row leaves neither the descriptor nor the state file
    behind, and the reply arrives before the process goes away.
 7. Live process: the Restart row comes back on a **new** port with the same pid, a
    republished descriptor that names the new port, and a daemon that still stops
-   cleanly on SIGTERM afterwards.
+   cleanly on SIGTERM afterwards. **Amended by 021:** "new port" was true of an
+   ephemeral TCP port; the current address (a fixed socket/pipe name) is the
+   *same* across a restart by design, and it is the descriptor's `pid`/`started`
+   that prove a genuine restart happened rather than a rebind at a new address.
 8. `install_termination_handlers` clears the in-teardown flag, so a restarted
    daemon is still stoppable by signal.
 9. The restart sentinel never reaches a shell as an exit code.

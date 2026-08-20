@@ -32,11 +32,13 @@ the menubar reflects that:
   raven knows the other exists; these two numbers are the whole of the ordering.
 - **Every row is a link.** Muninn publishes no ``action`` endpoint, because a
   history console has nothing that should be mutated from a menu. Naming the
-  mistake: adding one action "just to open a session" would put a POST endpoint
-  on this port for the rest of the project's life, and the same row works as a
-  ``url`` that the host opens against Muninn's own port.
-- **No ``token_path``.** See ravenserve.py, which is where that decision is
-  actually load-bearing, and docs/specs/009 for the reasoning.
+  mistake: adding one action "just to open a session" would put a mutating op
+  on this surface for the rest of the project's life, and the same row works as
+  a ``url`` the host resolves against this raven's own address instead.
+- **No ``token_path`` on POSIX.** See ravenserve.py, which is where that
+  decision is actually load-bearing, and docs/specs/009 and 021 for the
+  reasoning. Windows carries one — not a choice, a consequence of Windows
+  having no Unix domain socket, spelled out in 021.
 
 ## Everything in a label is attacker-influenceable
 
@@ -83,18 +85,28 @@ DISPLAY = "Muninn"
 #: list of known ravens and no opinion about which should lead.
 HOST_PRIORITY = 50
 
+#: The two transports this raven can publish. Chosen by ravenserve.py at
+#: startup, by platform capability rather than preference: POSIX gets a Unix
+#: domain socket (TRANSPORT_UNIX), because Python's socket module has no
+#: AF_UNIX on Windows, which gets a named pipe (TRANSPORT_PIPE) instead. See
+#: docs/specs/021-unix-socket-transport.md for why the two need different
+#: security treatment rather than sharing one.
+TRANSPORT_UNIX = "unix"
+TRANSPORT_PIPE = "pipe"
+
 #: Environment override for the shared descriptor directory, named by the
 #: protocol so a test harness (or a user who relocates state wholesale) can
 #: point every participant at one alternate location.
 STATE_DIR_ENV = "RAVENS_STATE_DIR"
 
-#: Endpoint paths, named rather than repeated as literals because the descriptor
-#: advertises them and the server routes them, and those two must not be able to
-#: disagree. ``ACTION_ENDPOINT`` matches the path Roost falls back to when a
-#: descriptor omits it, which is not a coincidence worth relying on — Muninn
-#: advertises it explicitly.
-MENU_ENDPOINT = "/api/menu"
-ACTION_ENDPOINT = "/api/menu/action"
+#: Request ops, named rather than repeated as literals because the descriptor
+#: advertises them and the server routes them, and those two must not be able
+#: to disagree. These used to be HTTP paths (``/api/menu``,
+#: ``/api/menu/action``); a Unix socket or named pipe has no URL space, so a
+#: request now names which op it wants in the JSON body instead of the path,
+#: and these constants are that op name rather than a path.
+MENU_OP = "menu"
+ACTION_OP = "action"
 
 #: The two action ids Muninn publishes. They are ordinary ids and that is the
 #: whole design: the host draws the label and posts the id back exactly as it
@@ -229,6 +241,35 @@ def descriptor_path() -> Path:
     return state_dir() / f"{NAME}.json"
 
 
+def socket_path(directory: Path | None = None) -> Path:
+    """Where the POSIX Unix domain socket is bound. Unused on Windows."""
+    return (state_dir() if directory is None else Path(directory)) / f"{NAME}.sock"
+
+
+def pages_dir(directory: Path | None = None) -> Path:
+    """Where the static pages a menu link opens are rendered.
+
+    Separate from the descriptor directory's top level rather than a sibling
+    of ``muninn.json``: pages are per-session render output, not protocol
+    state, and giving them their own subdirectory means a future raven-side
+    cleanup pass can rm one directory without a pattern match against
+    everything else ``ravens/`` holds for other ravens.
+    """
+    return (state_dir() if directory is None else Path(directory)) / NAME / "pages"
+
+
+def token_path(directory: Path | None = None) -> Path:
+    """Where the Windows named-pipe authkey is written. Unused on POSIX.
+
+    POSIX needs no credential because the socket file's own 0600 mode is the
+    entire trust boundary. A named pipe's default security descriptor does
+    not give that same same-user-only guarantee, so the Windows transport
+    additionally hands ``multiprocessing.connection`` an authkey, and this is
+    where the file naming it lives so Roost can find it from the descriptor.
+    """
+    return (state_dir() if directory is None else Path(directory)) / f"{NAME}.token"
+
+
 def _process_started(pid: int) -> float:
     """``pid``'s start time per the OS, falling back to the wall clock."""
     from .store import process_start_time
@@ -237,10 +278,28 @@ def _process_started(pid: int) -> float:
     return float(actual) if actual else time.time()
 
 
-def descriptor(port: int, *, pid: int | None = None,
+def descriptor(address: str, transport: str, pages_dir: str, *,
+               token_path: str | None = None,
+               pid: int | None = None,
                started: float | None = None,
                actions: bool = False) -> dict[str, Any]:
-    """Build the descriptor document for a server listening on ``port``.
+    """Build the descriptor document for a listener bound at ``address``.
+
+    ``transport`` is one of :data:`TRANSPORT_UNIX` or :data:`TRANSPORT_PIPE`.
+    ``address`` is a filesystem path for the former, a named-pipe path
+    (``\\\\.\\pipe\\...``) for the latter — Roost dispatches on ``transport``
+    rather than sniffing the address shape, because the two are visually
+    similar on POSIX and guessing would be exactly the kind of implicit
+    coupling this protocol otherwise avoids.
+
+    ``pages_dir`` is where this raven has rendered (or will render) every
+    file a ``url`` in the menu payload can point to. Roost resolves a link
+    row's ``url`` against it and refuses anything whose realpath escapes it —
+    see the client-side containment rule in Roost's ``SPEC.md``.
+
+    ``token_path``, when given, names a file holding the authkey a Windows
+    named-pipe client must present. Omitted on POSIX, where the socket's own
+    file mode already is the credential.
 
     ``started`` is this process's start time in epoch seconds. Supplying it is
     not optional in practice even though the protocol marks it optional: the host
@@ -269,18 +328,19 @@ def descriptor(port: int, *, pid: int | None = None,
     epoch-based, so the cross-check would fail against every live process rather
     than only against recycled PIDs.
 
-    No ``token_path`` and no ``token_header``, which is a decision rather than an
-    omission — see ravenserve.py and docs/specs/009.
+    No ``token_path`` on POSIX, which is a decision rather than an omission —
+    see ravenserve.py and docs/specs/009 and 021. Windows carries one, for the
+    reason given above.
 
     ``actions`` advertises the action endpoint. It defaults to **False** so that
     every caller that does not wire an action handler keeps saying "there is
-    nothing here to click" — the descriptor must not promise a route that answers
-    405, because the host would draw a row and the click would fail. Only the
-    daemon, which can honour Quit and Restart, passes True.
+    nothing here to click" — the descriptor must not promise an op that answers
+    "publishes no actions", because the host would draw a row and the click
+    would fail. Only the daemon, which can honour Quit and Restart, passes True.
     """
-    endpoints: dict[str, str] = {"menu": MENU_ENDPOINT}
+    endpoints: dict[str, str] = {"menu": MENU_OP}
     if actions:
-        endpoints["action"] = ACTION_ENDPOINT
+        endpoints["action"] = ACTION_OP
     process_id = os.getpid() if pid is None else pid
     return {
         "api_version": API_VERSION,
@@ -289,7 +349,10 @@ def descriptor(port: int, *, pid: int | None = None,
         "name": NAME,
         "display": DISPLAY,
         "pid": process_id,
-        "port": port,
+        "transport": transport,
+        "address": address,
+        "pages_dir": pages_dir,
+        **({"token_path": token_path} if token_path else {}),
         "started": _process_started(process_id) if started is None else started,
         "host_priority": HOST_PRIORITY,
         # Omitting "action" is how a raven says it has nothing to be clicked;
@@ -339,21 +402,24 @@ def _launch_block() -> dict | None:
         return None
 
 
-def publish(port: int, *, directory: Path | None = None,
+def publish(address: str, transport: str, pages_dir: str, *,
+            token_path: str | None = None,
+            directory: Path | None = None,
             started: float | None = None,
             actions: bool = False) -> Path:
     """Write the descriptor atomically and owner-only. Returns its path.
 
-    Call this **after** the port is bound, never before: a descriptor naming a
-    port that is not yet listening makes the host report a healthy Muninn as
-    "Is not answering on its recorded port." during startup.
+    Call this **after** the listener is bound, never before: a descriptor
+    naming an address nothing is listening on makes the host report a
+    healthy Muninn as unreachable during startup.
 
     The temp file is staged in the same directory (so ``os.replace`` cannot
     cross a filesystem boundary and fall back to a non-atomic copy) and its mode
     is set *before* the replace. That ordering is the point, and it matches
     store.py's 0600 discipline for the archive: creating the final file first and
     chmodding after leaves a window in which it is world-readable, and this file
-    names a loopback port that accepts unauthenticated requests.
+    names an address a local process can act on unauthenticated (POSIX) or
+    names where the credential to do so lives (Windows).
 
     The directory is 0700 for the same reason. Note that it is *shared* with
     other ravens owned by the same user, not with other users — one user's
@@ -364,8 +430,9 @@ def publish(port: int, *, directory: Path | None = None,
     _restrict(directory, 0o700)
 
     target = directory / f"{NAME}.json"
-    payload = json.dumps(descriptor(port, started=started, actions=actions),
-                         indent=2, sort_keys=True) + "\n"
+    doc = descriptor(address, transport, pages_dir, token_path=token_path,
+                     started=started, actions=actions)
+    payload = json.dumps(doc, indent=2, sort_keys=True) + "\n"
     fd, tmp_name = tempfile.mkstemp(prefix=f".{NAME}.", dir=str(directory))
     tmp = Path(tmp_name)
     try:
@@ -403,9 +470,13 @@ def _restrict(path: Path, mode: int) -> None:
 
     Windows is not silently ignored so much as deliberately left alone: NTFS
     does not honour mode bits, and Muninn has no pywin32 dependency to set a
-    DACL with. The descriptor names a port, not a credential, and the endpoint
-    it points at requires nothing — so on Windows this file is as sensitive as
-    the fact that Muninn is running, which is already visible in the task list.
+    DACL with. Every file this function is ever called on names an address, a
+    directory, or a page render — never a credential — so on Windows each is as
+    sensitive as the fact that Muninn is running, which is already visible in
+    the task list. The one Windows file that *is* a credential (the named-pipe
+    authkey) is deliberately never passed to this function — see
+    ravenserve.py's stdlib ctypes ACL helper, which is not a best-effort mode
+    bit because this file cannot afford to be.
     """
     if sys.platform == "win32":
         return
@@ -432,7 +503,12 @@ UNFINISHED_LIMIT = 3
 #: id that is not a plain token is simpler to be sure of than quoting one, and
 #: costs nothing: Muninn's ids are transcript filename stems and export uuids,
 #: a shape that is already this narrow.
-_SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+#:
+#: Public rather than a module-private name: ravenserve.py re-checks a session
+#: id against this before turning it into a page filename under pages_dir, and
+#: that check has to use the exact same pattern build_menu already applied —
+#: not a copy that could quietly drift from it.
+SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
 def _relative_when(started_at: str | None, now: float | None = None) -> str:
@@ -547,7 +623,7 @@ def build_menu(*, recent: list[dict[str, Any]], sessions: int, chunks: int,
         if not label:
             continue
         session_id = row.get("session_id")
-        if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
+        if not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id):
             continue
         detail_parts = [p for p in (
             safe_label(row.get("source"), 16),
@@ -575,7 +651,7 @@ def build_menu(*, recent: list[dict[str, Any]], sessions: int, chunks: int,
         session_id = row.get("session_id")
         if not label or not isinstance(session_id, str):
             continue
-        if not _SESSION_ID_RE.fullmatch(session_id):
+        if not SESSION_ID_RE.fullmatch(session_id):
             continue
         detail_parts = [p for p in (
             safe_label(row.get("outcome"), 16),

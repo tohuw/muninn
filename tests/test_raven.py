@@ -1,6 +1,7 @@
-"""The raven contract: descriptor lifecycle, menu payload, and the HTTP guards.
+"""The raven contract: descriptor lifecycle, menu payload, and the transport guards.
 
-Acceptance criteria from docs/specs/009-raven-descriptor-menu.md.
+Acceptance criteria from docs/specs/009-raven-descriptor-menu.md and
+docs/specs/021-unix-socket-transport.md.
 
 ## Why Appistry's parser is reimplemented here instead of imported
 
@@ -28,18 +29,27 @@ what makes this reimplementation trustworthy, not the reimplementation itself.
 The one rule to keep: **make this parser stricter or equal to Appistry's, never
 looser.** A local parser that accepts something the real one drops turns a
 silently truncated menu into a green test.
+
+## Why this file talks ``multiprocessing.connection`` and not HTTP any more
+
+Spec 021 replaced the loopback HTTP listener with a Unix domain socket (POSIX)
+or a named pipe (Windows), both spoken through ``multiprocessing.connection``.
+There is no verb, no path, no header — a request is one JSON message naming an
+``op``, and a reply is one JSON message back, then the connection closes. The
+``Host``/``Origin``/``Content-Length`` guards the old ``HttpGuardTest`` checked
+are gone from the implementation, not hardened, so they are gone from this file
+too; :class:`TransportGuardTest` below tests the guarantees that replaced them.
 """
 from __future__ import annotations
 
-import http.client
 import json
 import os
 import re
-import socket
 import stat
 import sys
 import tempfile
 import unittest
+from multiprocessing.connection import Client
 from pathlib import Path
 
 from muninn import raven, ravenserve
@@ -195,12 +205,33 @@ def a_session(session_id: str = "abc123", **over: object) -> dict:
     return row
 
 
+def _family_for(transport: str) -> str:
+    """The ``multiprocessing.connection`` family that speaks ``transport``."""
+    return "AF_UNIX" if transport == raven.TRANSPORT_UNIX else "AF_PIPE"
+
+
+def _connect(service: "ravenserve.RavenService"):
+    """Open one client connection to ``service``, matching its own transport."""
+    return Client(service.address, family=_family_for(service.transport))
+
+
+def _ask(service: "ravenserve.RavenService", payload: dict) -> dict:
+    """Send one JSON request and return the parsed JSON reply. One round trip,
+    matching the protocol: one message in, one message out, then close."""
+    conn = _connect(service)
+    try:
+        conn.send_bytes(json.dumps(payload).encode("utf-8"))
+        return json.loads(conn.recv_bytes().decode("utf-8"))
+    finally:
+        conn.close()
+
+
 class RavenTestCase(unittest.TestCase):
     """Points RAVENS_STATE_DIR at a tempdir.
 
     Every test in this file must do this. The real value is a shared directory in
     the user's home that a live Appistry polls, and a test that published there
-    would put a descriptor naming a dead port into the user's actual menubar.
+    would put a descriptor naming a dead address into the user's actual menubar.
     """
 
     def setUp(self) -> None:
@@ -281,8 +312,20 @@ class StateDirTest(unittest.TestCase):
 # ── Descriptor content and lifecycle ──────────────────────────────────────────
 
 class DescriptorTest(RavenTestCase):
+    """``raven.descriptor``/``publish`` over the new address/transport shape.
+
+    ``address``/``transport``/``pages_dir`` are plain strings here — nothing in
+    this class binds a real listener, on purpose: a test that can build and
+    check the descriptor with no socket bound is the whole reason the payload
+    lives in ``raven.py`` rather than in ``ravenserve.py``.
+    """
+
+    ADDR = "/tmp/fake-ravens/muninn.sock"
+    PAGES = "/tmp/fake-ravens/muninn/pages"
+
     def test_fields_match_the_protocol(self) -> None:
-        payload = raven.descriptor(47101, pid=4242, started=1785315600.5)
+        payload = raven.descriptor(self.ADDR, raven.TRANSPORT_UNIX, self.PAGES,
+                                   pid=4242, started=1785315600.5)
         # `launch` is platform-derived and absent where there is no supervisor,
         # so it is asserted separately rather than pinned into this literal.
         self.assertEqual({k: v for k, v in payload.items() if k != "launch"}, {
@@ -292,10 +335,12 @@ class DescriptorTest(RavenTestCase):
             "name": "muninn",
             "display": "Muninn",
             "pid": 4242,
-            "port": 47101,
+            "transport": raven.TRANSPORT_UNIX,
+            "address": self.ADDR,
+            "pages_dir": self.PAGES,
             "started": 1785315600.5,
             "host_priority": 50,
-            "endpoints": {"menu": "/api/menu"},
+            "endpoints": {"menu": raven.MENU_OP},
         })
 
     def test_the_launch_block_names_a_service_never_a_command(self) -> None:
@@ -304,7 +349,7 @@ class DescriptorTest(RavenTestCase):
         Absent is valid: a platform with no start-at-login mechanism publishes
         no block, and the host then draws no Start row.
         """
-        launch = raven.descriptor(47101).get("launch")
+        launch = raven.descriptor(self.ADDR, raven.TRANSPORT_UNIX, self.PAGES).get("launch")
         if launch is None:
             self.skipTest("no start-at-login mechanism on this platform")
         self.assertIn(launch["kind"], ("launchd", "systemd", "windows-run"))
@@ -315,22 +360,33 @@ class DescriptorTest(RavenTestCase):
 
     def test_declares_a_range_not_a_single_version(self) -> None:
         """tohuw/huginn#38: equality comparison silently disabled every plugin."""
-        payload = raven.descriptor(1)
+        payload = raven.descriptor(self.ADDR, raven.TRANSPORT_UNIX, self.PAGES)
         self.assertLessEqual(payload["min_api"], payload["api_version"])
         self.assertGreaterEqual(payload["max_api"], payload["api_version"])
 
     def test_defers_to_huginn(self) -> None:
         # 50 against Huginn's 100. Ordering is data the ravens supply; the host
         # knows neither name.
-        self.assertEqual(raven.descriptor(1)["host_priority"], 50)
+        payload = raven.descriptor(self.ADDR, raven.TRANSPORT_UNIX, self.PAGES)
+        self.assertEqual(payload["host_priority"], 50)
         self.assertLess(raven.HOST_PRIORITY, 100)
 
-    def test_advertises_no_token_and_no_action_endpoint(self) -> None:
+    def test_advertises_no_token_and_no_action_endpoint_by_default(self) -> None:
         """Both absences are decisions. See ravenserve.py's module docstring."""
-        payload = raven.descriptor(1)
+        payload = raven.descriptor(self.ADDR, raven.TRANSPORT_UNIX, self.PAGES)
         self.assertNotIn("token_path", payload)
-        self.assertNotIn("token_header", payload)
         self.assertNotIn("action", payload["endpoints"])
+
+    def test_token_path_is_advertised_only_when_given(self) -> None:
+        """Windows carries one; POSIX callers simply never pass it (spec 021)."""
+        token = str(Path(self.PAGES).parent / "muninn.token")
+        payload = raven.descriptor(r"\\.\pipe\muninn-raven", raven.TRANSPORT_PIPE,
+                                   self.PAGES, token_path=token)
+        self.assertEqual(payload["token_path"], token)
+
+    def test_actions_advertises_the_action_op(self) -> None:
+        payload = raven.descriptor(self.ADDR, raven.TRANSPORT_UNIX, self.PAGES, actions=True)
+        self.assertEqual(payload["endpoints"]["action"], raven.ACTION_OP)
 
     def test_supplies_a_plausible_epoch_started(self) -> None:
         """Without ``started`` a recycled PID passes as a live raven.
@@ -348,7 +404,7 @@ class DescriptorTest(RavenTestCase):
 
         from muninn.store import process_start_time
 
-        payload = raven.descriptor(1)
+        payload = raven.descriptor(self.ADDR, raven.TRANSPORT_UNIX, self.PAGES)
         # Epoch-based, not monotonic: a monotonic reading counts from an
         # arbitrary origin and is a far smaller number than this.
         self.assertGreater(payload["started"], 1_600_000_000)
@@ -361,7 +417,9 @@ class DescriptorTest(RavenTestCase):
         from unittest.mock import patch
 
         with patch("muninn.store.process_start_time", return_value=1_700_000_000.0):
-            self.assertEqual(raven.descriptor(1)["started"], 1_700_000_000.0)
+            self.assertEqual(
+                raven.descriptor(self.ADDR, raven.TRANSPORT_UNIX, self.PAGES)["started"],
+                1_700_000_000.0)
 
     def test_a_republish_reports_the_same_start_time(self) -> None:
         """The Restart row does not start a new process.
@@ -374,9 +432,10 @@ class DescriptorTest(RavenTestCase):
         """
         import time
 
-        first = raven.descriptor(1)["started"]
+        first = raven.descriptor(self.ADDR, raven.TRANSPORT_UNIX, self.PAGES)["started"]
         time.sleep(0.05)
-        self.assertEqual(raven.descriptor(2)["started"], first)
+        second = raven.descriptor(self.ADDR + ".2", raven.TRANSPORT_UNIX, self.PAGES)["started"]
+        self.assertEqual(second, first)
 
     def test_started_falls_back_to_the_clock_when_the_os_cannot_answer(self) -> None:
         """A descriptor with a weak ``started`` beats no descriptor at all."""
@@ -384,24 +443,29 @@ class DescriptorTest(RavenTestCase):
         from unittest.mock import patch
 
         with patch("muninn.store.process_start_time", return_value=None):
-            self.assertAlmostEqual(raven.descriptor(1)["started"], time.time(), delta=5.0)
+            self.assertAlmostEqual(
+                raven.descriptor(self.ADDR, raven.TRANSPORT_UNIX, self.PAGES)["started"],
+                time.time(), delta=5.0)
 
     def test_pid_names_this_process(self) -> None:
-        self.assertEqual(raven.descriptor(1)["pid"], os.getpid())
+        payload = raven.descriptor(self.ADDR, raven.TRANSPORT_UNIX, self.PAGES)
+        self.assertEqual(payload["pid"], os.getpid())
 
     def test_publish_writes_valid_json_at_the_right_name(self) -> None:
-        path = raven.publish(47101)
+        path = raven.publish(self.ADDR, raven.TRANSPORT_UNIX, self.PAGES)
         self.assertEqual(path, raven.descriptor_path())
         # The filename stem must equal the declared name, or the host refuses the
         # file rather than reconciling it.
         self.assertEqual(path.name, "muninn.json")
         payload = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(payload["name"], path.stem)
-        self.assertEqual(payload["port"], 47101)
+        self.assertEqual(payload["address"], self.ADDR)
+        self.assertEqual(payload["transport"], raven.TRANSPORT_UNIX)
+        self.assertEqual(payload["pages_dir"], self.PAGES)
 
     @unittest.skipIf(sys.platform == "win32", "NTFS uses ACLs, not mode bits")
     def test_permissions_are_owner_only(self) -> None:
-        path = raven.publish(47101)
+        path = raven.publish(self.ADDR, raven.TRANSPORT_UNIX, self.PAGES)
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
 
@@ -414,31 +478,31 @@ class DescriptorTest(RavenTestCase):
         """
         prior = os.umask(0)
         try:
-            path = raven.publish(47101)
+            path = raven.publish(self.ADDR, raven.TRANSPORT_UNIX, self.PAGES)
         finally:
             os.umask(prior)
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
 
     def test_publish_leaves_no_temp_file_behind(self) -> None:
-        raven.publish(47101)
+        raven.publish(self.ADDR, raven.TRANSPORT_UNIX, self.PAGES)
         leftovers = [p.name for p in raven.state_dir().iterdir() if p.name != "muninn.json"]
         self.assertEqual(leftovers, [])
 
     def test_publish_replaces_a_stale_descriptor(self) -> None:
-        raven.publish(1111)
-        raven.publish(2222)
+        raven.publish("/tmp/fake-ravens/first.sock", raven.TRANSPORT_UNIX, self.PAGES)
+        raven.publish("/tmp/fake-ravens/second.sock", raven.TRANSPORT_UNIX, self.PAGES)
         payload = json.loads(raven.descriptor_path().read_text(encoding="utf-8"))
-        self.assertEqual(payload["port"], 2222)
+        self.assertEqual(payload["address"], "/tmp/fake-ravens/second.sock")
 
     def test_withdraw_removes_it(self) -> None:
-        path = raven.publish(47101)
+        path = raven.publish(self.ADDR, raven.TRANSPORT_UNIX, self.PAGES)
         raven.withdraw(path)
         self.assertFalse(path.exists())
 
     def test_withdraw_is_idempotent(self) -> None:
         """A double stop must not raise: this runs in a shutdown path."""
-        path = raven.publish(47101)
+        path = raven.publish(self.ADDR, raven.TRANSPORT_UNIX, self.PAGES)
         raven.withdraw(path)
         raven.withdraw(path)
         self.assertFalse(path.exists())
@@ -451,7 +515,8 @@ class DescriptorTest(RavenTestCase):
         that removal is guaranteed.
         """
         from muninn import store
-        payload = raven.descriptor(47101, pid=999_999_998, started=1.0)
+        payload = raven.descriptor(self.ADDR, raven.TRANSPORT_UNIX, self.PAGES,
+                                   pid=999_999_998, started=1.0)
         self.assertFalse(store.pid_alive(payload["pid"]))
         self.assertIsNotNone(payload["started"])
 
@@ -465,56 +530,32 @@ class ServiceLifecycleTest(RavenTestCase):
         try:
             self.assertTrue(service.descriptor.exists())
             payload = json.loads(service.descriptor.read_text(encoding="utf-8"))
-            self.assertEqual(payload["port"], service.port)
+            self.assertEqual(payload["address"], service.address)
+            self.assertEqual(payload["transport"], service.transport)
         finally:
             service.stop()
         self.assertFalse(raven.descriptor_path().exists())
 
-    def test_the_advertised_port_is_actually_listening(self) -> None:
+    def test_the_advertised_address_is_actually_listening(self) -> None:
         """Publish after bind, never before.
 
-        A descriptor naming a port nothing is listening on makes the host report
-        a healthy Muninn as unreachable during startup.
+        A descriptor naming an address nothing is listening on makes the host
+        report a healthy Muninn as unreachable during startup.
         """
         with ravenserve.serve(lambda: raven.build_menu(recent=[], sessions=0, chunks=0)) as svc:
-            port = json.loads(svc.descriptor.read_text(encoding="utf-8"))["port"]
-            with socket.create_connection(("127.0.0.1", port), timeout=5):
-                pass
+            reply = _ask(svc, {"op": raven.MENU_OP})
+            self.assertTrue(reply["ok"])
 
-    def test_binds_loopback_only(self) -> None:
+    @unittest.skipIf(sys.platform == "win32", "socket file modes; Windows binds a named pipe")
+    def test_the_socket_is_owner_only(self) -> None:
         with ravenserve.serve(lambda: raven.build_menu(recent=[], sessions=0, chunks=0)) as svc:
-            self.assertEqual(svc.server.server_address[0], "127.0.0.1")
+            self.assertEqual(svc.transport, raven.TRANSPORT_UNIX)
+            sock_path = Path(svc.address)
+            self.assertEqual(stat.S_IMODE(sock_path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(sock_path.parent.stat().st_mode), 0o700)
 
-    def test_binding_never_asks_a_resolver_anything(self) -> None:
-        """The macOS startup hang.
-
-        ``http.server.HTTPServer.server_bind`` calls ``socket.getfqdn(host)`` to
-        fill in ``server_name`` for CGI's benefit. It is a blocking reverse DNS
-        query on the daemon's startup path, and on macOS it can take tens of
-        seconds when the resolver has nothing to say about 127.0.0.1 — a CI
-        runner, or a laptop behind a captive portal or VPN. The daemon sat
-        silent, bound nothing and published nothing, which is why every
-        LiveLifecycleTest timed out there while Linux passed.
-
-        Asserted as "does not call it" rather than "is fast", because a timing
-        assertion would pass on any machine whose resolver happens to answer
-        quickly — including every machine this is likely to be run on.
-        """
-        from unittest.mock import patch
-
-        def _forbidden(*_args, **_kwargs):
-            raise AssertionError("server_bind performed a name lookup")
-
-        with patch("socket.getfqdn", _forbidden), \
-             patch("socket.gethostbyaddr", _forbidden):
-            with ravenserve.serve(
-                lambda: raven.build_menu(recent=[], sessions=0, chunks=0)
-            ) as svc:
-                self.assertEqual(svc.server.server_name, "127.0.0.1")
-                self.assertEqual(svc.server.server_port, svc.port)
-
-    def test_stop_releases_the_port_for_a_restart(self) -> None:
-        """Without server_close() the socket stays bound and a restart fails."""
+    def test_stop_releases_the_address_for_a_restart(self) -> None:
+        """Without unlinking the socket, the address stays bound and a restart fails."""
         first = ravenserve.serve(lambda: raven.build_menu(recent=[], sessions=0, chunks=0))
         first.stop()
         second = ravenserve.serve(lambda: raven.build_menu(recent=[], sessions=0, chunks=0))
@@ -525,6 +566,15 @@ class ServiceLifecycleTest(RavenTestCase):
             descriptor = svc.descriptor
             self.assertTrue(descriptor.exists())
         self.assertFalse(descriptor.exists())
+
+    @unittest.skipIf(sys.platform == "win32", "asserts the POSIX socket file specifically")
+    def test_stop_removes_the_socket_file(self) -> None:
+        """No stale address should survive a clean shutdown (spec 021 #12)."""
+        svc = ravenserve.serve(lambda: raven.build_menu(recent=[], sessions=0, chunks=0))
+        address = Path(svc.address)
+        self.assertTrue(address.exists())
+        svc.stop()
+        self.assertFalse(address.exists())
 
     def test_attach_returns_none_rather_than_raising(self) -> None:
         """A menubar section must never cost the indexer its ingest.
@@ -705,7 +755,7 @@ class MenuPayloadTest(unittest.TestCase):
         self.assertEqual(raven._relative_when(future), "just now")
 
 
-# ── Hostile transcript text ───────────────────────────────────────────────────
+# ── Quit/Restart in the menu ───────────────────────────────────────────────────
 
 class LifecycleMenuTest(unittest.TestCase):
     """Quit and Restart: drawn only where the click can be honoured."""
@@ -908,14 +958,18 @@ class HostileLabelTest(unittest.TestCase):
         self.assertNotIn("AKIA", blob)
 
 
-# ── The HTTP surface ──────────────────────────────────────────────────────────
+# ── The transport surface ──────────────────────────────────────────────────────
 
-class HttpGuardTest(RavenTestCase):
-    """Loopback is reachable by any web page the user has open.
+class TransportGuardTest(RavenTestCase):
+    """The guarantees the Unix-socket/named-pipe transport actually gives.
 
-    With no token, ``Host`` and ``Origin`` are the *only* thing between this port
-    and such a page — the opposite of the intuition that "no secret to steal"
-    means there is less to defend.
+    This replaces the old ``HttpGuardTest``. There is no ``Host``, no
+    ``Origin``, no ``Content-Length`` any more — a Unix domain socket cannot be
+    opened by a browser tab at all, so those checks were retired rather than
+    ported (docs/specs/021). What is left to guarantee: a request over the
+    length cap never reaches the JSON parser, a malformed or non-dict body gets
+    an honest ``{"ok": false}`` rather than a crash or a dropped connection, and
+    an unrecognised ``op`` is refused the same way.
     """
 
     def setUp(self) -> None:
@@ -924,116 +978,70 @@ class HttpGuardTest(RavenTestCase):
             lambda: raven.build_menu(recent=[a_session()], sessions=1, chunks=1))
         self.addCleanup(self.service.stop)
 
-    def request(self, method: str = "GET", path: str = "/api/menu",
-                host: str = "127.0.0.1", headers: dict[str, str] | None = None):
-        conn = http.client.HTTPConnection("127.0.0.1", self.service.port, timeout=10)
+    def _raw(self, raw: bytes) -> bytes:
+        conn = _connect(self.service)
         try:
-            conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
-            conn.putheader("Host", host)
-            for name, value in (headers or {}).items():
-                conn.putheader(name, value)
-            conn.endheaders()
-            response = conn.getresponse()
-            return response.status, dict(response.getheaders()), response.read()
+            conn.send_bytes(raw)
+            return conn.recv_bytes()
         finally:
             conn.close()
 
     def test_menu_is_served(self) -> None:
-        status, _headers, body = self.request()
-        self.assertEqual(status, 200)
-        self.assertEqual(parse_menu(json.loads(body))["title"], "Muninn")
+        reply = json.loads(self._raw(json.dumps({"op": raven.MENU_OP}).encode()))
+        self.assertTrue(reply["ok"])
+        self.assertEqual(parse_menu(reply["body"])["title"], "Muninn")
 
-    def test_loopback_host_names_are_accepted(self) -> None:
-        for host in ("127.0.0.1", "localhost", "127.0.0.1:1234", "[::1]:80", "LOCALHOST"):
-            with self.subTest(host=host):
-                self.assertEqual(self.request(host=host)[0], 200)
-
-    def test_a_foreign_host_is_refused(self) -> None:
-        """The DNS-rebinding defence: a page served from evil.example carries
-        that hostname here even when it resolves to 127.0.0.1."""
-        for host in ("evil.example.com", "127.0.0.1.evil.com", "localhost.evil.com",
-                     "0.0.0.0", "169.254.169.254"):
-            with self.subTest(host=host):
-                self.assertEqual(self.request(host=host)[0], 400)
-
-    def test_a_missing_host_is_refused(self) -> None:
-        """Absent must not be treated as acceptable — that is a one-line bypass."""
-        sock = socket.create_connection(("127.0.0.1", self.service.port), timeout=10)
+    def test_a_message_over_the_cap_is_refused_without_being_parsed(self) -> None:
+        """multiprocessing.connection enforces the length cap while reading the
+        length-prefixed frame, before a single byte reaches ``json.loads`` — the
+        transport's equivalent of the old ``Content-Length`` guard, minus the
+        header that guard existed to police in the first place. The connection
+        is closed with no reply, which is how a caller can tell the message was
+        never dispatched at all.
+        """
+        oversized = json.dumps(
+            {"op": raven.MENU_OP, "pad": "x" * (ravenserve.MAX_REQUEST_BODY * 2)}).encode()
+        conn = _connect(self.service)
         try:
-            sock.sendall(b"GET /api/menu HTTP/1.1\r\n\r\n")
-            self.assertIn(b"400", sock.recv(64).split(b"\r\n")[0])
+            conn.send_bytes(oversized)
+            with self.assertRaises(EOFError):
+                conn.recv_bytes()
         finally:
-            sock.close()
+            conn.close()
 
-    def test_any_origin_is_refused(self) -> None:
-        for origin in ("https://evil.example", "null", "",
-                       f"http://127.0.0.1:{self.service.port}"):
-            with self.subTest(origin=origin):
-                # Muninn's own origin is refused too: allowlisting it would let a
-                # page served from this very port script the endpoint.
-                self.assertEqual(self.request(headers={"Origin": origin})[0], 403)
+    def test_a_non_json_body_answers_ok_false_not_a_crash(self) -> None:
+        for raw in (b"", b"not json", b"\xff\xfe garbage", b"{not json"):
+            with self.subTest(raw=raw):
+                reply = json.loads(self._raw(raw))
+                self.assertFalse(reply["ok"])
+                self.assertIn("error", reply)
 
-    def test_content_length_is_guarded_before_anything_is_read(self) -> None:
-        for length in ("-1", "-999999999", "99999", "abc", "1 1", str(2 ** 64)):
-            with self.subTest(content_length=length):
-                # -1 is the case that matters most: read(-1) means "until EOF",
-                # which is no bound at all.
-                self.assertEqual(self.request(headers={"Content-Length": length})[0], 413)
+    def test_a_non_dict_body_answers_ok_false(self) -> None:
+        for raw in (b"[]", b"7", b'"a string"', b"null", b"true"):
+            with self.subTest(raw=raw):
+                reply = json.loads(self._raw(raw))
+                self.assertFalse(reply["ok"])
 
-    def test_post_is_refused_because_no_actions_are_published(self) -> None:
-        self.assertEqual(self.request(method="POST")[0], 405)
+    def test_an_unknown_op_is_refused(self) -> None:
+        reply = json.loads(self._raw(json.dumps({"op": "delete-everything"}).encode()))
+        self.assertFalse(reply["ok"])
 
-    def test_a_cross_origin_post_is_refused_before_routing(self) -> None:
-        """403, not 405: a route-shaped answer confirms what this port is."""
-        self.assertEqual(
-            self.request(method="POST", headers={"Origin": "https://evil.example"})[0], 403)
+    def test_a_missing_op_is_refused(self) -> None:
+        reply = json.loads(self._raw(json.dumps({"id": raven.QUIT}).encode()))
+        self.assertFalse(reply["ok"])
 
-    def test_guards_apply_to_every_route(self) -> None:
-        for path in ("/", "/api/menu", "/session/abc123", "/nope"):
-            with self.subTest(path=path):
-                self.assertEqual(self.request(path=path, host="evil.example.com")[0], 400)
-                self.assertEqual(
-                    self.request(path=path, headers={"Origin": "https://e.example"})[0], 403)
-
-    def test_headers_come_from_an_allowlist(self) -> None:
-        status, headers, _body = self.request()
-        self.assertEqual(status, 200)
-        self.assertEqual(headers.get("X-Content-Type-Options"), "nosniff")
-        self.assertEqual(headers.get("Cache-Control"), "no-store")
-        self.assertEqual(headers.get("Content-Type"), "application/json")
-        self.assertTrue(headers.get("Content-Length"))
-        # Nothing inbound is reflected.
-        echoed = self.request(headers={"X-Muninn-Echo": "reflect-me"})[1]
-        self.assertNotIn("reflect-me", json.dumps(echoed))
-
-    def test_html_carries_a_restrictive_csp(self) -> None:
-        for path in ("/", "/session/abc123"):
-            with self.subTest(path=path):
-                _status, headers, _body = self.request(path=path)
-                self.assertIn("default-src 'none'", headers.get("Content-Security-Policy", ""))
-                self.assertEqual(headers.get("X-Content-Type-Options"), "nosniff")
-
-    def test_a_session_page_escapes_its_id(self) -> None:
-        status, _headers, body = self.request(path="/session/<script>alert(1)</script>")
-        self.assertNotIn(b"<script>", body)
-        self.assertIn(status, (200, 404))
-
-    def test_unknown_routes_are_404_not_500(self) -> None:
-        self.assertEqual(self.request(path="/nope")[0], 404)
-
-    def test_a_failing_provider_answers_500_rather_than_dropping(self) -> None:
-        """A dropped connection reads to the host as "not answering on its port",
-        which points the user at completely the wrong problem."""
+    def test_a_failing_provider_answers_ok_false_rather_than_dropping(self) -> None:
+        """A dropped connection reads to the host as "not answering," which
+        points the user at completely the wrong problem than an archive error."""
         def boom() -> dict:
             raise RuntimeError("archive on fire")
 
         with ravenserve.serve(boom) as svc:
-            conn = http.client.HTTPConnection("127.0.0.1", svc.port, timeout=10)
-            try:
-                conn.request("GET", "/api/menu")
-                self.assertEqual(conn.getresponse().status, 500)
-            finally:
-                conn.close()
+            reply = _ask(svc, {"op": raven.MENU_OP})
+        self.assertFalse(reply["ok"])
+        # The exception's own text must never reach the reply — see _handle's
+        # docstring on why only the exception class is logged.
+        self.assertNotIn("archive on fire", json.dumps(reply))
 
     def test_the_menu_is_rebuilt_per_request(self) -> None:
         """A payload captured at startup would freeze the session count."""
@@ -1045,17 +1053,37 @@ class HttpGuardTest(RavenTestCase):
 
         with ravenserve.serve(provide) as svc:
             for _ in range(3):
-                conn = http.client.HTTPConnection("127.0.0.1", svc.port, timeout=10)
-                try:
-                    conn.request("GET", "/api/menu")
-                    conn.getresponse().read()
-                finally:
-                    conn.close()
+                _ask(svc, {"op": raven.MENU_OP})
         self.assertEqual(len(calls), 3)
+
+    def test_nothing_inbound_is_reflected_in_an_error_reply(self) -> None:
+        reply = self._raw(json.dumps({"op": "reflect-me-please"}).encode())
+        self.assertNotIn(b"reflect-me-please", reply)
+
+    def test_one_request_per_connection(self) -> None:
+        """No keep-alive, no pipelining — a second message on the same
+        connection gets no second reply, matching the one-shot protocol.
+
+        The server has already closed its end by the time a second message is
+        attempted, so which call raises is a race between this client's send
+        and the closed socket being noticed — a ``BrokenPipeError`` on the
+        second ``send_bytes`` is just as much "no second reply" as an
+        ``EOFError`` on the following ``recv_bytes`` would be.
+        """
+        conn = _connect(self.service)
+        try:
+            conn.send_bytes(json.dumps({"op": raven.MENU_OP}).encode())
+            first = json.loads(conn.recv_bytes())
+            self.assertTrue(first["ok"])
+            with self.assertRaises((EOFError, OSError)):
+                conn.send_bytes(json.dumps({"op": raven.MENU_OP}).encode())
+                conn.recv_bytes()
+        finally:
+            conn.close()
 
 
 class ActionEndpointTest(RavenTestCase):
-    """The POST route, its guards, and the descriptor claim that goes with it."""
+    """The action op, its guards, and the descriptor claim that goes with it."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -1076,93 +1104,80 @@ class ActionEndpointTest(RavenTestCase):
             action_handler=handler)
         self.addCleanup(self.service.stop)
 
-    def post(self, body: bytes | None, path: str = raven.ACTION_ENDPOINT,
-             headers: dict[str, str] | None = None):
-        conn = http.client.HTTPConnection("127.0.0.1", self.service.port, timeout=10)
-        try:
-            conn.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
-            conn.putheader("Host", "127.0.0.1")
-            if body is not None:
-                conn.putheader("Content-Length", str(len(body)))
-            for name, value in (headers or {}).items():
-                conn.putheader(name, value)
-            conn.endheaders()
-            if body is not None:
-                conn.send(body)
-            response = conn.getresponse()
-            return response.status, response.read()
-        finally:
-            conn.close()
+    def post(self, body: dict) -> dict:
+        return _ask(self.service, body)
 
     def test_a_published_action_is_dispatched(self) -> None:
-        status, body = self.post(json.dumps({"id": raven.QUIT}).encode())
-        self.assertEqual(status, 200)
-        self.assertTrue(json.loads(body)["stopping"])
+        reply = self.post({"op": raven.ACTION_OP, "id": raven.QUIT})
+        self.assertTrue(reply["ok"])
+        self.assertTrue(reply["stopping"])
         self.assertEqual(self.calls, [raven.QUIT])
 
     def test_the_reply_is_written_before_the_followup_runs(self) -> None:
         """A quit that drops the connection reads as a wedged raven, not a quit.
 
         The two halves are asserted differently on purpose. That the reply comes
-        first is proved synchronously: this client read a complete 200 before
+        first is proved synchronously: this client read a complete reply before
         looking. That the followup then runs is *waited* for, because it runs on
         the server thread after the flush -- so demanding it be finished the
         instant the client returns asserts the opposite ordering to the one
-        claimed, and races. It read as a pass only because binding used to take
-        tens of seconds on macOS; making that instant exposed it.
+        claimed, and races.
         """
         import time
 
-        status, _body = self.post(json.dumps({"id": raven.QUIT}).encode())
-        self.assertEqual(status, 200)
+        reply = self.post({"op": raven.ACTION_OP, "id": raven.QUIT})
+        self.assertTrue(reply["ok"])
         deadline = time.monotonic() + 10.0
         while not self.followups and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertEqual(self.followups, ["ran"])
 
-    def test_a_refused_action_answers_409_not_200(self) -> None:
-        # 200 with ok=false would make a failed action look successful to any
-        # caller that checks the status and not the body.
-        status, body = self.post(json.dumps({"id": "nope"}).encode())
-        self.assertEqual(status, 409)
-        self.assertFalse(json.loads(body)["ok"])
+    def test_a_refused_action_reports_ok_false_not_a_dropped_connection(self) -> None:
+        # ok=false with a real reply is the whole point: a caller that only
+        # checked for a live connection would otherwise call this a success.
+        reply = self.post({"op": raven.ACTION_OP, "id": "nope"})
+        self.assertFalse(reply["ok"])
 
-    def test_a_handler_that_raises_answers_500_rather_than_dropping(self) -> None:
-        status, body = self.post(json.dumps({"id": "boom"}).encode())
-        self.assertEqual(status, 500)
-        self.assertEqual(json.loads(body), {"error": "internal error"})
+    def test_a_handler_that_raises_answers_ok_false_rather_than_dropping(self) -> None:
+        reply = self.post({"op": raven.ACTION_OP, "id": "boom"})
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["error"], "internal error")
+        self.assertNotIn("handler exploded", reply.get("error", ""))
 
-    def test_malformed_bodies_are_refused_with_a_reason(self) -> None:
-        for body in (b"", b"not json", b"[]", b'{"id": ""}', b'{"id": 7}', b"{}"):
+    def test_malformed_action_bodies_are_refused_with_a_reason(self) -> None:
+        for body in ({"op": raven.ACTION_OP}, {"op": raven.ACTION_OP, "id": ""},
+                     {"op": raven.ACTION_OP, "id": 7}):
             with self.subTest(body=body):
-                status, _ = self.post(body)
-                self.assertEqual(status, 400)
+                reply = self.post(body)
+                self.assertFalse(reply["ok"])
         self.assertEqual(self.calls, [])
 
-    def test_a_body_over_the_cap_never_reaches_the_parser(self) -> None:
-        oversized = json.dumps({"id": "x" * (ravenserve.MAX_REQUEST_BODY * 2)}).encode()
-        self.assertEqual(self.post(oversized)[0], 413)
+    def test_a_body_over_the_cap_never_reaches_the_handler(self) -> None:
+        oversized = json.dumps({"op": raven.ACTION_OP,
+                                "id": "x" * (ravenserve.MAX_REQUEST_BODY * 2)}).encode()
+        conn = _connect(self.service)
+        try:
+            conn.send_bytes(oversized)
+            with self.assertRaises(EOFError):
+                conn.recv_bytes()
+        finally:
+            conn.close()
         self.assertEqual(self.calls, [])
 
     def test_a_long_id_is_truncated_before_it_is_dispatched(self) -> None:
-        self.post(json.dumps({"id": "a" * 400}).encode())
+        self.post({"op": raven.ACTION_OP, "id": "a" * 400})
         self.assertEqual(self.calls, ["a" * raven.MAX_ACTION_ID])
 
-    def test_another_post_path_is_not_an_action(self) -> None:
-        self.assertEqual(self.post(json.dumps({"id": raven.QUIT}).encode(),
-                                   path="/api/menu")[0], 404)
+    def test_a_menu_request_is_not_an_action(self) -> None:
+        reply = self.post({"op": raven.MENU_OP, "id": raven.QUIT})
+        self.assertTrue(reply["ok"])
         self.assertEqual(self.calls, [])
 
-    def test_the_guards_still_run_first(self) -> None:
-        body = json.dumps({"id": raven.QUIT}).encode()
-        self.assertEqual(self.post(body, headers={"Origin": "https://evil.example"})[0], 403)
-        self.assertEqual(self.calls, [])
-
-    def test_the_descriptor_advertises_the_action_endpoint(self) -> None:
+    def test_the_descriptor_advertises_the_action_op(self) -> None:
         # Advertising it is the same claim as routing it; the host draws a row
         # from one and posts to the other.
         payload = json.loads(raven.descriptor_path().read_text())
-        self.assertEqual(payload["endpoints"]["action"], raven.ACTION_ENDPOINT)
+        self.assertEqual(payload["endpoints"]["action"], raven.ACTION_OP)
 
 
 class NoActionsPublishedTest(RavenTestCase):
@@ -1174,18 +1189,18 @@ class NoActionsPublishedTest(RavenTestCase):
             lambda: raven.build_menu(recent=[a_session()], sessions=1, chunks=1))
         self.addCleanup(self.service.stop)
 
-    def test_the_descriptor_omits_the_action_endpoint(self) -> None:
+    def test_the_descriptor_omits_the_action_op(self) -> None:
         payload = json.loads(raven.descriptor_path().read_text())
-        self.assertEqual(payload["endpoints"], {"menu": raven.MENU_ENDPOINT})
+        self.assertEqual(payload["endpoints"], {"menu": raven.MENU_OP})
 
     def test_the_menu_draws_no_lifecycle_rows(self) -> None:
-        conn = http.client.HTTPConnection("127.0.0.1", self.service.port, timeout=10)
-        try:
-            conn.request("GET", raven.MENU_ENDPOINT)
-            menu = json.loads(conn.getresponse().read())
-        finally:
-            conn.close()
-        self.assertNotIn("lifecycle", [s.get("id") for s in menu["sections"]])
+        reply = _ask(self.service, {"op": raven.MENU_OP})
+        self.assertTrue(reply["ok"])
+        self.assertNotIn("lifecycle", [s.get("id") for s in reply["body"]["sections"]])
+
+    def test_an_action_request_answers_ok_false(self) -> None:
+        reply = _ask(self.service, {"op": raven.ACTION_OP, "id": raven.QUIT})
+        self.assertFalse(reply["ok"])
 
 
 class MenuProviderTest(RavenTestCase):
@@ -1295,6 +1310,75 @@ class MenuProviderTest(RavenTestCase):
         finally:
             recall_module.recall = original
         self.assertEqual(called, [])
+
+    # ── pages_dir rendering (spec 021, _write_pages/_write_index_page/
+    # _write_session_page) ─────────────────────────────────────────────────
+
+    def test_pages_dir_is_untouched_when_omitted(self) -> None:
+        """Tests that build a payload with no listener have nowhere for pages
+        to live, and must not get an implicit directory anyway."""
+        provider = ravenserve.menu_provider_for(self.tmp / "muninn.db")
+        provider()
+        self.assertFalse((self.tmp / "pages").exists())
+
+    def test_pages_dir_renders_an_index_page_restating_the_archive_section(self) -> None:
+        pages = self.tmp / "pages"
+        provider = ravenserve.menu_provider_for(self.tmp / "muninn.db", pages_dir=pages)
+        payload = provider()
+        index_html = (pages / "index.html").read_text(encoding="utf-8")
+        self.assertIn("Muninn", index_html)
+        archive = next(s for s in payload["sections"] if s["id"] == "archive")
+        self.assertIn(archive["items"][0]["label"], index_html)
+
+    def test_pages_dir_renders_a_session_page_with_the_real_transcript(self) -> None:
+        from muninn import store
+        db = self.tmp / "muninn.db"
+        st = store.open_store(db)
+        st.upsert_session({
+            "session_id": "sess0001", "source": "claude", "provenance": "human",
+            "cwd": "/a/b/proj", "started_at": "2026-08-01T09:00:00+00:00",
+            "text": "the actual transcript text lives here, not a stub",
+            "words": 9, "updated_at": "2026-08-01T09:00:00+00:00",
+            "user_turns": 1, "assistant_turns": 1, "tool_uses": 0, "tool_results": 0,
+            "source_present": 1, "origin": "raw",
+        })
+        st.close()
+        pages = self.tmp / "pages"
+        provider = ravenserve.menu_provider_for(db, pages_dir=pages)
+        provider()
+        page = (pages / "session" / "sess0001.html").read_text(encoding="utf-8")
+        self.assertIn("the actual transcript text lives here, not a stub", page)
+        self.assertIn("sess0001", page)
+        self.assertIn("/a/b/proj", page)
+
+    def test_pages_dir_only_gets_pages_the_payload_just_referenced(self) -> None:
+        """A url build_menu did not emit must have no file waiting for it —
+        Roost's containment check treats "no file" the same as "refused"."""
+        from muninn import store
+        db = self.tmp / "muninn.db"
+        st = store.open_store(db)
+        st.upsert_session({
+            "session_id": "sess0001", "source": "claude", "provenance": "human",
+            "cwd": "/a/b/proj", "started_at": "2026-08-01T09:00:00+00:00",
+            "text": "hello", "words": 1, "updated_at": "2026-08-01T09:00:00+00:00",
+            "user_turns": 1, "assistant_turns": 1, "tool_uses": 0, "tool_results": 0,
+            "source_present": 1, "origin": "raw",
+        })
+        st.close()
+        pages = self.tmp / "pages"
+        ravenserve.menu_provider_for(db, pages_dir=pages)()
+        self.assertFalse((pages / "session" / "never-existed.html").exists())
+
+    @unittest.skipIf(sys.platform == "win32", "asserts POSIX mode bits")
+    def test_pages_dir_is_owner_only(self) -> None:
+        from muninn import store
+        db = self.tmp / "muninn.db"
+        st = store.open_store(db)
+        st.close()
+        pages = self.tmp / "pages"
+        ravenserve.menu_provider_for(db, pages_dir=pages)()
+        self.assertEqual(stat.S_IMODE(pages.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((pages / "session").stat().st_mode), 0o700)
 
 
 # ── Parity with the document this implements ──────────────────────────────────

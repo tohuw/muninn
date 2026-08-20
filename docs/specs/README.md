@@ -29,6 +29,7 @@ wiki wins and the contradiction is a bug worth reporting.
 | [018 — Automatic enrichment](018-automatic-enrichment.md) | implemented | 014, 016, 011, 005 |
 | [019 — `muninn recall`](019-recall.md) | implemented | 005, 006, 009 |
 | [020 — `muninn why`](020-why.md) | implemented | 005, 019 |
+| [021 — Unix socket transport](021-unix-socket-transport.md) | implemented | 009, 010, 017 |
 
 Specs 002 and 003 both modify `muninn/cli.py`, as do 004, 005, 010 and 011. Run
 overlapping specs sequentially, or in separate git worktrees, so they cannot
@@ -41,10 +42,11 @@ Spec 007 deletes data on purpose and is the most dangerous of the set. Its one
 inviolable rule: never drop prose for a session whose raw source is already gone.
 
 Spec 009 covers only Muninn's **producer** side of the shared menubar — the raven
-descriptor and the `/api/menu` payload. It publishes no console: `/` and
-`/session/<id>` are deliberately stubs, because a real UI on that port would carry
-transcript prose and would force spec 009's "unauthenticated by design" decision
-to be reopened.
+descriptor and the `/api/menu` payload. It originally published no console: `/`
+and `/session/<id>` were deliberately stubs, because a real UI on that port would
+carry transcript prose and would force spec 009's "unauthenticated by design"
+decision to be reopened. **Spec 021 reopens exactly that**, on the transport
+change it makes: the pages are no longer stubs.
 
 Spec 010 answers the owner decision spec 009 left open ("The lifecycle question"):
 Muninn now has a daemon, `muninn serve`, and it — not `muninn index --watch` — is
@@ -85,8 +87,14 @@ measurements worth reading before writing anything that attributes work to a
 session — session lifetimes span four orders of magnitude, and `cwd` is not the
 repository.
 
-Later phases not yet spec'd: the console, the agent skill, and the Cisco
-distribution's plugins.
+Spec 021 replaces the raven surface's HTTP transport with a Unix domain socket
+(POSIX) or a named pipe (Windows), and reopens the console stub spec 009 left
+in place on the explicit condition that the transport changed — see 021's "The
+console decision, reopened." The wire-level request/reply shape and the
+descriptor's `port` field both change; the action semantics 017 built do not.
+
+Later phases not yet spec'd: a general console beyond the pages 021 renders,
+the agent skill, and the Cisco distribution's plugins.
 
 ## How to work one of these
 

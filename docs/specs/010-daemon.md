@@ -87,6 +87,11 @@ which is a cross-project contract and is untouched by this spec.
 }
 ```
 
+**Amended by 021:** `port` is `address` as of the Unix-socket transport — a
+socket path on POSIX, a named-pipe path on Windows — and the field-name parity
+with Huginn's `daemon.json` this section argues for below no longer holds for
+that one field. See 021.
+
 **Field names mirror Huginn's `daemon.json`** (`huginn/daemon.py`'s
 `_write_daemon_state`) wherever they mean the same thing — `pid`, `port`,
 `started`, `python`, `repo` — so the two ravens are operationally similar and one
@@ -243,6 +248,10 @@ shared menubar (published while `muninn serve` runs)
               serving · pid 15586 · port 53683
 ```
 
+**Amended by 021:** `menu port` reads as `menu`, and its value is the bound
+address (a socket path or named-pipe path), not a port number — see 021 and
+the current `cli._print_daemon_section`.
+
 - **The lock** answers "is an ingest loop running at all" — including `index
   --watch`, which writes no state file. It is the only one of the three the
   kernel maintains, so it survives a SIGKILL that leaves the others stale.
@@ -264,6 +273,14 @@ by.
 
 ## Security
 
+**Amended by 021:** the HTTP-specific half of this section (`Host`, `Origin`,
+`Content-Length`) describes a transport this daemon no longer runs on POSIX.
+`/api/menu` (now the ``menu`` op) staying unauthenticated there is *still*
+unchanged from spec 009 — 021 re-derives the same conclusion from a different
+threat model rather than assuming it survives the transport swap unexamined.
+Windows gained a `token_path` it did not have when this section was written;
+see 021 for why.
+
 **Unchanged from spec 009, deliberately, and the threat model was re-examined
 rather than assumed.** `/api/menu` stays unauthenticated with no `token_path`;
 `Host` validation, blanket `Origin` rejection, `Content-Length` guarding, the
@@ -278,7 +295,9 @@ loopback port), and widens nothing else:
 
 - The payload is identical. Still counts, relative times, and short labels; still
   no prose, no transcript text, no path beyond a basename. `/` and
-  `/session/<id>` are still stubs.
+  `/session/<id>` are still stubs. **No longer true as of 021** — see that spec
+  for why the daemon's continuous uptime was never the reason this held, and
+  did not become the reason it stopped.
 - The surface is identical. Still `GET` only, still one route with data on it.
 - A token would still not help, for spec 009's reason: the page would be refused
   for lacking one, which is the same outcome `Host`/`Origin` already produce. A
@@ -300,7 +319,8 @@ not**, which is the reason for 0600 rather than the archive's own precedent.
 2. Startup publishes a raven descriptor **and** a state file; both 0600 in a 0700
    directory, verified under `umask 0`.
 3. The state file's `pid`/`port` agree with the descriptor's, and the advertised
-   port answers `/api/menu`.
+   port answers `/api/menu`. **Amended by 021:** "port" reads as "address"; the
+   advertised address answers the `menu` op.
 4. `SIGTERM` → exit 0, descriptor **and** state file gone.
 5. `SIGHUP` → identical.
 6. `SIGINT` → identical (the pre-existing path must not have regressed).
@@ -396,6 +416,7 @@ observe.
   second, worse copy of it.
 - **The console.** Still unspec'd, and `/` and `/session/<id>` are still stubs —
   a real UI there would carry prose and force spec 009's token decision open.
+  **Amended by 021** — see the same note in spec 009's "Out of scope".
 
 Formerly out of scope and **now filled** — see "The login-agent installer" below:
 the launchd/systemd/Windows installer, the `install-agent` verb, and the

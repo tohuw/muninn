@@ -142,17 +142,20 @@ def lock_path() -> Path:
 
 # ── The state file ────────────────────────────────────────────────────────────
 
-def write_state(port: int | None, *, path: Path | None = None,
+def write_state(address: str | None, *, path: Path | None = None,
                 started: float | None = None, db_path: str | Path | None = None) -> Path:
-    """Record pid/port/started/python/repo/db for a supervisor to read. 0600.
+    """Record pid/address/started/python/repo/db for a supervisor to read. 0600.
 
-    **Field names mirror Huginn's ``daemon.json``** (``huginn/daemon.py``'s
-    ``_write_daemon_state``) wherever they mean the same thing, so the two ravens
-    are operationally similar and one script can read either: ``pid``, ``port``,
-    ``started``, ``python``, ``repo``. ``db`` is Muninn's own addition, because
-    the archive path is overridable per invocation (``--db``) and a supervisor
-    that wants to know which archive a running daemon is feeding cannot otherwise
-    tell.
+    **Field names used to mirror Huginn's ``daemon.json``** (``huginn/daemon.py``'s
+    ``_write_daemon_state``) byte for byte, so the two ravens were operationally
+    similar and one script could read either: ``pid``, ``port``, ``started``,
+    ``python``, ``repo``. That parity breaks here on purpose: Muninn's raven
+    surface is no longer TCP (docs/specs/018), and a field called ``port``
+    holding a socket path or a named-pipe name would be a worse lie than an
+    honest divergence from Huginn's shape. ``db`` is Muninn's own addition
+    regardless, because the archive path is overridable per invocation
+    (``--db``) and a supervisor that wants to know which archive a running
+    daemon is feeding cannot otherwise tell.
 
     ``started`` is **epoch seconds, not an ISO string**, which is the opposite of
     how the rest of Muninn stores timestamps (``store.record_sweep``, the
@@ -160,12 +163,12 @@ def write_state(port: int | None, *, path: Path | None = None,
     same name *and* the ``started`` in Muninn's own raven descriptor, and those
     two are the readers that exist. Rendering it for humans is ``doctor``'s job.
 
-    ``port`` may be ``None``, and a reader that assumes otherwise is the mistake
-    worth naming. Huginn's port is never ``None`` because its bind is mandatory
-    and the daemon dies without it; Muninn's raven is best-effort by design
-    (``ravenserve.attach`` returns ``None`` rather than costing the indexer its
-    ingest), so "the daemon is running and there is no menu port" is a legitimate
-    state that must still be discoverable.
+    ``address`` may be ``None``, and a reader that assumes otherwise is the
+    mistake worth naming. Huginn's port is never ``None`` because its bind is
+    mandatory and the daemon dies without it; Muninn's raven is best-effort by
+    design (``ravenserve.attach`` returns ``None`` rather than costing the
+    indexer its ingest), so "the daemon is running and there is no menu
+    listener" is a legitimate state that must still be discoverable.
 
     Written atomically with the mode set *before* the replace, the same ordering
     and for the same reason as ``raven.publish``: creating the final file and
@@ -180,8 +183,8 @@ def write_state(port: int | None, *, path: Path | None = None,
     directory = target.parent
     directory.mkdir(parents=True, exist_ok=True)
     # The archive itself is 0600 (store.py) but the directory holding it was
-    # never restricted. This file names a loopback port that answers
-    # unauthenticated requests, and ``python``/``repo`` are paths a tray app may
+    # never restricted. This file names an address that answers unauthenticated
+    # requests on POSIX, and ``python``/``repo`` are paths a tray app may
     # relaunch from — integrity matters even where confidentiality does not
     # (the reasoning Huginn recorded for its own 0600, finding M5 of the security
     # review of its issue #41 — not of #41's own scope, which was model policy).
@@ -189,7 +192,7 @@ def write_state(port: int | None, *, path: Path | None = None,
 
     payload = json.dumps({
         "pid": os.getpid(),
-        "port": port,
+        "address": address,
         "started": time.time() if started is None else started,
         "python": sys.executable,
         # Same expression Huginn uses, and the same caveat: from a checkout this
@@ -678,7 +681,7 @@ class Daemon:
         self.state_file = state_file
         self.lock_file = lock_file
         self.announce = announce or (lambda _msg: None)
-        self.port: int | None = None
+        self.address: str | None = None
         self.embedder: embedder.BackgroundEmbedder | None = None
         self.enricher: enricher.BackgroundEnricher | None = None
         self.calibrator: calibrator.BackgroundCalibrator | None = None
@@ -735,8 +738,9 @@ class Daemon:
                     action_handler=lambda action_id: raven.perform_action(self, action_id),
                 )
                 if service is not None:
-                    self.port = service.port
-                    self.announce(f"muninn raven serving http://127.0.0.1:{service.port}/api/menu")
+                    self.address = service.address
+                    self.announce(f"muninn raven serving over {service.transport}: "
+                                  f"{service.address}")
                 else:
                     self.announce("muninn raven: not published (see `muninn doctor`)")
 
@@ -779,7 +783,7 @@ class Daemon:
             # 5. The state file last, so "the daemon is discoverable" implies
             #    everything it advertises is already true.
             if self.publish_state:
-                written = write_state(self.port, path=self.state_file, db_path=self.db_path)
+                written = write_state(self.address, path=self.state_file, db_path=self.db_path)
                 self.announce(f"muninn daemon pid {os.getpid()} · state {written}")
             self.announce(f"muninn indexer watching {', '.join(str(p) for p in self.roots.values())}")
 

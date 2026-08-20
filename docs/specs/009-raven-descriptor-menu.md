@@ -76,6 +76,8 @@ this gap is visible rather than discovered.
 | `tests/test_indexer.py` | three tests for the `watch()` termination fix |
 
 No new dependencies. Everything here is stdlib (`http.server`, `socketserver`).
+**Amended by 021:** stdlib remains true, but the modules changed —
+`multiprocessing.connection` and, on Windows only, `ctypes`.
 
 ## The descriptor
 
@@ -107,6 +109,11 @@ Windows); it is the wrong *location*.
 }
 ```
 
+**Amended by 021:** this shape is Muninn's original, HTTP-era descriptor and is
+no longer what a current build publishes. `port`/`endpoints`' path-shaped values
+are gone; `transport`, `address`, and `pages_dir` (and, on Windows only,
+`token_path`) replace them. See 021 for the current shape and why.
+
 Four field-level decisions, each of which the protocol permits a raven to make
 for itself:
 
@@ -116,7 +123,9 @@ for itself:
 - **`min_api`/`max_api` as a range, never an equality.** Huginn #38: one routine
   bump silently disabled every participant with nothing on screen to say why.
 - **No `token_path`, no `token_header`.** See "Security" below. This is a decision,
-  not an omission.
+  not an omission. **Amended by 021:** true on POSIX only, as of the Unix-socket
+  transport. Windows carries a `token_path` — a consequence of the platform, not
+  a reopening of this decision; see 021.
 - **No `action` endpoint.** Every row is a link. A history console has nothing that
   should be mutated from a menu, and adding an action "just to open a session"
   would put a POST endpoint on this port permanently.
@@ -196,6 +205,16 @@ separator row Muninn emits survives the host's parser unchanged.
 
 ## Security
 
+**Amended by 021, for POSIX: this whole section describes an HTTP surface
+that no longer exists.** The rules below (loopback bind, `Host`, `Origin`,
+`Content-Length`, `GET`-only) were the defence against a browser page
+reaching a TCP port, and a Unix domain socket cannot be reached that way in
+the first place — see 021 for why none of them were reimplemented for that
+transport rather than ported. Windows, which has no `AF_UNIX` and so keeps a
+listener a browser API still cannot open but whose ACL story differs, is also
+covered there. This section is retained as the historical record of the HTTP
+surface's own rules, in case that transport is ever needed again.
+
 Bound loopback only, on an ephemeral port. Every rule the protocol requires:
 
 - **`Host` must name a loopback address.** A missing `Host` is refused too —
@@ -243,6 +262,14 @@ spec accepts it, on the record:
 in the same change.** `tests/test_raven.py` has a test that fails when prose
 reaches the payload.
 
+**Amended by 021: revisited, deliberately, and changed.** The "no prose"
+half of this decision was never about the token — it was about not putting
+transcript text on a port any browser page could reach. A Unix socket (POSIX)
+or an ACL-protected named pipe (Windows) cannot be reached that way, so the
+premise this rule was defending is gone, and `pages_dir`'s rendered session
+pages now carry the real transcript. See 021 for the full argument and for
+why the *token* conclusion above still holds unchanged on POSIX regardless.
+
 ## Sanitisation
 
 Session titles, topics, and `cwd` paths come from transcripts, which hold whatever
@@ -279,12 +306,18 @@ not asserted.
    host's liveness check to refuse it.
 4. Field values exactly as tabulated; declared range overlaps the host's; no
    `token_path`; no `action` endpoint (017: unless a handler is supplied).
+   **Amended by 021:** `token_path` is present on Windows. Field *shape* is 021's,
+   not the table above's.
 5. The advertised port is listening by the time the descriptor exists.
+   **Amended by 021:** "port" reads as "listener" — the advertised address (socket
+   path or named pipe) is bound by the time the descriptor exists.
 6. The payload parses under Appistry's real `menu_spec.parse_menu` with **no row
    dropped and no string repaired**.
 7. `Host` non-loopback → 400; missing `Host` → 400; any `Origin` → 403; bad or
    negative `Content-Length` → 413; `POST` → 405 (017: when no action handler is
-   supplied); guards apply to every route.
+   supplied); guards apply to every route. **Superseded by 021 on POSIX**, where
+   none of this applies to a transport with no `Host`, `Origin`, or verb at all;
+   still literally true of the historical HTTP surface.
 8. Hostile transcript text cannot put a control character, ANSI escape, bidi
    override, CR or LF into any label.
 9. `attach()` returns `None` rather than raising when it cannot bind or publish —
@@ -353,6 +386,9 @@ therefore hides a loop that never ends on its own.
 
 - **The console.** `/` and `/session/<id>` are deliberately stubs. A real UI on
   this port would carry prose and would force the token decision to be reopened.
+  **This happened.** 021 reopens exactly this, on the grounds anticipated here:
+  the surface changed, so the question was reasked, and this time the transcript
+  did not have to stay behind it.
 - **Host election.** Ravens do not participate; Appistry elects its own host by
   lock file.
 - **Huginn's side.** Implemented separately in its own repository.

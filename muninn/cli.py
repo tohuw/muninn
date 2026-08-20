@@ -1598,17 +1598,17 @@ def _print_daemon_section() -> None:
     # a field printed verbatim makes whatever wrote that file an author of it. A
     # `db` path carrying an ANSI escape could rewrite the line above it.
     pid = state.get("pid") if isinstance(state.get("pid"), int) else None
-    port = state.get("port") if isinstance(state.get("port"), int) else None
+    address = state.get("address") if isinstance(state.get("address"), str) else None
     if pid is None or not store.pid_alive(pid):
         print(f"  state       {state_file}")
         print(f"  WARNING: state file names pid {pid if pid is not None else '(unrecorded)'}, "
               f"which is not running — the daemon crashed; the file is stale")
         return
     print(f"  running     pid {pid} · since {_epoch_to_iso(state.get('started'))}")
-    # "no menu port" is a real state, not an error: ravenserve.attach() returns
-    # None rather than costing the daemon its ingest (spec 009 #9), so a daemon
-    # with no port is still doing the job that matters.
-    print(f"  menu port   {port if port is not None else 'none (the raven did not bind; see below)'}")
+    # "no menu listener" is a real state, not an error: ravenserve.attach()
+    # returns None rather than costing the daemon its ingest (spec 009 #9), so
+    # a daemon with no listener is still doing the job that matters.
+    print(f"  menu        {address if address is not None else 'none (the raven did not bind; see below)'}")
     print(f"  archive     {raven.safe_label(state.get('db'), 200) or '(unrecorded)'}")
 
 

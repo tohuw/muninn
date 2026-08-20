@@ -867,7 +867,8 @@ class DoctorTest(_TempState):
 
         (paths.STATE_DIR).mkdir(parents=True, exist_ok=True)
         (paths.STATE_DIR / "daemon.json").write_text(
-            json.dumps({"pid": 2 ** 30, "port": 1, "started": 0.0}), encoding="utf-8")
+            json.dumps({"pid": 2 ** 30, "address": "/tmp/fake.sock", "started": 0.0}),
+            encoding="utf-8")
         report = self._report()
         self.assertIn("stale", report.lower())
         self.assertIn("at login", report)
