@@ -737,6 +737,61 @@ class DoctorRenderingTest(unittest.TestCase):
         self.assertNotIn("  running     pid", report)
 
 
+class MenubarSectionRenderingTest(unittest.TestCase):
+    """`doctor`'s "shared menubar" section reads the raven descriptor, not the
+    daemon state file — a separate function, :func:`cli._print_menubar_section`,
+    with no coverage before this class. Added alongside spec 021: a descriptor
+    this build wrote carries "transport"/"address" and no "port" at all, and a
+    line that still printed "port None" against one would be worse than no line.
+    """
+
+    def setUp(self) -> None:
+        from muninn import cli, raven
+
+        self.cli = cli
+        self.tmp = Path(tempfile.mkdtemp(prefix="muninn-menubar-doctor-"))
+        self.prior = raven.state_dir
+        raven.state_dir = lambda *_a, **_kw: self.tmp
+        self.addCleanup(setattr, raven, "state_dir", self.prior)
+
+    def tearDown(self) -> None:
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _report(self) -> str:
+        import contextlib
+        import io
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.cli._print_menubar_section()
+        return buffer.getvalue()
+
+    def test_a_current_descriptor_reports_its_address_not_a_port(self) -> None:
+        (self.tmp / "muninn.json").write_text(json.dumps({
+            "pid": os.getpid(), "transport": "unix",
+            "address": "/tmp/fake-muninn.sock",
+        }), encoding="utf-8")
+        report = self._report()
+        self.assertIn("address /tmp/fake-muninn.sock", report)
+        self.assertNotIn("port", report)
+
+    def test_a_pre_021_descriptor_still_reports_its_port(self) -> None:
+        # A still-running older daemon can have published this shape before an
+        # upgrade landed; doctor must describe what is actually on disk, not
+        # assume every descriptor was written by this build.
+        (self.tmp / "muninn.json").write_text(json.dumps({
+            "pid": os.getpid(), "port": 49408,
+        }), encoding="utf-8")
+        report = self._report()
+        self.assertIn("port 49408", report)
+        self.assertNotIn("address", report)
+
+    def test_absent_descriptor_says_muninn_is_not_in_the_menubar(self) -> None:
+        self.assertIn("absent", self._report())
+
+
 # ── The real thing: a live daemon, signalled ──────────────────────────────────
 
 _CHILD = textwrap.dedent(

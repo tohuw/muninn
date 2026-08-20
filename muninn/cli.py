@@ -1710,13 +1710,22 @@ def _print_menubar_section() -> None:
         return
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        pid, port = payload.get("pid"), payload.get("port")
+        pid = payload.get("pid")
+        transport = payload.get("transport")
+        # A descriptor with no "transport" key is the pre-021 HTTP shape,
+        # where "port" is the whole address; one written by this build always
+        # carries "transport" and reports "address" instead. Reading both
+        # rather than assuming the current build wrote this file is what lets
+        # this line stay correct against a descriptor a still-running older
+        # process published before an upgrade.
+        where = payload.get("address") if transport else payload.get("port")
+        label = "address" if transport else "port"
     except (OSError, ValueError):
         print("              present but unreadable — the host will report it as malformed")
         return
     alive = store.pid_alive(pid if isinstance(pid, int) else None)
     state = "serving" if alive else "STALE (its process is gone; the host will say so)"
-    print(f"              {state} · pid {pid} · port {port}")
+    print(f"              {state} · pid {pid} · {label} {where}")
 
 
 def _print_plugins_section() -> None:
