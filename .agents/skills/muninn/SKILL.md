@@ -169,6 +169,28 @@ matches a basename or path; `--tool` matches a tool the session used (`Read`,
   guessing. `--enrich-metered` is how the user opts into spending; suggest it, do
   not assume it.
 
+### The name and the topic are different fields
+
+Every session row carries both, and answering with the wrong one is a real
+mistake rather than a stylistic one:
+
+- **`title`** is what the conversation is *called* — the name the user gave it
+  in claude.ai's sidebar, or a `title:` header from a prose index. It is what
+  they will say out loud ("the Neurospicy one") and the only string they can
+  use to find it again in the vendor UI.
+- **`topic`** is what enrichment decided the conversation was *about*. Useful,
+  derived, and not something the user ever typed.
+
+When asked what a session is called, give the `title`. Do not offer the topic as
+though it were the name. Sources that do not name conversations — Claude Code,
+Codex — report `title: null`, which is a fact about the source, not a missing
+value to paper over; say the session has no name rather than substituting one.
+
+`show` prints the name in its header, and `search`, `log` and `correlate` print
+it quoted before the topic. **Titles are not in the search index**, so
+`search "Neurospicy"` matches sessions whose *prose* contains the word, not
+sessions named it — scan `log --json` for the name when hunting a series.
+
 ## Machine-readable output
 
 Prefer `--json` when you are going to parse or relay the result — do not scrape

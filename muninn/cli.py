@@ -11,6 +11,7 @@ import datetime as dt
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 from . import (
     __version__,
@@ -655,7 +656,8 @@ def cmd_recall(args: argparse.Namespace) -> int:
         print(heading)
         for item in entries:
             score = f"  {item.score:.2f}" if item.score is not None else ""
-            label = item.topic or _first_line(item.summary) or item.cwd or item.source
+            label = (item.topic or item.title or _first_line(item.summary)
+                     or item.cwd or item.source)
             print(f"  {item.session_id[:8]}  {str(item.started_at)[:10]}{score}  "
                   f"{str(label)[:66]}")
             if item.outcome:
@@ -671,6 +673,28 @@ def _first_line(text: str | None) -> str | None:
         return None
     lines = str(text).splitlines()
     return lines[0].strip() if lines else None
+
+
+def _title(row: Any) -> str:
+    """The conversation's own name, ready to drop into a one-line row.
+
+    This is the name *the user gave the conversation* -- claude.ai's sidebar
+    title, codexdex's ``title`` header -- as opposed to ``topic``, which
+    enrichment derived. Both are useful and neither substitutes for the other:
+    "Neurospicy 3" is how somebody finds a conversation again, and "Late-
+    identified adult autism diagnosis" is what it turned out to be about. So
+    this never competes with topic for the same slot; it gets its own.
+
+    Whitespace is collapsed because a title is transcript-derived text and a
+    newline in one would tear the row it is printed into. The quotes mark it as
+    a name rather than a description, which is the whole distinction when both
+    are on the same line.
+    """
+    raw = row.get("title") if isinstance(row, dict) else getattr(row, "title", None)
+    if not raw:
+        return ""
+    flat = " ".join(str(raw).split())
+    return f'  "{flat}"' if flat else ""
 
 
 _CONFIDENCE_NOTE = {
@@ -704,7 +728,8 @@ def cmd_why(args: argparse.Namespace) -> int:
             print("          no session was open when this landed")
         for session in change.sessions:
             note = _CONFIDENCE_NOTE.get(session.confidence, session.confidence)
-            label = session.topic or _first_line(session.summary) or session.source
+            label = (session.topic or session.title
+                     or _first_line(session.summary) or session.source)
             print(f"          {session.session_id[:8]}  ({note})  {str(label)[:52]}")
             if session.outcome:
                 print(f"                    outcome: {session.outcome}")
@@ -716,7 +741,8 @@ def cmd_why(args: argparse.Namespace) -> int:
         print("edited this file, but committed nothing — exploration, a reverted")
         print("attempt, or work still in the tree:\n")
         for session in found.uncommitted:
-            label = session.topic or _first_line(session.summary) or session.source
+            label = (session.topic or session.title
+                     or _first_line(session.summary) or session.source)
             print(f"  {session.session_id[:8]}  {str(label)[:66]}")
         print()
     for reason in found.unavailable.values():
@@ -939,7 +965,7 @@ def cmd_correlate(args: argparse.Namespace) -> int:
         where = Path(rec["cwd"]).name if rec.get("cwd") else "-"
         topic = f"  {rec['topic']}" if rec.get("topic") else ""
         print(f"{score:5.3f}  {session_id[:8]}  {rec.get('source','?'):6} {when}  "
-              f"{where}{topic}")
+              f"{where}{_title(rec)}{topic}")
     st.close()
     return 0
 
@@ -999,6 +1025,7 @@ def cmd_search(args: argparse.Namespace) -> int:
             "started_at": hit.get("started_at"),
             "cwd": hit.get("cwd"),
             "words": hit.get("words"),
+            "title": hit.get("title"),
             "excerpt": " ".join((hit.get("excerpt") or "").split()),
             "score": hit.get("score"),
             "chunk_hits": hit.get("chunk_hits"),
@@ -1021,7 +1048,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         tag = " (subagent)" if rec.get("provenance") == "subagent" else ""
         hits_note = f"  [{hit['chunk_hits']} hits]" if hit.get("chunk_hits", 1) > 1 else ""
         print(f"\n{sid[:8]}  {rec.get('source','?'):6} {when}  {where}{tag}"
-              f"  ({rec.get('words',0):,}w){hits_note}")
+              f"  ({rec.get('words',0):,}w){hits_note}{_title(rec)}")
         excerpt = " ".join((hit.get("excerpt") or "").split())
         if excerpt:
             print(f"    {excerpt}")
@@ -1096,7 +1123,7 @@ def cmd_log(args: argparse.Namespace) -> int:
         tag = " (subagent)" if row.get("provenance") == "subagent" else ""
         topic = f"  {row['topic']}" if row.get("topic") else ""
         print(f"{when}  {row['session_id'][:8]}  {row.get('source','?'):6} "
-              f"{where}{tag}  ({row.get('words',0):,}w){topic}")
+              f"{where}{tag}  ({row.get('words',0):,}w){_title(row)}{topic}")
     st.close()
     return 0
 
@@ -1119,7 +1146,7 @@ def cmd_show(args: argparse.Namespace) -> int:
     sid = rows[0]["session_id"]
     rec = st.get_session(sid) or {}
     print(f"# session: {sid}")
-    for key in ("source", "provenance", "cwd", "branch", "model",
+    for key in ("title", "source", "provenance", "cwd", "branch", "model",
                 "started_at", "ended_at", "words"):
         if rec.get(key) not in (None, ""):
             print(f"# {key}: {rec[key]}")

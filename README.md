@@ -78,7 +78,8 @@ uv run muninn recall --repo cyberwise
 # Why is this file the way it is? Its commits, and the work behind each one.
 uv run muninn why src/auth.py
 
-# Read one session in full (id prefixes are fine).
+# Read one session in full (id prefixes are fine). The header names the
+# conversation, when the source gave it a name.
 uv run muninn show a7efca23
 
 # Reopen a session in the tool that created it — if its transcript still exists.
@@ -604,6 +605,7 @@ nonsense rather than an error.
 - [x] Prose-index backfill (`muninn backfill`) from `claudex` / `codexdex`
 - [x] `muninn resume` — reopen a session, or say honestly why it cannot be
 - [x] Index-time enrichment (`muninn enrich`): topic, outcome, decisions, artifacts
+- [x] Conversation names surfaced alongside derived topics in every command and `--json` payload
 - [x] Hybrid retrieval: `muninn embed`, `search --semantic/--deep`, `muninn correlate`
 - [x] Automatic background embedding, owned by the daemon and gated on a provider
 - [ ] `muninn brief` — a synthesis across matching sessions, carrying provenance per claim

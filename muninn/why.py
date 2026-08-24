@@ -97,6 +97,9 @@ class Attribution:
     session_id: str
     source: str
     confidence: str
+    #: The name the conversation was given, when the source had one. Distinct
+    #: from ``topic``, which enrichment derived.
+    title: str | None = None
     topic: str | None = None
     outcome: str | None = None
     summary: str | None = None
@@ -107,6 +110,7 @@ class Attribution:
             "session_id": self.session_id,
             "source": self.source,
             "confidence": self.confidence,
+            "title": self.title,
             "topic": self.topic,
             "outcome": self.outcome,
             "summary": self.summary,
@@ -247,8 +251,8 @@ def _rows_for_file(st: Store, path: str, repo: str | None) -> dict[str, dict]:
     # neither in a way that can be relied on across the two spellings.
     like = f"%{os.sep}{basename}" if basename else "%"
     rows = st.conn.execute(
-        f"SELECT s.session_id, s.source, s.started_at, s.ended_at, s.topic, "
-        f"       s.outcome, s.summary, s.facets_json, f.path "
+        f"SELECT s.session_id, s.source, s.started_at, s.ended_at, s.title, "
+        f"       s.topic, s.outcome, s.summary, s.facets_json, f.path "
         f"FROM sessions s JOIN session_files f ON f.session_id = s.session_id "
         f"WHERE s.provenance IN ({placeholders}) "
         f"  AND (f.basename = ? OR f.path LIKE ? OR f.path LIKE ?)",
@@ -306,6 +310,7 @@ def _attribution(row: dict, confidence: str) -> Attribution:
         session_id=row["session_id"],
         source=row["source"],
         confidence=confidence,
+        title=row["title"],
         topic=row["topic"],
         outcome=row["outcome"],
         summary=row["summary"],

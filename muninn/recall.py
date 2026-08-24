@@ -72,6 +72,10 @@ class Recalled:
     started_at: str
     words: int
     why: str                      #: unfinished | prior | related
+    #: The name the conversation was given, when the source had one. Distinct
+    #: from ``topic``, which enrichment derived: a title is how someone finds
+    #: this again, a topic is what it turned out to be about.
+    title: str | None = None
     topic: str | None = None
     outcome: str | None = None
     summary: str | None = None
@@ -113,12 +117,12 @@ def _row(row: Any, why: str, score: float | None = None) -> Recalled:
         session_id=row["session_id"], source=row["source"] or "",
         cwd=row["cwd"] or "", started_at=row["started_at"] or "",
         words=int(row["words"] or 0), why=why,
-        topic=row["topic"], outcome=row["outcome"], summary=row["summary"],
-        score=score)
+        title=row["title"], topic=row["topic"], outcome=row["outcome"],
+        summary=row["summary"], score=score)
 
 
-_SELECT = ("SELECT session_id, source, cwd, started_at, words, topic, outcome, summary "
-           "FROM sessions")
+_SELECT = ("SELECT session_id, source, cwd, started_at, words, title, topic, "
+           "outcome, summary FROM sessions")
 
 
 def current_repo(st: Store, *, cwd: str | None = None) -> str | None:

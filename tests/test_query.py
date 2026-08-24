@@ -356,7 +356,7 @@ class JsonShapeTest(TempArchiveTest):
         make_session(self.st, "b", "shared search term")
         rows = self.st.search("shared search term")
         expected_keys = {"session_id", "source", "provenance", "started_at",
-                         "cwd", "words", "excerpt", "score", "chunk_hits"}
+                         "cwd", "words", "title", "excerpt", "score", "chunk_hits"}
         self.assertEqual(len(rows), 2)
         for row in rows:
             self.assertEqual(set(row.keys()), expected_keys)
