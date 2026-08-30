@@ -2153,6 +2153,21 @@ def _add_filter_args(p: argparse.ArgumentParser) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows gives us a cp1252 stdout, so any transcript holding a character
+    # outside that codepage - an arrow, an em dash, a box-drawing rule, all of
+    # which agents emit constantly - killed the command with UnicodeEncodeError
+    # instead of printing. `muninn show` was unusable on Windows for exactly
+    # that reason: it died on a single U+2192 in the first session tried.
+    #
+    # Reconfigure rather than sanitise. The archive holds the real text and the
+    # terminal can render it; only the default encoding was ever wrong. Guarded
+    # because stdout is not always a reconfigurable stream - piped, captured
+    # under a test harness, or already replaced by a caller.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     args = build_parser().parse_args(argv)
     return int(args.func(args))
 
