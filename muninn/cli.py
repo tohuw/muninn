@@ -10,6 +10,7 @@ import argparse
 import datetime as dt
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from . import (
     providers,
     queue,
     raven,
+    ravenserve,
     recall,
     rerank,
     resume,
@@ -878,7 +880,8 @@ def cmd_embed(args: argparse.Namespace) -> int:
     # the two can never disagree about what is already embedded. Id order here
     # rather than the worker's newest-first: a resumed manual run should visibly
     # continue where the last one stopped.
-    rows = embed.pending_chunks(st, provider.model,
+    space = embed.space_of(provider)
+    rows = embed.pending_chunks(st, space,
                                source=args.source, limit=args.limit)
 
     if args.dry_run:
@@ -886,7 +889,7 @@ def cmd_embed(args: argparse.Namespace) -> int:
         # store and then called vector_count() on it, so `--dry-run` — the one
         # path whose entire job is to be safe to run — was the only path that
         # raised.
-        present = embed.vector_count(st, provider.model)
+        present = embed.vector_count(st, space)
         st.close()
         print(f"model    {provider.model} (dim {provider.dim})")
         print(f"planned  {len(rows):,} chunk(s) to embed")
@@ -906,7 +909,7 @@ def cmd_embed(args: argparse.Namespace) -> int:
             vectors = provider.embed([r["body"] for r in window])
             for row, vector in zip(window, vectors):
                 written += embed.store_vectors(
-                    st, row["session_id"], provider.model, provider.dim,
+                    st, row["session_id"], space, provider.dim,
                     [list(vector)], start_ordinal=row["ordinal"])
             st.commit()   # resumable: a killed run keeps everything it paid for
     except embed.EmbeddingUnavailable as exc:
@@ -948,7 +951,7 @@ def cmd_correlate(args: argparse.Namespace) -> int:
         st.close()
         return 1
 
-    neighbours = embed.correlate(st, provider.model, rows[0]["session_id"],
+    neighbours = embed.correlate(st, embed.space_of(provider), rows[0]["session_id"],
                                  limit=args.limit)
     if args.json:
         print(json.dumps([{"session_id": s, "similarity": round(v, 4)}
@@ -1300,6 +1303,67 @@ def cmd_uninstall_agent(args: argparse.Namespace) -> int:
     return result
 
 
+def cmd_stop(args: argparse.Namespace) -> int:
+    """Ask the running daemon to stop, or restart, over its own raven.
+
+    The gap this fills, stated plainly because it was invisible for as long as
+    it existed: `muninn serve` has published a Quit action since spec 017 and
+    performed a clean teardown on it — withdraw the descriptor, stop the
+    embedder and enricher, remove the state file, release the lock, in that
+    order — and the only thing able to *invoke* it was a menubar. From a
+    terminal the daemon could only be killed, which on Windows means
+    `TerminateProcess` and therefore none of those four. The symptom is a
+    stale descriptor plus an import ledger row with ``finished_at`` NULL, both
+    of which `doctor` then reports as a crash. It was a crash; the tool just
+    had no other way to stop.
+
+    So this is a front door onto the existing action, not a second shutdown
+    path. ``raven.perform_action`` is unchanged and still the only thing that
+    stops the loop — see its docstring on why the signal is delivered *after*
+    the reply is written rather than before.
+
+    Exit status is 0 when there is nothing to stop. Stopping an already
+    stopped daemon is not a failure, and a script that stops before starting
+    should not need to special-case the first run.
+    """
+    action = raven.RESTART if args.restart else raven.QUIT
+    verb = "restart" if args.restart else "stop"
+    try:
+        reply = ravenserve.request({"op": raven.ACTION_OP, "id": action})
+    except FileNotFoundError:
+        print("muninn: no daemon is running (no raven descriptor published)")
+        return 0
+    except OSError as exc:
+        # A descriptor naming a dead pid is the fingerprint of the very
+        # problem this command exists to prevent, so say so rather than
+        # printing a bare errno.
+        print(f"muninn: cannot reach the daemon — {exc}", file=sys.stderr)
+        print("        `muninn doctor` reports whether the descriptor is stale",
+              file=sys.stderr)
+        return 1
+
+    if not reply.get("ok"):
+        print(f"muninn: the daemon refused to {verb}: "
+              f"{reply.get('error', 'no reason given')}", file=sys.stderr)
+        return 1
+
+    # The reply is written before the signal is delivered, so a successful
+    # answer means "accepted", not "finished". Waiting for the descriptor to
+    # go is what makes this usable in a script that restarts the daemon:
+    # without it the next `serve` races the old process for the lock.
+    deadline = time.monotonic() + args.timeout
+    path = raven.descriptor_path()
+    while time.monotonic() < deadline:
+        if not path.exists():
+            print(f"muninn: daemon {verb}ped cleanly" if not args.restart
+                  else "muninn: daemon restarting")
+            return 0
+        time.sleep(0.1)
+    print(f"muninn: the daemon accepted the {verb} but its descriptor is still "
+          f"present after {args.timeout:.0f}s", file=sys.stderr)
+    return 1
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Report archive health. Staleness must be visible, never silent."""
     st = store.open_store(args.db)
@@ -1421,9 +1485,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _print_embeddings_section(st: store.Store) -> None:
-    """Vector count and memory per model (spec 006: report it so growth is visible).
+    """Vector count and memory per space (spec 006: report it so growth is visible).
 
-    Two models present is the line worth reading. It means a half-finished
+    Per *space*, not per model: a provider may embed the same weights by a
+    different recipe, and `embed.space_of` is what keeps those apart. The rows
+    here are whatever is in ``chunk_vectors.model``, so a windowed provider
+    prints `<model>+w512s64mean` and a plain one prints the bare id.
+
+    Two spaces present is the line worth reading. It means a half-finished
     re-embed — search uses one space at a time, so the older set is dead weight
     that still costs the memory printed next to it, and nothing else in the tool
     will ever mention it.
@@ -1453,7 +1522,7 @@ def _print_embeddings_section(st: store.Store) -> None:
         if pending:
             print(f"  {'':44} {pending:>14,} chunk(s) pending")
     if len(models) > 1:
-        print("  WARNING: more than one embedding model is present. Search uses one at "
+        print("  WARNING: more than one embedding space is present. Search uses one at "
               "a time, so the others are dead weight — finish the re-embed or delete them")
 
 
@@ -1869,7 +1938,13 @@ def build_parser() -> argparse.ArgumentParser:
                               "survey calls no model: it is SQL aggregates, and "
                               "the alternative is a gate that silently covers "
                               "less of the corpus every week while enrichment "
-                              "keeps reporting 100% of eligible (docs/specs/011)")
+                              # Doubled, or argparse crashes formatting this
+                              # help: it runs `help % params`, and "% o" is a
+                              # valid conversion (space flag, octal), so
+                              # `muninn serve --help` died with "%o format: an
+                              # integer is required, not dict". A literal
+                              # percent in a help string must always be "%%".
+                              "keeps reporting 100%% of eligible (docs/specs/011)")
     p_serve.add_argument("--enrich-metered", action="store_true",
                          help="allow background enrichment to use a model that bills "
                               "per token. Off by default: without it the worker "
@@ -2047,6 +2122,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_doctor = sub.add_parser("doctor", help="report archive health and index lag")
     p_doctor.set_defaults(func=cmd_doctor)
+
+    p_stop = sub.add_parser(
+        "stop", help="stop the running daemon cleanly (or restart it)",
+        description="Ask `muninn serve` to shut down over its own raven, which "
+                    "runs the full teardown: withdraw the descriptor, stop the "
+                    "embedder and enricher, remove the state file, release the "
+                    "lock. Killing the process skips all four and looks like a "
+                    "crash to `doctor` afterwards. Exits 0 when nothing is "
+                    "running, so it is safe to call before `serve`.")
+    p_stop.add_argument("--restart", action="store_true",
+                        help="restart the daemon instead of stopping it")
+    p_stop.add_argument("--timeout", type=float, default=10.0,
+                        help="seconds to wait for the descriptor to disappear "
+                             "(default: 10)")
+    p_stop.set_defaults(func=cmd_stop)
 
     p_survey = sub.add_parser(
         "survey", help="measure the corpus and derive thresholds into calibration.json",

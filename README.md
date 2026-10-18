@@ -60,6 +60,7 @@ uv sync
 # Run it as a service. This is the normal way to run Muninn.
 uv run muninn serve
 uv run muninn install-agent   # ...and have it start at login
+uv run muninn stop            # ...and stop it cleanly, not with a kill
 
 # Ingest local transcripts once, by hand. Idempotent; safe to run repeatedly.
 uv run muninn index
@@ -143,6 +144,14 @@ It is built to be supervised, not to supervise itself: it records
 exits cleanly on `SIGTERM`, `SIGHUP` and Ctrl-C, withdrawing everything it
 published. `muninn doctor` reports whether it is running, its port, and whether
 its menubar descriptor is published.
+
+Stop it with **`muninn stop`** (or `muninn stop --restart`), which asks the
+daemon over its own menubar channel and gets the full teardown: descriptor
+withdrawn, workers stopped, state file removed, lock released. That matters
+more than it sounds like it should — killing the process skips all four, so
+`doctor` afterwards reports a stale descriptor and an unfinished import, and
+on Windows killing it was for a long time the *only* way to stop it. `stop`
+exits 0 when nothing is running, so a script may call it before `serve`.
 
 Only one ingest loop may run at a time — a second is refused, naming the first —
 because two loops would drain one queue twice and fight over one descriptor.

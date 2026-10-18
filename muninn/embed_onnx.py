@@ -65,15 +65,20 @@ DEFAULT_DIM = 384
 ONNX_FILE = "onnx/model.onnx"
 TOKENIZER_FILE = "tokenizer.json"
 
-#: BERT-family context limit. Truncation is here so a long chunk cannot raise
-#: instead of embedding — but note that for this corpus it is the *ordinary*
-#: path, not a guard against a pathological outlier: ``store.chunk_text``
-#: targets 400 words, which measures at a median of 540 tokens, and 85% of
-#: real chunks reach this cap (.valholl/articles/corpus-measurements.md,
-#: "Embedding memory"). Every full-width chunk loses its tail. That is a
-#: retrieval question, recorded where it can be weighed, and deliberately not
-#: changed here: widening the window is a re-embed of the whole archive.
+#: BERT-family context limit — the model's, not a policy. A chunk longer than
+#: this is **windowed** rather than truncated (see :meth:`embed`), because for
+#: this corpus reaching the cap is the ordinary path and not a pathological
+#: outlier: ``store.chunk_text`` targets 400 words, which measures at a median
+#: of 540 tokens, and 85% of real chunks reach it
+#: (.valholl/articles/corpus-measurements.md, "Embedding memory").
 MAX_TOKENS = 512
+
+#: Tokens each window repeats from the one before it. The chunker already
+#: overlaps its *word* windows for the same reason — a phrase that straddles a
+#: boundary must still be findable — and the argument does not change one
+#: layer down. 64 is ~12% of the window: enough to carry a sentence across,
+#: cheap enough not to add a window to a typical chunk.
+WINDOW_STRIDE = 64
 
 #: Rows per forward pass. Padding is to the longest row *in the batch*, and
 #: because of the measurement above essentially every batch pads to the full
@@ -107,6 +112,28 @@ class ONNXEmbeddingProvider:
     _session: Any = field(default=None, repr=False, compare=False)
     _tokenizer: Any = field(default=None, repr=False, compare=False)
     _inputs: frozenset = field(default=frozenset(), repr=False, compare=False)
+    _pad_id: int = field(default=0, repr=False, compare=False)
+
+    @property
+    def space(self) -> str:
+        """The identity of the vectors this provider produces.
+
+        The model id alone is not it. Two providers can load the same weights
+        and still produce vectors that must never be compared — which is
+        exactly what happened here: until 2026-10-18 a chunk over
+        :data:`MAX_TOKENS` was embedded from its first 512 tokens and its tail
+        was discarded, and now it is embedded from every window of it. Same
+        weights, same dimension, different meaning per row.
+
+        So the recipe is part of the key, derived from the constants rather
+        than written out, because a change to either of them is a change to
+        the vectors and must invalidate the stored ones rather than quietly
+        mixing two spaces. ``chunk_vectors`` is keyed on this, so bumping it
+        re-embeds the archive; see
+        .valholl/articles/embedding-the-whole-chunk.md for why that cost was
+        accepted rather than engineered around.
+        """
+        return f"{self.model}+w{MAX_TOKENS}s{WINDOW_STRIDE}mean"
 
     def available(self) -> str | None:
         """Import-level checks only. No network, no weight load, no I/O."""
@@ -146,8 +173,19 @@ class ONNXEmbeddingProvider:
         tokenizer_path = fetch(TOKENIZER_FILE)
 
         tokenizer = Tokenizer.from_file(tokenizer_path)
-        tokenizer.enable_truncation(max_length=MAX_TOKENS)
-        tokenizer.enable_padding()
+        # Truncation here does not mean "drop the tail". The tokenizer hands
+        # back everything past the cap on ``Encoding.overflowing``, each window
+        # carrying its own [CLS]/[SEP]; what used to discard the tail was
+        # embed() reading only the first encoding and ignoring that list.
+        # ``stride`` is the overlap between consecutive windows and nothing
+        # more — verified by mutation: removing it leaves the windows in place
+        # and merely butts them end to end.
+        tokenizer.enable_truncation(max_length=MAX_TOKENS, stride=WINDOW_STRIDE)
+        # Padding is done by hand in embed(), per batch of windows, because the
+        # batch is assembled from several texts' overflow and encode_batch's
+        # per-call padding cannot see across that.
+        tokenizer.no_padding()
+        self._pad_id = tokenizer.token_to_id("[PAD]") or 0
 
         options = ort.SessionOptions()
         # Half the cores, not all of them. This runs in the daemon's background
@@ -184,6 +222,34 @@ class ONNXEmbeddingProvider:
         Normalised here so every consumer can treat cosine as a dot product;
         ``embed.cosine_topk`` relies on it and would otherwise pay a division
         per row per query.
+
+        **Every token of every input reaches the model.** A text longer than
+        :data:`MAX_TOKENS` becomes several overlapping windows, each embedded,
+        and the row's vector is their mean. The thing being fixed is not
+        hypothetical: measured on this archive, truncation left **7.9% of all
+        prose unreachable to semantic search**, and the losses were not spread
+        evenly — code and JSON tokenise at roughly three tokens per word, so a
+        400-word chunk of them fit only ~170 words inside the cap, and the
+        chunker's 80-word overlap cannot bridge a 230-word gap. In an archive
+        of coding-agent transcripts the worst-covered chunks were the most
+        code-heavy ones.
+
+        **The mean is a compromise, and the honest version of it is written
+        down.** ``embed.search_sessions`` argues the other way one level up —
+        a session scores as its *best* chunk, never its mean, because
+        averaging lets fifty irrelevant chunks dilute one exact hit. That
+        argument applies here too, weakly: these windows are 2–3 adjacent
+        slices of one 400-word passage rather than a whole session, so the
+        dilution is real but small. Storing one row per window would avoid it
+        and is the better endpoint; it needs ``chunk_vectors`` rebuilt, since
+        its primary key is ``(session_id, ordinal, model)`` and would collapse
+        the windows into one row. That was not worth coupling to a coverage
+        fix. Unreachable prose is a guaranteed miss; dilution is a ranking
+        risk — fixing the first and recording the second is the right order.
+
+        Peak memory is unchanged by any of this: :data:`BATCH` bounds the
+        forward pass, and it now bounds windows rather than rows, so a long
+        input costs more passes and never a larger one.
         """
         reason = self.available()
         if reason is not None:
@@ -201,25 +267,50 @@ class ONNXEmbeddingProvider:
             return np.zeros((0, self.dim), dtype=np.float32)
 
         session, tokenizer = self._ensure_loaded()
+
+        # Flatten every input to its windows, remembering which row each one
+        # belongs to. One flat list means a batch is always full even when one
+        # long text and several short ones are embedded together.
+        owners: list[int] = []
+        windows: list[Any] = []
+        for index, text in enumerate(rows):
+            encoded = tokenizer.encode(text)
+            for window in (encoded, *encoded.overflowing):
+                owners.append(index)
+                windows.append(window)
+
         out: list[Any] = []
-        for start in range(0, len(rows), BATCH):
-            encoded = tokenizer.encode_batch(rows[start:start + BATCH])
-            ids = np.array([e.ids for e in encoded], dtype=np.int64)
-            feeds = {
-                "input_ids": ids,
-                "attention_mask": np.array(
-                    [e.attention_mask for e in encoded], dtype=np.int64),
-            }
+        for start in range(0, len(windows), BATCH):
+            batch = windows[start:start + BATCH]
+            width = max(len(w.ids) for w in batch)
+            ids = np.full((len(batch), width), self._pad_id, dtype=np.int64)
+            mask = np.zeros((len(batch), width), dtype=np.int64)
+            for row, window in enumerate(batch):
+                ids[row, :len(window.ids)] = window.ids
+                mask[row, :len(window.attention_mask)] = window.attention_mask
+            feeds = {"input_ids": ids, "attention_mask": mask}
             # This export declares token_type_ids; others do not. Feeding an
             # input the graph never declared is an error, so it is asked for.
             if "token_type_ids" in self._inputs:
                 feeds["token_type_ids"] = np.zeros_like(ids)
-            # BGE pools the CLS token, not the mean. Mean pooling here would
-            # produce plausible vectors that quietly rank worse — the model was
-            # trained with CLS and its own card specifies it.
+            # BGE pools the CLS token, not the mean *over tokens*. Mean
+            # pooling across tokens here would produce plausible vectors that
+            # quietly rank worse — the model was trained with CLS and its own
+            # card specifies it. The mean taken below is a different thing: it
+            # is across *windows*, each of which was itself CLS-pooled.
             out.append(session.run(None, feeds)[0][:, 0])
 
-        array = np.concatenate(out, axis=0).astype(np.float32)
+        stacked = np.concatenate(out, axis=0).astype(np.float32)
+
+        # Mean per row, over that row's windows. A single-window row — every
+        # query, and every chunk under the cap — comes out of this unchanged,
+        # which is why short inputs are bit-for-bit what they were before.
+        array = np.zeros((len(rows), self.dim), dtype=np.float32)
+        counts = np.zeros((len(rows), 1), dtype=np.float32)
+        np.add.at(array, owners, stacked)
+        np.add.at(counts, owners, 1.0)
+        array /= np.maximum(counts, 1.0)
+
         norms = np.linalg.norm(array, axis=1, keepdims=True)
         norms[norms == 0.0] = 1.0
         return (array / norms).astype(np.float32)

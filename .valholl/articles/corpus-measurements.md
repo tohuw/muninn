@@ -91,10 +91,35 @@ Two consequences, and only the first was acted on:
 1. Attention tensors are quadratic in sequence length, so `BATCH` alone sizes
    them: `batch x 12 heads x 512 x 512 x 4 B` is 100 MB at 8 and 400 MB at 32,
    with several live at once.
-2. **Every full-width chunk loses its tail to truncation** — roughly the last
-   30 words of 400 are not in the vector. Recorded here rather than fixed:
-   widening the window is a re-embed of the whole archive, and it is a
-   retrieval-quality decision, not a memory one.
+2. **Every full-width chunk lost its tail to truncation.** Recorded here first
+   as a retrieval-quality question rather than a memory one, and **fixed on
+   2026-10-18** once measured properly — see below, and
+   [[embedding-the-whole-chunk]] for the decisions.
+
+### How much prose truncation actually cost
+
+My first estimate from this table was wrong and worth preserving as the error:
+I reasoned that losing ~21 words off a 400-word chunk is harmless because
+`chunk_text` overlaps its windows by 80 words, so a neighbour embeds the tail
+anyway. That is sound arithmetic for prose and it is not what the corpus does.
+
+| | |
+|---|---|
+| truncated chunks sampled | 6,403 |
+| tail covered by a later chunk's embedded prefix | 4,698 (73.4%) |
+| tail **genuinely unreachable** | 1,705 (26.6%) |
+| words unreachable | 223,618 of 2,827,499 (**7.9%**) |
+
+**Finding: tokens per word is not a constant, and the losses concentrated
+where they hurt most.** Prose runs ~1.35 tokens/word, so a 400-word chunk is
+~540 tokens and loses ~21 words — inside the overlap. Code, JSON and stack
+traces run ~3 tokens/word, so a 400-word chunk is ~1,200 tokens, only its
+first ~170 words fit, and an 80-word overlap cannot bridge a 230-word hole. In
+an archive of coding-agent transcripts, **the worst-covered chunks were the
+most code-heavy ones** — the content the archive exists to find.
+
+Same shape as pitfall 3 below ([[provenance-classification]]'s 40x error): a
+uniform assumption over a non-uniform corpus measures nothing in particular.
 
 ### One pass sets the footprint for the life of the process
 

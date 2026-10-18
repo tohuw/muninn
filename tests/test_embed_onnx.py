@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 
 from muninn import embed
 from muninn.embed_onnx import (BATCH, DEFAULT_DIM, DEFAULT_MODEL, MAX_TOKENS,
-                               ONNX_FILE, TOKENIZER_FILE,
+                               ONNX_FILE, TOKENIZER_FILE, WINDOW_STRIDE,
                                ONNXEmbeddingProvider)
 
 
@@ -185,6 +185,79 @@ class ProviderBehaviourTest(unittest.TestCase):
     def test_text_beyond_the_context_limit_truncates_rather_than_raising(self):
         out = self.provider.embed(["word " * 5000])
         self.assertEqual(out.shape, (1, DEFAULT_DIM))
+
+
+class WholeChunkCoverageTest(unittest.TestCase):
+    """Every token of a chunk must reach the model, not just the first 512.
+
+    Measured on the real archive before this: truncation left **7.9% of all
+    prose unreachable to semantic search**. The chunker's 80-word overlap
+    covers the ~21-word tail that prose loses, which is why this looked
+    harmless — but code and JSON tokenise at ~3 tokens per word, so a 400-word
+    chunk of them fit only ~170 words inside the cap and left a 230-word hole
+    no overlap could bridge. In an archive of coding-agent transcripts the
+    worst-covered chunks were the most code-heavy ones.
+    """
+
+    def test_the_space_names_the_windowing_recipe(self) -> None:
+        """Two providers over identical weights, two incompatible spaces.
+
+        Runs without the optional runtime because this is the assertion that
+        stops a silent mix: if ``space`` ever collapses back to the bare model
+        id, the truncated vectors already in an archive would be compared
+        against windowed ones, and cosine would rank the result without
+        complaint. Derived from the constants so changing either of them is
+        also a re-embed.
+        """
+        provider = ONNXEmbeddingProvider()
+        self.assertNotEqual(provider.space, provider.model)
+        self.assertIn(provider.model, provider.space)
+        self.assertIn(str(MAX_TOKENS), provider.space)
+        self.assertIn(str(WINDOW_STRIDE), provider.space)
+
+    @unittest.skipUnless(_weights_cached(), "model weights are not cached locally")
+    def test_the_tail_of_an_over_cap_text_reaches_the_vector(self) -> None:
+        """The defect, stated as behaviour rather than as an implementation.
+
+        Two texts share a filler prefix that alone exceeds the cap, and differ
+        only in the sentence appended *after* it. Under truncation their
+        vectors were byte-identical, so this comparison had no signal at all
+        and the assertion below could not be satisfied by any amount of
+        tuning. It is a real contract: content late in a chunk has to pull the
+        chunk's vector toward a query about that content.
+        """
+        provider = ONNXEmbeddingProvider()
+        filler = ("the archive is a system of record for data that no longer "
+                  "exists anywhere else " * 50)
+        needle = ("the redscript compiler failed to bind the vehicle summon "
+                  "hotkey in Cyberpunk 2077")
+        other = "a tabby cat asleep on a sunny windowsill in the afternoon"
+
+        with_needle, with_other, needle_only = provider.embed(
+            [f"{filler} {needle}", f"{filler} {other}", needle])
+
+        self.assertGreater(float(with_needle @ needle_only),
+                           float(with_other @ needle_only) + 0.05,
+                           "the text after the 512-token cap did not move the "
+                           "vector; the tail is being discarded")
+
+    @unittest.skipUnless(_weights_cached(), "model weights are not cached locally")
+    def test_an_input_inside_the_cap_is_a_single_window(self) -> None:
+        """Windowing must not perturb the ordinary case.
+
+        Every query and every short chunk is one window, and one window taken
+        through the mean of a one-element set is the same CLS vector it always
+        was. Asserted so a future change to the pooling cannot quietly alter
+        vectors it was not meant to touch.
+        """
+        import numpy as np
+
+        provider = ONNXEmbeddingProvider()
+        text = "a short chunk about deployment and containers"
+        once = provider.embed([text])[0]
+        # Alongside a long row, so the batch contains another text's overflow.
+        batched = provider.embed([text, "filler " * 2000])[0]
+        self.assertTrue(np.allclose(once, batched, atol=1e-5))
 
 
 class FootprintTest(unittest.TestCase):

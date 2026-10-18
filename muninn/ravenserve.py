@@ -336,6 +336,72 @@ def _listen(directory: Path | None) -> tuple[Listener, str, str, Path | None]:
     return listener, str(path), raven.TRANSPORT_UNIX, None
 
 
+def request(payload: dict[str, Any], *, reply_timeout_s: float = 5.0
+            ) -> dict[str, Any]:
+    """Send one request to the running daemon's raven and return its reply.
+
+    The client side of this module, and deliberately the only one. Roost has
+    its own (`bird_client`), and this is not a second implementation of the
+    protocol for Muninn's benefit — it exists because the *daemon's own CLI*
+    had no way to reach it, which left `muninn serve` with a documented Quit
+    action that only a menubar could invoke. A command-line user's only
+    recourse was `TerminateProcess`, the one path spec 010 spends its teardown
+    section explaining the cost of.
+
+    Everything about *where* and *how* comes out of the published descriptor
+    rather than from constants here: the address, the transport, and on
+    Windows the ``token_path`` holding the authkey. That is the same hop Roost
+    makes, and going through the descriptor rather than ``PIPE_NAME`` is what
+    keeps this honest — a daemon that published something unexpected is a
+    daemon this cannot reach, which is correct, instead of one it talks to by
+    luck.
+
+    Raises ``FileNotFoundError`` when no descriptor exists, and ``OSError``
+    when one exists but names a process that is gone. The caller distinguishes
+    them because they mean different things to a person: nothing to stop
+    versus something to clean up.
+    """
+    from . import store
+
+    path = raven.descriptor_path()
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    descriptor = json.loads(path.read_text(encoding="utf-8"))
+
+    pid = descriptor.get("pid")
+    if not store.pid_alive(pid if isinstance(pid, int) else None):
+        raise OSError(f"the descriptor names pid {pid}, which is gone")
+
+    transport = descriptor.get("transport")
+    address = descriptor.get("address")
+    if transport not in (raven.TRANSPORT_UNIX, raven.TRANSPORT_PIPE) or not address:
+        # A pre-021 descriptor advertises a port and speaks HTTP. Refusing
+        # is better than guessing: that daemon is a different protocol, and
+        # the person needs to restart it, not be told the address is bad.
+        raise OSError(f"descriptor advertises transport {transport!r}, "
+                      "which this build does not speak — restart the daemon")
+
+    authkey = None
+    token = descriptor.get("token_path")
+    if token:
+        authkey = Path(token).read_bytes()
+
+    family = "AF_UNIX" if transport == raven.TRANSPORT_UNIX else "AF_PIPE"
+    from multiprocessing.connection import Client
+
+    conn = Client(address, family=family, authkey=authkey)
+    try:
+        conn.send_bytes(_encode(payload))
+        # Bound the *reply*, not the connect: a wedged daemon that accepted
+        # the connection and never answered would otherwise hang a command
+        # whose entire job is to end that daemon.
+        if not conn.poll(reply_timeout_s):
+            raise OSError(f"no reply within {reply_timeout_s:.0f}s")
+        return json.loads(conn.recv_bytes(maxlength=MAX_REQUEST_BODY).decode("utf-8"))
+    finally:
+        conn.close()
+
+
 # ── Server ───────────────────────────────────────────────────────────────────
 
 class _Server:

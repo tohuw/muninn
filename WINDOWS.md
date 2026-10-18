@@ -147,6 +147,15 @@ weaken there. Both are best-effort by design, and neither costs ingest:
    silent:** the menubar host checks the recorded pid before trusting a
    descriptor, and `muninn doctor` cross-checks `daemon.json`'s pid and says
    "the daemon crashed; the file is stale". A restart over both files works.
+
+   Since 2026-10-18 there is also a way to not need any of that: **`muninn
+   stop`** asks the daemon over its own raven and gets the clean teardown, so
+   a Windows user is no longer choosing between Ctrl-C in a foreground console
+   and a kill. Worth stating how long that gap went unnoticed — the Quit
+   action has existed since spec 017, and nothing but a menubar could invoke
+   it, so on the platform where the menubar [had never
+   bound](#the-raven-never-bound-here-and-nobody-noticed) there was no
+   graceful stop at all.
 2. **The single-instance lock uses `msvcrt.locking` rather than `flock`**, and
    is untested on a real Windows machine. If no locking primitive is available
    at all, the daemon **fails open** — it starts anyway, with a warning, and

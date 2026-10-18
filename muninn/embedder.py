@@ -256,7 +256,8 @@ class BackgroundEmbedder:
         provider = self.provider
         assert provider is not None      # start() guarantees it before threading
 
-        backlog = embed.pending_count(st, provider.model)
+        space = embed.space_of(provider)
+        backlog = embed.pending_count(st, space)
         if backlog:
             # The one line that must not be silent: on a fresh archive this is
             # thousands of chunks and, against a hosted provider, a bill.
@@ -302,7 +303,7 @@ class BackgroundEmbedder:
                     logger.warning(
                         "muninn embedder: stopping — %d passes made no progress with "
                         "%d chunk(s) still pending; run `muninn embed` to see the error",
-                        stalls, embed.pending_count(st, provider.model))
+                        stalls, embed.pending_count(st, embed.space_of(provider)))
                     self.stopped_reason = STOPPED_STALLED
                     return
                 if self._stop.wait(backoff):
@@ -326,7 +327,7 @@ class BackgroundEmbedder:
         mid-backlog keeps every vector it has already paid for.
         """
         rows = embed.pending_chunks(
-            st, provider.model,
+            st, embed.space_of(provider),
             limit=self.batch * self.window_batches, newest_first=True)
         if not rows:
             return 0, 0
@@ -339,7 +340,7 @@ class BackgroundEmbedder:
             vectors = provider.embed([r["body"] for r in window])
             for row, vector in zip(window, vectors):
                 written += embed.store_vectors(
-                    st, row["session_id"], provider.model, provider.dim,
+                    st, row["session_id"], embed.space_of(provider), provider.dim,
                     [list(vector)], start_ordinal=row["ordinal"])
             st.commit()
         self.vectors_written += written

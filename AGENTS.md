@@ -87,6 +87,7 @@ uv run python -m unittest discover tests -v
 uv run ruff check muninn tests tools
 uv run muninn index
 uv run muninn serve
+uv run muninn stop
 uv run muninn install-agent
 uv run muninn doctor
 uv run muninn search "query"

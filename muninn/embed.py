@@ -84,6 +84,30 @@ class EmbeddingProvider(Protocol):
     def embed(self, texts: Sequence[str]) -> Any: ...
 
 
+def space_of(provider: EmbeddingProvider) -> str:
+    """The key ``chunk_vectors`` stores a provider's vectors under.
+
+    Defaults to the model id, which is what it was for every provider until
+    one of them needed to say more. ``chunk_vectors`` exists to keep
+    incompatible vectors apart, and the model id was standing in for that job
+    on the assumption that the weights fully determine the vector. They do
+    not: `embed_onnx` used to embed a chunk's first 512 tokens and discard the
+    rest, and now embeds every window of it, and those two sets of numbers
+    must never be compared even though every byte of the weights is identical.
+
+    So a provider may declare a ``space``, and one that does not keeps the old
+    behaviour unchanged — which matters because a plugin-supplied provider
+    (`plugins.EmbeddingProvider`) was written against the three-attribute
+    protocol and must not break for gaining a fourth.
+
+    Kept separate from ``provider.model`` on purpose. The model id is what
+    `policy.check` governs and what `doctor` prints to a person, and neither
+    of those wants a recipe suffix.
+    """
+    declared = getattr(provider, "space", None)
+    return str(declared) if declared else provider.model
+
+
 def require_numpy():
     """Import numpy, or raise something a person can act on.
 
@@ -367,7 +391,7 @@ def search_sessions(st: Store, provider: EmbeddingProvider, query: str,
     single strong chunk gets diluted by fifty unrelated ones.
     """
     policy.check(provider.model, provider.name)
-    matrix = load_matrix(st, provider.model)
+    matrix = load_matrix(st, space_of(provider))
     if len(matrix) == 0:
         return []
     vector = provider.embed([query])[0]
