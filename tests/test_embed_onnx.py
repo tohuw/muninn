@@ -182,7 +182,15 @@ class ProviderBehaviourTest(unittest.TestCase):
             single = self.provider.embed(texts)
         self.assertTrue(np.allclose(batched, single, atol=1e-4))
 
-    def test_text_beyond_the_context_limit_truncates_rather_than_raising(self):
+    def test_text_beyond_the_context_limit_is_one_vector_not_an_error(self):
+        """`embed` always reduces to one vector per text, however long.
+
+        Renamed from "truncates rather than raising", which is what this used
+        to assert and is no longer what happens: the text is windowed and the
+        windows are averaged. The shape is the part that was always the
+        contract — `search_sessions` embeds a query through here and needs one
+        point to search with.
+        """
         out = self.provider.embed(["word " * 5000])
         self.assertEqual(out.shape, (1, DEFAULT_DIM))
 
@@ -214,6 +222,95 @@ class WholeChunkCoverageTest(unittest.TestCase):
         self.assertIn(provider.model, provider.space)
         self.assertIn(str(MAX_TOKENS), provider.space)
         self.assertIn(str(WINDOW_STRIDE), provider.space)
+
+    def test_the_space_did_not_keep_its_name_when_the_pooling_changed(self) -> None:
+        """Changing *how* windows are stored invalidates vectors too.
+
+        The first version of the windowing fix averaged a chunk's windows into
+        one row and named its space ``...mean``. Storing one row per window
+        produces different numbers from the same weights, the same window size
+        and the same stride — so reusing that name would have mixed averaged
+        vectors with per-window ones under a single key, which cosine ranks
+        without complaint.
+
+        Written as the old name spelled out from the current constants, so it
+        fails if the suffix is ever reverted while the storage stays
+        per-window. That pairing — a recipe change that is not a constant
+        change — is the case the derived-from-constants scheme above does not
+        catch by itself.
+        """
+        provider = ONNXEmbeddingProvider()
+        self.assertNotEqual(
+            f"{provider.model}+w{MAX_TOKENS}s{WINDOW_STRIDE}mean", provider.space)
+
+    @unittest.skipUnless(_weights_cached(), "model weights are not cached locally")
+    def test_an_over_cap_text_yields_one_vector_per_window(self) -> None:
+        """What `embed.windows_of` stores, asserted on the real tokeniser.
+
+        The count is not pinned to a number — it depends on the tokeniser's
+        own boundaries and would be a test of the weights rather than of this
+        code. What is pinned is that a text past the cap produces *more than
+        one* vector, that a short one produces exactly one, and that owners
+        maps every window back to its text.
+        """
+        provider = ONNXEmbeddingProvider()
+        long_text = ("the archive is a system of record for data that no "
+                     "longer exists anywhere else " * 60)
+        short_text = "a short chunk about deployment"
+
+        array, owners = provider.embed_windows([short_text, long_text])
+
+        self.assertEqual(array.shape[1], DEFAULT_DIM)
+        self.assertEqual(array.shape[0], len(owners))
+        self.assertEqual(1, owners.count(0), "a short text should be one window")
+        self.assertGreater(owners.count(1), 1,
+                           "a text well past the cap should be several windows")
+        # Window order within a text is what numbers the rows in storage.
+        self.assertEqual(sorted(owners), owners)
+
+    @unittest.skipUnless(_weights_cached(), "model weights are not cached locally")
+    def test_every_window_vector_is_unit_length(self) -> None:
+        """The provider's contract with `cosine_topk`, on the new path too.
+
+        These vectors are now stored directly rather than being averaged
+        first, so they are what search dots against. A normalisation that
+        applied only to the mean would leave every stored vector slightly off
+        unit length and quietly scale scores by the window's magnitude.
+        """
+        import numpy as np
+
+        provider = ONNXEmbeddingProvider()
+        array, _ = provider.embed_windows(
+            ["short one", "the quick brown fox jumps " * 200])
+        norms = np.linalg.norm(array, axis=1)
+        self.assertTrue(np.allclose(norms, 1.0, atol=1e-5), f"norms were {norms}")
+
+    @unittest.skipUnless(_weights_cached(), "model weights are not cached locally")
+    def test_embed_is_the_mean_of_embed_windows(self) -> None:
+        """The two halves of the provider, checked against each other.
+
+        A contract test in the strict sense: `embed` is the query path and
+        `embed_windows` is the indexing path, and they must be the same
+        forward pass differing only by a reduction. Asserted by computing the
+        reduction here from the other method's output, so neither side can
+        satisfy it by echoing the other — if `embed` ever grew its own
+        tokenisation or pooling, these numbers would part company.
+        """
+        import numpy as np
+
+        provider = ONNXEmbeddingProvider()
+        texts = ["a short chunk about deployment",
+                 "the archive is a system of record " * 80]
+
+        array, owners = provider.embed_windows(texts)
+        reduced = provider.embed(texts)
+
+        for index in range(len(texts)):
+            rows = array[[i for i, owner in enumerate(owners) if owner == index]]
+            mean = rows.mean(axis=0)
+            expected = mean / np.linalg.norm(mean)
+            with self.subTest(text=index, windows=rows.shape[0]):
+                self.assertTrue(np.allclose(expected, reduced[index], atol=1e-5))
 
     @unittest.skipUnless(_weights_cached(), "model weights are not cached locally")
     def test_the_tail_of_an_over_cap_text_reaches_the_vector(self) -> None:

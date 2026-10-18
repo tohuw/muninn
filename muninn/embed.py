@@ -73,6 +73,17 @@ class EmbeddingProvider(Protocol):
     than a diagnostic. ``embed()`` returns an ``(n, dim)`` float32 array,
     **L2-normalised**, so search is a plain dot product rather than a division
     per row per query.
+
+    Two members are optional, and both exist because the first provider that
+    windowed its input needed to say something the original three attributes
+    could not. Neither may be *required*, because `plugins.EmbeddingProvider`
+    is this same protocol and a plugin written against it must not break for
+    lacking a member added later:
+
+    - ``space`` — the identity of the vectors, if the weights alone do not
+      determine it. See :func:`space_of`.
+    - ``embed_windows`` — per-window vectors instead of one per text. See
+      :func:`windows_of`, which is how callers must reach it.
     """
 
     name: str
@@ -108,6 +119,49 @@ def space_of(provider: EmbeddingProvider) -> str:
     return str(declared) if declared else provider.model
 
 
+def windows_of(provider: EmbeddingProvider, texts: Sequence[str]) -> tuple[Any, list[int]]:
+    """``(array, owners)``: every window's vector, and which text produced it.
+
+    ``array`` is ``(total_windows, dim)`` and ``owners[i]`` is the index into
+    ``texts`` that row ``i`` came from, so a text that needed three windows
+    appears three times. Rows stay in window order within a text, which is
+    what makes ``owners`` sufficient to number them.
+
+    **A provider that does not window is not a special case.** Without
+    ``embed_windows`` this is ``provider.embed(texts)`` and ``owners`` is just
+    ``range(len(texts))`` — one window per text, which is literally true of a
+    provider that reads each text once. So `embed_mlx` and any plugin provider
+    keep working untouched and store exactly the rows they always did, while
+    the windowing provider stores one row per window, through this one call
+    site rather than a branch at each.
+
+    Returning a flat array plus an owner map, rather than a list of arrays per
+    text, is deliberate: it is the shape a provider already has internally
+    (its batches span several texts' windows), and it keeps the caller from
+    re-concatenating what was just split.
+
+    **``owners`` is truncated to the number of rows actually returned, and
+    that is a behaviour this module is required to have rather than a
+    defensive habit.** A provider that returns fewer vectors than it was asked
+    for is broken, and `embedder.BackgroundEmbedder` detects exactly that
+    case — by seeing a pass make *zero progress* against a non-empty backlog,
+    then stopping after ``stall_limit`` passes. It is what stands between a
+    broken metered provider and a hot loop billing for it. The callers used to
+    get this free from ``zip``, which stops at the shorter side; building an
+    owner list from ``len(texts)`` instead turned that silent short write into
+    an ``IndexError``, which the worker read as a transient failure and
+    retried forever.
+    """
+    embed_windows = getattr(provider, "embed_windows", None)
+    if embed_windows is None:
+        array = provider.embed(texts)
+        owners = list(range(len(texts)))
+    else:
+        array, owners = embed_windows(texts)
+        owners = list(owners)
+    return array, owners[:len(array)]
+
+
 def require_numpy():
     """Import numpy, or raise something a person can act on.
 
@@ -135,9 +189,15 @@ def unpack_vector(blob: bytes) -> tuple[float, ...]:
     return struct.unpack(f"<{len(blob) // _ITEM_BYTES}f", blob)
 
 
-def store_vectors(st: Store, session_id: str, model: str, dim: int,
-                  vectors: Sequence[Sequence[float]], *, start_ordinal: int = 0) -> int:
-    """Persist one session's chunk vectors. Returns the row count written.
+def store_window_vectors(st: Store, session_id: str, model: str, dim: int,
+                         items: Sequence[tuple[int, int, Sequence[float]]]) -> int:
+    """Persist ``(ordinal, window, vector)`` rows. Returns the count written.
+
+    The one write path into ``chunk_vectors``; :func:`store_vectors` is this
+    function with every window fixed at 0. Kept as one function on purpose —
+    two INSERTs would be two chances to disagree about the conflict clause,
+    and the direction that disagreement fails in is a duplicate row that
+    cosine search ranks twice.
 
     A wrong-length vector raises rather than being padded or truncated. The
     alternative is a silently corrupt row that cosine search will happily rank —
@@ -145,21 +205,77 @@ def store_vectors(st: Store, session_id: str, model: str, dim: int,
     downstream would ever notice.
     """
     rows = []
-    for offset, vector in enumerate(vectors):
+    for ordinal, window, vector in items:
         values = list(vector)
         if len(values) != dim:
             raise DimensionMismatch(
-                f"{session_id} chunk {start_ordinal + offset}: provider declares dim={dim}, "
-                f"got {len(values)}")
-        rows.append((session_id, start_ordinal + offset, model, dim, pack_vector(values)))
+                f"{session_id} chunk {ordinal} window {window}: "
+                f"provider declares dim={dim}, got {len(values)}")
+        rows.append((session_id, ordinal, model, window, dim, pack_vector(values)))
     if rows:
         st.conn.executemany(
-            "INSERT INTO chunk_vectors (session_id, ordinal, model, dim, vec) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(session_id, ordinal, model) DO UPDATE SET "
+            "INSERT INTO chunk_vectors (session_id, ordinal, model, window, dim, vec) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id, ordinal, model, window) DO UPDATE SET "
             "  dim = excluded.dim, vec = excluded.vec",
             rows)
     return len(rows)
+
+
+def store_vectors(st: Store, session_id: str, model: str, dim: int,
+                  vectors: Sequence[Sequence[float]], *, start_ordinal: int = 0) -> int:
+    """One vector per consecutive chunk ordinal, all at window 0.
+
+    What a provider that does no windowing produces, and the signature every
+    caller used before windowing existed. Delegates to
+    :func:`store_window_vectors` so there is still exactly one INSERT.
+    """
+    return store_window_vectors(
+        st, session_id, model, dim,
+        [(start_ordinal + offset, 0, vector) for offset, vector in enumerate(vectors)])
+
+
+def embed_and_store(st: Store, provider: EmbeddingProvider,
+                    rows: Sequence[Any]) -> int:
+    """Embed one batch of pending chunks and write every window. Row count out.
+
+    Used by both `muninn embed` and the background worker
+    (`embedder.BackgroundEmbedder`), which is the point: those two had
+    identical copies of this loop, and :func:`pending_chunks` already exists
+    because two copies of the *read* side would be two chances to disagree
+    about what is embedded. The write side has the same problem and now has
+    the same answer.
+
+    Windows are numbered per chunk in the order the provider returned them,
+    which :func:`windows_of` guarantees. The numbering is positional rather
+    than derived from token offsets because nothing reads it: it exists to
+    keep a chunk's windows from colliding in the primary key, and a window's
+    *meaning* is in its vector.
+
+    Does not commit. Both callers batch and commit around this so a killed run
+    keeps every vector it has already paid for.
+    """
+    if not rows:
+        return 0
+    array, owners = windows_of(provider, [r["body"] for r in rows])
+    model, dim = space_of(provider), provider.dim
+
+    # (session_id, ordinal) -> next unused window number, so a batch spanning
+    # several sessions numbers each chunk's windows from 0 independently.
+    counters: dict[tuple[str, int], int] = {}
+    grouped: dict[str, list[tuple[int, int, Any]]] = {}
+    for position, owner in enumerate(owners):
+        row = rows[owner]
+        key = (row["session_id"], row["ordinal"])
+        window = counters.get(key, 0)
+        counters[key] = window + 1
+        grouped.setdefault(row["session_id"], []).append(
+            (row["ordinal"], window, array[position]))
+
+    written = 0
+    for session_id, items in grouped.items():
+        written += store_window_vectors(st, session_id, model, dim, items)
+    return written
 
 
 def pending_chunks(st: Store, model: str, *, source: str | None = None,
@@ -233,6 +349,21 @@ def vector_count(st: Store, model: str | None = None) -> int:
         "SELECT COUNT(*) n FROM chunk_vectors WHERE model = ?", (model,)).fetchone()["n"])
 
 
+def embedded_chunks(st: Store, model: str) -> int:
+    """How many *chunks* have at least one vector in ``model``'s space.
+
+    Not the same as :func:`vector_count`, which counts rows and therefore
+    windows. The distinction exists because `doctor` reports coverage as a
+    percentage of chunks, and dividing a window count by a chunk count
+    produced "137% of chunks" the moment a chunk could hold more than one
+    vector — a number that reads as a bug in the archive rather than in the
+    arithmetic.
+    """
+    return int(st.conn.execute(
+        "SELECT COUNT(DISTINCT session_id || ':' || ordinal) n "
+        "FROM chunk_vectors WHERE model = ?", (model,)).fetchone()["n"])
+
+
 def models_present(st: Store) -> list[tuple[str, int, int]]:
     """``(model, dim, rows)`` for every embedding space in the archive.
 
@@ -248,10 +379,17 @@ def models_present(st: Store) -> list[tuple[str, int, int]]:
 
 @dataclass
 class Matrix:
-    """A contiguous float32 array plus the keys its rows correspond to."""
+    """A contiguous float32 array plus the keys its rows correspond to.
 
-    keys: tuple[tuple[str, int], ...]     # (session_id, ordinal), row-aligned
-    array: Any                            # numpy (n, dim) float32
+    ``window`` is in the key only to keep it unique — a chunk embedded as
+    three windows is three rows. No consumer reads it, but a key that
+    collided would be a quietly wrong answer the first time anything indexed
+    by it, which is the kind of thing this project prefers to make impossible
+    rather than remember.
+    """
+
+    keys: tuple[tuple[str, int, int], ...]   # (session_id, ordinal, window), row-aligned
+    array: Any                               # numpy (n, dim) float32
 
     def __len__(self) -> int:
         return len(self.keys)
@@ -321,8 +459,8 @@ def load_matrix(st: Store, model: str, *, use_cache: bool = True) -> Matrix:
             return cached[1]
 
     rows = st.conn.execute(
-        "SELECT session_id, ordinal, dim, vec FROM chunk_vectors WHERE model = ? "
-        "ORDER BY session_id, ordinal", (model,)).fetchall()
+        "SELECT session_id, ordinal, window, dim, vec FROM chunk_vectors WHERE model = ? "
+        "ORDER BY session_id, ordinal, window", (model,)).fetchall()
     if not rows:
         matrix = Matrix(keys=(), array=np.zeros((0, 0), dtype=np.float32))
     else:
@@ -333,8 +471,9 @@ def load_matrix(st: Store, model: str, *, use_cache: bool = True) -> Matrix:
         usable = [r for r in rows if len(r["vec"]) == dim * _ITEM_BYTES]
         array = np.frombuffer(b"".join(r["vec"] for r in usable),
                               dtype="<f4").reshape(len(usable), dim)
-        matrix = Matrix(keys=tuple((r["session_id"], r["ordinal"]) for r in usable),
-                        array=np.ascontiguousarray(array))
+        matrix = Matrix(
+            keys=tuple((r["session_id"], r["ordinal"], r["window"]) for r in usable),
+            array=np.ascontiguousarray(array))
     # Re-stamped after the read, not before: a write that lands *during* the
     # read would otherwise be cached under the pre-write stamp and never
     # invalidate. Storing the later stamp means the next call re-reads, which is
@@ -385,10 +524,24 @@ def search_sessions(st: Store, provider: EmbeddingProvider, query: str,
                     limit: int = 20) -> list[tuple[str, float]]:
     """Semantic search, collapsed to one row per session.
 
-    A session's score is its **best** chunk, not its mean. A long session with
+    A session's score is its **best** vector, not its mean. A long session with
     one exactly-relevant passage is a better answer than a short one that is
     vaguely on-topic throughout, and averaging inverts that — the long session's
     single strong chunk gets diluted by fifty unrelated ones.
+
+    "Best vector" rather than "best chunk" since one chunk may be several
+    windows, and that is the whole reason per-window rows are stored: the max
+    here already did the right thing, so giving it the windows to choose
+    between is enough, and no code in this function changed to gain it. A
+    query that matches the tail of a long code chunk now scores against that
+    tail, instead of against an average in which it was one voice of three.
+
+    The query itself goes through ``provider.embed``, not
+    :func:`windows_of`: a query needs exactly one vector to search with, and
+    for a query long enough to window, the provider's mean over its windows is
+    the sensible single vector. The asymmetry is intentional — stored text is
+    being *indexed*, where more rows is better, and a query is being *reduced*
+    to one point.
     """
     policy.check(provider.model, provider.name)
     matrix = load_matrix(st, space_of(provider))
@@ -399,7 +552,7 @@ def search_sessions(st: Store, provider: EmbeddingProvider, query: str,
     # the top 20 chunks are frequently 3 sessions.
     hits = cosine_topk(matrix, vector, k=min(limit * 10, len(matrix)))
     best: dict[str, float] = {}
-    for (session_id, _ordinal), score in hits:
+    for (session_id, _ordinal, _window), score in hits:
         if score > best.get(session_id, float("-inf")):
             best[session_id] = score
     ranked = sorted(best.items(), key=lambda kv: (-kv[1], kv[0]))
@@ -419,6 +572,14 @@ def correlate(st: Store, model: str, session_id: str,
     the same thing", which is a property of the whole conversation. Comparing
     best-chunk to best-chunk would make every pair of sessions that once
     mentioned a stack trace look like neighbours.
+
+    Since vectors are stored per *window*, this mean is over windows, which
+    makes it length-weighted: a chunk that needed three windows contributes
+    three times as much as one that fitted in a single pass. That is a change
+    from the per-chunk mean and it is the better of the two for this question
+    — "what is this session about" should weigh a long dense passage above a
+    short one, and the previous equal-weighting-per-chunk was an artefact of
+    the storage shape rather than a decision anyone made.
     """
     np = require_numpy()
     matrix = load_matrix(st, model)
@@ -426,7 +587,7 @@ def correlate(st: Store, model: str, session_id: str,
         return []
 
     by_session: dict[str, list[int]] = {}
-    for row, (sid, _ordinal) in enumerate(matrix.keys):
+    for row, (sid, _ordinal, _window) in enumerate(matrix.keys):
         by_session.setdefault(sid, []).append(row)
     if session_id not in by_session:
         return []

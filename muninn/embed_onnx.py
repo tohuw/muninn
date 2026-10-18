@@ -102,6 +102,20 @@ BATCH = 8
 PROVIDER_NAME = "onnx-local"
 
 
+def _unit_rows(np, array):
+    """L2-normalise each row, leaving an all-zero row alone.
+
+    Both the per-window array and the mean over windows end here, which is
+    the point: normalisation is the provider's contract with
+    ``embed.cosine_topk`` (it treats cosine as a plain dot product and would
+    otherwise pay a division per row per query), and a second copy of it
+    could satisfy that contract on one path and not the other.
+    """
+    norms = np.linalg.norm(array, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0
+    return (array / norms).astype(np.float32)
+
+
 @dataclass
 class ONNXEmbeddingProvider:
     """Local embeddings via ONNX Runtime. Runs anywhere ONNX Runtime does."""
@@ -133,7 +147,7 @@ class ONNXEmbeddingProvider:
         .valholl/articles/embedding-the-whole-chunk.md for why that cost was
         accepted rather than engineered around.
         """
-        return f"{self.model}+w{MAX_TOKENS}s{WINDOW_STRIDE}mean"
+        return f"{self.model}+w{MAX_TOKENS}s{WINDOW_STRIDE}win"
 
     def available(self) -> str | None:
         """Import-level checks only. No network, no weight load, no I/O."""
@@ -216,40 +230,45 @@ class ONNXEmbeddingProvider:
         self._inputs = frozenset(i.name for i in session.get_inputs())
         return session, tokenizer
 
-    def embed(self, texts: Sequence[str]) -> Any:
-        """``(len(texts), dim)`` float32, L2-normalised.
+    def embed_windows(self, texts: Sequence[str]) -> tuple[Any, list[int]]:
+        """``(array, owners)``: one L2-normalised vector per window.
 
         Normalised here so every consumer can treat cosine as a dot product;
         ``embed.cosine_topk`` relies on it and would otherwise pay a division
         per row per query.
 
-        **Every token of every input reaches the model.** A text longer than
-        :data:`MAX_TOKENS` becomes several overlapping windows, each embedded,
-        and the row's vector is their mean. The thing being fixed is not
-        hypothetical: measured on this archive, truncation left **7.9% of all
-        prose unreachable to semantic search**, and the losses were not spread
-        evenly — code and JSON tokenise at roughly three tokens per word, so a
-        400-word chunk of them fit only ~170 words inside the cap, and the
-        chunker's 80-word overlap cannot bridge a 230-word gap. In an archive
-        of coding-agent transcripts the worst-covered chunks were the most
-        code-heavy ones.
+        ``owners[i]`` is the index in ``texts`` that row ``i`` came from, so a
+        text needing three windows appears three times, in window order. The
+        shape is flat rather than nested because a batch is assembled across
+        several texts' windows and the caller would only have to flatten it
+        again.
 
-        **The mean is a compromise, and the honest version of it is written
-        down.** ``embed.search_sessions`` argues the other way one level up —
-        a session scores as its *best* chunk, never its mean, because
-        averaging lets fifty irrelevant chunks dilute one exact hit. That
-        argument applies here too, weakly: these windows are 2–3 adjacent
-        slices of one 400-word passage rather than a whole session, so the
-        dilution is real but small. Storing one row per window would avoid it
-        and is the better endpoint; it needs ``chunk_vectors`` rebuilt, since
-        its primary key is ``(session_id, ordinal, model)`` and would collapse
-        the windows into one row. That was not worth coupling to a coverage
-        fix. Unreachable prose is a guaranteed miss; dilution is a ranking
-        risk — fixing the first and recording the second is the right order.
+        **Every token of every input reaches the model, and no window is
+        averaged away.** A text longer than :data:`MAX_TOKENS` becomes several
+        overlapping windows and each one keeps its own vector. The thing being
+        fixed is not hypothetical: measured on this archive, truncation left
+        **7.9% of all prose unreachable to semantic search**, and the losses
+        were not spread evenly — code and JSON tokenise at roughly three
+        tokens per word, so a 400-word chunk of them fit only ~170 words
+        inside the cap, and the chunker's 80-word overlap cannot bridge a
+        230-word gap. In an archive of coding-agent transcripts the
+        worst-covered chunks were the most code-heavy ones.
+
+        **Per window rather than a mean, which is this project's own rule
+        applied one level down.** ``embed.search_sessions`` scores a session
+        by its *best* vector and never its mean, because averaging lets
+        irrelevant neighbours dilute one exact hit. The first version of this
+        fix averaged a chunk's windows anyway, to avoid rebuilding
+        ``chunk_vectors`` — whose key collapsed a chunk's windows into one
+        row — and said so in writing as a compromise. The table was then
+        rebuilt (``window`` joined the primary key, schema v4), so the max
+        that was always right now has the windows to choose between, and the
+        dilution is gone rather than documented. See
+        .valholl/articles/embedding-the-whole-chunk.md.
 
         Peak memory is unchanged by any of this: :data:`BATCH` bounds the
-        forward pass, and it now bounds windows rather than rows, so a long
-        input costs more passes and never a larger one.
+        forward pass, and it bounds windows rather than rows, so a long input
+        costs more passes and never a larger one.
         """
         reason = self.available()
         if reason is not None:
@@ -264,7 +283,7 @@ class ONNXEmbeddingProvider:
 
         rows = list(texts)
         if not rows:
-            return np.zeros((0, self.dim), dtype=np.float32)
+            return np.zeros((0, self.dim), dtype=np.float32), []
 
         session, tokenizer = self._ensure_loaded()
 
@@ -301,16 +320,35 @@ class ONNXEmbeddingProvider:
             out.append(session.run(None, feeds)[0][:, 0])
 
         stacked = np.concatenate(out, axis=0).astype(np.float32)
+        return _unit_rows(np, stacked), owners
 
-        # Mean per row, over that row's windows. A single-window row — every
-        # query, and every chunk under the cap — comes out of this unchanged,
-        # which is why short inputs are bit-for-bit what they were before.
+    def embed(self, texts: Sequence[str]) -> Any:
+        """``(len(texts), dim)`` float32, L2-normalised: one vector per text.
+
+        The protocol's required entry point, and what a *query* is embedded
+        through — a search needs one point to compare against, so a query long
+        enough to window is reduced to the mean of its windows here.
+
+        Stored text does not come through this any more. `embed.windows_of`
+        reaches :meth:`embed_windows` and keeps every window as its own row,
+        because indexing wants more rows and only querying wants fewer. Both
+        are the same forward pass; this is the reduction, not a second path
+        through the model.
+
+        A single-window input — every query, and every chunk under
+        :data:`MAX_TOKENS` — comes out of the mean unchanged, so short inputs
+        are bit-for-bit what they were before any of this.
+        """
+        import numpy as np
+
+        rows = list(texts)
+        if not rows:
+            return np.zeros((0, self.dim), dtype=np.float32)
+        stacked, owners = self.embed_windows(rows)
+
         array = np.zeros((len(rows), self.dim), dtype=np.float32)
         counts = np.zeros((len(rows), 1), dtype=np.float32)
         np.add.at(array, owners, stacked)
         np.add.at(counts, owners, 1.0)
         array /= np.maximum(counts, 1.0)
-
-        norms = np.linalg.norm(array, axis=1, keepdims=True)
-        norms[norms == 0.0] = 1.0
-        return (array / norms).astype(np.float32)
+        return _unit_rows(np, array)

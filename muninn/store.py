@@ -31,7 +31,7 @@ from typing import Any, Iterable
 from .query import Filters, build_log_sql, build_search_sql, expand_terms
 from .receipt import Delta, Outcome, SourceFacts
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: Enumerated failures kept per source. Large enough that a normal run's
 #: failures all survive to be acted on, small enough that a pathological ingest
@@ -161,13 +161,30 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
     tokenize = 'porter unicode61'
 );
 
--- Embeddings, one row per (chunk, model). Schema v3; see docs/specs/006.
+-- Embeddings, one row per (chunk, model, window). Schema v4; see docs/specs/006.
 --
 -- ``model`` is in the primary key because **vectors from different models are
 -- not comparable**. Mixing two embedding spaces in one cosine search does not
 -- error and does not look wrong — it silently returns nonsense ranked
 -- confidently — so a model change produces a new *set* of vectors and search
--- uses one model at a time.
+-- uses one model at a time. It holds the *space* (``embed.space_of``), not
+-- the bare model id: the recipe that produced a vector is part of its
+-- identity, and the column kept its name only because renaming a primary-key
+-- column in a released schema buys nothing.
+--
+-- ``window`` is the slice of the chunk this vector covers, 0 for the first.
+-- A chunk longer than the embedding model's context window becomes several
+-- overlapping windows, and each gets its own row rather than being averaged
+-- into one: ``embed.search_sessions`` scores a session by its *best* vector,
+-- so one row per window lets the existing max do the work and a window that
+-- matches exactly is not diluted by its neighbours. A provider that does no
+-- windowing writes window 0 and nothing else, which is why the column
+-- defaults to 0 — see .valholl/articles/embedding-the-whole-chunk.md.
+--
+-- Nothing joins on ``window``. "Is this chunk embedded?" is answered by the
+-- existence of *any* row for (session_id, ordinal, model), which is what
+-- ``embed.pending_chunks`` asks and is why adding the column did not change
+-- that query.
 --
 -- ``vec`` is raw float32 little-endian, ``dim * 4`` bytes. A BLOB rather than
 -- JSON because 60k x 1024 floats is 246 MB as bytes and several times that as
@@ -181,9 +198,10 @@ CREATE TABLE IF NOT EXISTS chunk_vectors (
     session_id TEXT NOT NULL,
     ordinal    INTEGER NOT NULL,
     model      TEXT NOT NULL,
+    window     INTEGER NOT NULL DEFAULT 0,
     dim        INTEGER NOT NULL,
     vec        BLOB NOT NULL,
-    PRIMARY KEY (session_id, ordinal, model)
+    PRIMARY KEY (session_id, ordinal, model, window)
 );
 CREATE INDEX IF NOT EXISTS idx_vectors_model ON chunk_vectors(model);
 """
@@ -1023,6 +1041,7 @@ def _connect_and_prepare(path: Path) -> sqlite3.Connection:
     # untouched by this call.
     conn.executescript(_LEDGER_SCHEMA)
     _add_missing_session_columns(conn)
+    _add_vector_window_column(conn)
     return conn
 
 
@@ -1064,6 +1083,70 @@ def _add_missing_session_columns(conn: sqlite3.Connection) -> None:
             "WHERE topic IS NOT NULL AND TRIM(topic) != '' "
             "  AND enriched_words IS NULL")
         conn.commit()
+
+
+#: The one short-lived vector space that this migration deletes rather than
+#: carries forward. It was shipped on 2026-10-18 in v2026.10.18.1, held one
+#: *mean* vector per chunk over the chunk's windows, and was superseded the
+#: same day by one row per window. No build carrying this migration can
+#: produce or read that name — ``embed_onnx.space`` derives the suffix from its
+#: own constants and now ends in ``win`` — so the rows are unreadable by
+#: construction rather than merely stale, and `doctor` would nag about a second
+#: space forever with no command able to remove it.
+_SUPERSEDED_SPACES = ("BAAI/bge-small-en-v1.5+w512s64mean",)
+
+
+def _add_vector_window_column(conn: sqlite3.Connection) -> None:
+    """Rebuild ``chunk_vectors`` with ``window`` in its primary key.
+
+    Unlike :func:`_add_missing_session_columns`, this cannot be an ``ALTER
+    TABLE ... ADD COLUMN``: the column has to join the *primary key*, and
+    SQLite has no statement for that. So it is the documented 12-step dance —
+    new table, copy, drop, rename — which is why this is the only migration
+    here that rewrites a table.
+
+    Rewriting it is cheap and safe for one specific reason, stated in the
+    schema above: **embeddings are derived data.** Every row can be
+    regenerated from prose by `muninn embed`, nothing here is covered by the
+    archive-of-record guarantee, and a failed rebuild costs a re-embed rather
+    than a loss. The same statement about ``sessions`` or ``chunks`` would be
+    false and this approach would be unacceptable there.
+
+    Existing rows become window 0, which is exactly what they are — a
+    non-windowing provider's single vector per chunk — so no re-embed is
+    forced by the migration itself. A re-embed does follow for the ONNX
+    provider, but because its *space name* changed, which is the mechanism
+    that already exists for this and is deliberately not special-cased here.
+
+    Idempotent and safe to run on every open: it returns immediately once the
+    column is present, and the whole rebuild is one transaction, so an
+    interrupted run leaves the old table in place to be retried.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(chunk_vectors)")}
+    if not columns or "window" in columns:
+        return      # fresh archive (already created by _SCHEMA), or already migrated
+
+    with conn:      # one transaction: either the new table lands or the old one stays
+        conn.execute("""
+            CREATE TABLE chunk_vectors_v4 (
+                session_id TEXT NOT NULL,
+                ordinal    INTEGER NOT NULL,
+                model      TEXT NOT NULL,
+                window     INTEGER NOT NULL DEFAULT 0,
+                dim        INTEGER NOT NULL,
+                vec        BLOB NOT NULL,
+                PRIMARY KEY (session_id, ordinal, model, window)
+            )""")
+        placeholders = ", ".join("?" for _ in _SUPERSEDED_SPACES)
+        conn.execute(
+            "INSERT INTO chunk_vectors_v4 "
+            "  (session_id, ordinal, model, window, dim, vec) "
+            f"SELECT session_id, ordinal, model, 0, dim, vec FROM chunk_vectors "
+            f"WHERE model NOT IN ({placeholders})", _SUPERSEDED_SPACES)
+        conn.execute("DROP TABLE chunk_vectors")
+        conn.execute("ALTER TABLE chunk_vectors_v4 RENAME TO chunk_vectors")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_vectors_model "
+                     "ON chunk_vectors(model)")
 
 
 def open_store(path: str | Path) -> Store:

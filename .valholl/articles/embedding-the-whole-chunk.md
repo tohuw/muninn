@@ -1,13 +1,13 @@
 ---
 type: "Knowledge Article"
 title: "Embedding the whole chunk"
-description: "Truncating a chunk at the model's context limit left 7.9% of the archive unreachable to semantic search, concentrated in the code-heavy chunks; why windowing fixes it and why the vector space had to be renamed."
+description: "Truncating a chunk at the model's context limit left 7.9% of the archive unreachable to semantic search, concentrated in the code-heavy chunks; why windowing fixes it, why each window is stored as its own vector, and why the vector space had to be renamed twice."
 tags: ["retrieval", "embeddings", "chunking", "measurement"]
 timestamp: "2026-10-18T00:00:00Z"
 category: "retrieval"
 status: "current"
 updated: "2026-10-18"
-summary: "A chunk longer than the embedding model's 512-token window had its tail discarded. The chunker's 80-word overlap hid this for prose but not for code, which tokenises three times denser, so 7.9% of all prose was unreachable to semantic search and the worst-covered chunks were the most code-heavy ones. Chunks are now embedded as overlapping windows and averaged. The averaging is a compromise against this project's own max-not-mean rule, taken deliberately because unreachable text is a guaranteed miss and dilution is only a ranking risk."
+summary: "A chunk longer than the embedding model's 512-token window had its tail discarded. The chunker's 80-word overlap hid this for prose but not for code, which tokenises three times denser, so 7.9% of all prose was unreachable to semantic search and the worst-covered chunks were the most code-heavy ones. Chunks are now embedded as overlapping windows, each stored as its own vector so the existing max-over-chunks ranking picks the window that matches. The first version averaged the windows instead, as a deliberate compromise to avoid rebuilding the table; it lasted one day, and the article keeps both halves because the ordering — fix the guaranteed miss first, record the ranking risk, then go back for it — is the transferable part."
 related: ["embedding-is-not-a-chore", "corpus-measurements", "derived-calibration"]
 ---
 
@@ -78,31 +78,58 @@ each embedded, and the row's vector is their mean.
 Three things about that are deliberate and each could reasonably have gone the
 other way.
 
-### The mean is a compromise, and it argues against this project's own rule
+### The mean was a compromise, and it lasted one day
 
-`embed.search_sessions` is explicit that a session scores as its **best** chunk
-and never its mean, because averaging lets fifty irrelevant chunks dilute one
-exact hit. That argument applies one level down, to windows within a chunk, and
-it is not wrong here — merely weaker. These are two or three adjacent slices of
-a single 400-word passage, overlapping each other, not fifty unrelated
-paragraphs.
+The first version averaged a chunk's windows into one vector, and that argued
+against this project's own rule. `embed.search_sessions` is explicit that a
+session scores as its **best** chunk and never its mean, because averaging lets
+fifty irrelevant chunks dilute one exact hit. That argument applies one level
+down, to windows within a chunk — weaker, since these are two or three adjacent
+slices of a single 400-word passage rather than fifty unrelated paragraphs, but
+not wrong.
 
-The strictly better design is **one stored vector per window**, letting the
-existing max-over-chunks logic do what it already does well. It was not done
-because `chunk_vectors` is keyed `(session_id, ordinal, model)`, which collapses
-a chunk's windows into one row, and extending a primary key in SQLite means
-rebuilding the table. Coupling a table rebuild to a coverage fix is how a fix
-becomes a migration incident.
+It was taken anyway, because `chunk_vectors` was keyed
+`(session_id, ordinal, model)`, which collapses a chunk's windows into one row,
+and extending a primary key in SQLite means rebuilding the table. The ordering
+principle is the transferable part: **unreachable text is a guaranteed miss;
+dilution is a ranking risk.** Fix the certainty first, record the risk, and do
+not hold the certain fix hostage to the better architecture.
 
-The ordering principle, which is the transferable part: **unreachable text is a
-guaranteed miss; dilution is a ranking risk.** Fix the certainty first, record
-the risk, and do not hold the certain fix hostage to the better architecture.
+Then the better architecture shipped, the same day, as its own change — which is
+the point of separating them rather than an argument that the separation was
+pointless. `window` joined the primary key (schema v4) and each window is now
+its own row.
 
-A known consequence, written down rather than discovered later: windows are
-weighted equally regardless of length, so a short final window is
-over-weighted relative to the text it holds. Length-weighting was considered
-and rejected for now — it reduces the pull of exactly the tail content this
-change exists to make findable.
+**The dilution was not hypothetical, and the test says so by arithmetic.**
+`tests/test_embed_windows.py::DilutionTest` builds two sessions whose ranking
+*inverts* between the two designs, with vectors written down so the expected
+order is checkable by hand:
+
+| session | windows | best | mean |
+|---|---|---|---|
+| `long` | `[0,1,0,0]`, `[1,0,0,0]` | **1.00** | 0.707 |
+| `short` | `[0.8,0.6,0,0]` | 0.80 | **0.80** |
+
+Averaging `long`'s two windows gives `[0.5,0.5,0,0]`, which normalises to
+`[0.707,0.707,0,0]` — so the session that *literally contains the query* loses
+to one that merely resembles it. The test asserts both directions: that
+per-window storage ranks `long` first, and that storing the mean ranks `short`
+first. Without the second assertion the first could pass for the wrong reason
+and nothing would show the change was needed.
+
+Two consequences worth having written down:
+
+- **`search_sessions` did not change at all.** The max over a session's vectors
+  was always the right operation; it simply had nothing to choose between. The
+  better design here was not new logic, it was giving existing logic its input —
+  which is usually the cheaper half of a fix and almost never the obvious one.
+- **`correlate` changed without being touched**, and for the better. It takes a
+  session's mean vector, which is now a mean over windows rather than over
+  chunks, making it length-weighted: a dense 1,200-token chunk now counts three
+  times as much as a short one. Per-chunk equal weighting was an artefact of the
+  storage shape and not a decision anyone had made. The equal-weighting problem
+  the mean design had — a short final window pulling as hard as a full one —
+  disappears at query time for the same reason.
 
 ### The windowing recipe is part of the vectors' identity
 
@@ -114,15 +141,29 @@ it.
 `chunk_vectors.model` had been carrying the identity of the vector space on the
 assumption that the weights determine the vector. They do not — the *recipe*
 does. So a provider may now declare a `space`, and `embed_onnx` derives it from
-its own constants (`BAAI/bge-small-en-v1.5+w512s64mean`), which means changing
+its own constants (`BAAI/bge-small-en-v1.5+w512s64win`), which means changing
 either constant invalidates the stored vectors instead of silently mixing two
 spaces. `embed.space_of` falls back to the model id, so a plugin provider
 written against the three-attribute protocol keeps working untouched.
 
-The cost is honest and was accepted: **the whole archive re-embeds**, ~147,000
-chunks, which the background worker drains by itself. `doctor` shows both
-spaces while it runs and says the older one is dead weight, which is the
-behaviour its "half-finished re-embed" line was already written for.
+**The pooling is part of the recipe too, and that is not obvious.** Going from
+one mean vector per chunk to one vector per window changed no constant: same
+weights, same window size, same stride. The space name still had to change,
+because the numbers under the key are different — so the suffix went from
+`mean` to `win`, and a test spells the old name out from the current constants
+to catch a revert that leaves the storage per-window. A derived-from-constants
+scheme does not catch a change that is not in the constants, which is the
+general version of the lesson.
+
+The cost is honest and was accepted twice: **the whole archive re-embeds**,
+~150,000 chunks, which the background worker drains by itself. `doctor` shows
+both spaces while it runs and says the older one is dead weight, which is the
+behaviour its "half-finished re-embed" line was already written for. The `mean`
+space is the exception — it is deleted by the v4 migration rather than carried
+forward, because no build carrying that migration can produce or read that name,
+so the rows are unreadable *by construction* and nothing in the tool could ever
+remove them. A space that merely went stale would be left alone for the operator
+to judge.
 
 ### MLX was left alone
 

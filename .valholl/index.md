@@ -31,7 +31,8 @@ the code does.
 - [Embedding is not a chore](articles/embedding-is-not-a-chore.md) — why the daemon owns embedding, and why the automatic loop is written to quit rather than retry
 
 - [Embedding the whole chunk](articles/embedding-the-whole-chunk.md) — a chunk longer than the model's window had its
-  tail discarded; 7.9% of the archive was unreachable, and the code-heavy chunks were the worst covered
+  tail discarded; 7.9% of the archive was unreachable, the code-heavy chunks were the worst covered, and each window
+  is now its own stored vector so the max-not-mean rule applies one level down
 
 - [Superseding a predecessor](articles/superseding-a-predecessor.md) — a byte-verified backfill that was still missing four of six directories
 

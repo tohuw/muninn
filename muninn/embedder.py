@@ -336,12 +336,8 @@ class BackgroundEmbedder:
         for start in range(0, len(rows), self.batch):
             if self._stop.is_set():
                 break
-            window = rows[start:start + self.batch]
-            vectors = provider.embed([r["body"] for r in window])
-            for row, vector in zip(window, vectors):
-                written += embed.store_vectors(
-                    st, row["session_id"], embed.space_of(provider), provider.dim,
-                    [list(vector)], start_ordinal=row["ordinal"])
+            written += embed.embed_and_store(
+                st, provider, rows[start:start + self.batch])
             st.commit()
         self.vectors_written += written
         if written:

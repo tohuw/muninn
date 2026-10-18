@@ -116,16 +116,42 @@ rerank, correlation of similar sessions.
 CREATE TABLE chunk_vectors (
     session_id TEXT NOT NULL,
     ordinal    INTEGER NOT NULL,
-    model      TEXT NOT NULL,      -- provider+model id; vectors are model-specific
+    model      TEXT NOT NULL,      -- the vector *space* (embed.space_of), not just weights
+    window     INTEGER NOT NULL DEFAULT 0,   -- which slice of the chunk; 0 if it fits
     dim        INTEGER NOT NULL,
     vec        BLOB NOT NULL,      -- float32 little-endian, dim * 4 bytes
-    PRIMARY KEY (session_id, ordinal, model)
+    PRIMARY KEY (session_id, ordinal, model, window)
 );
 ```
 
 `model` is in the primary key because **vectors from different models are not
 comparable**. A model change must not silently mix embedding spaces; it produces a
 new set, and search uses one model at a time.
+
+Two amendments, both from 2026-10-18 and both recorded in
+`.valholl/articles/embedding-the-whole-chunk.md`:
+
+- **`model` holds the space, not the weights.** Two providers can load identical
+  weights and produce vectors that must never be compared — one reading a chunk's
+  first 512 tokens and one reading all of it. `embed.space_of` is the single
+  source of that key; a provider may declare a `space`, and one that does not
+  falls back to its model id so a plugin written against the original
+  three-attribute protocol keeps working. The column keeps its name because
+  renaming a primary-key column in a released schema buys nothing.
+
+- **`window` joined the key (schema v4).** A chunk longer than the model's
+  context window is several overlapping windows. Averaging them into one row
+  contradicted this spec's own rule one level down — a session scores by its
+  *best* chunk precisely because averaging dilutes an exact hit — so each window
+  is its own row and the existing max does the work. Nothing joins on `window`:
+  "is this chunk embedded?" is the existence of *any* row for
+  `(session_id, ordinal, model)`, which is why adding it left `pending_chunks`
+  untouched.
+
+  Two counts follow from this and must not be confused. `vector_count` counts
+  rows, so it exceeds the chunk count; `embedded_chunks` counts chunks with at
+  least one vector, and is what `doctor` divides by the corpus to report
+  coverage.
 
 Load into a single contiguous `numpy` array at query time, cached in memory with
 the archive's mtime as the cache key. 60k × 1024 float32 is 246 MB — acceptable,
@@ -147,6 +173,29 @@ class EmbeddingProvider(Protocol):
 `available()` must **not** make a network call or load weights — it is called
 during discovery and startup, and a slow probe there is a hang. Normalize to unit
 length inside `embed()` so search is a plain dot product.
+
+Two members were added later and are both **optional**, because this protocol is
+also `plugins.EmbeddingProvider` and a plugin written against the three required
+attributes must not break for lacking a fourth:
+
+```python
+    space: str                       # the vector space, if the weights alone do not fix it
+    def embed_windows(self, texts) -> tuple["np.ndarray", list[int]]:
+        ...                          # (total_windows, dim) plus owners[i] -> index in texts
+```
+
+Callers must not branch on whether a provider has them. `embed.space_of` and
+`embed.windows_of` are the only read points, and each supplies the pre-windowing
+behaviour when the member is absent — one window per text, keyed on the model id.
+`embed.embed_and_store` is the only write path, shared by `muninn embed` and the
+background worker so the two cannot disagree about what a pass stored.
+
+**`windows_of` truncates `owners` to the number of rows actually returned.** A
+provider returning fewer vectors than it was asked for is broken, and spec 014's
+worker detects precisely that by seeing a pass make zero progress against a
+non-empty backlog. That short write has to stay a short write rather than become
+an exception, or the stall guard never fires and a metered provider is billed in
+a hot loop.
 
 The default build has **no provider**. `muninn search --semantic` without one
 prints how to install the extra and exits non-zero; it must not crash and must not

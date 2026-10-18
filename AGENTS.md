@@ -76,6 +76,11 @@ blocking, stop and report it rather than weakening it.
   `pyproject.toml`, and tags add `v`.
 - Tests use stdlib `unittest` under pytest. Filesystem tests use tempdirs, never
   a real archive.
+- **Stop the daemon before running the suite** (`muninn stop`). `tests/test_raven.py`
+  binds the real raven endpoint, so a live `muninn serve` owns the name first and
+  26 tests fail with `PermissionError: [WinError 5]` on Windows — a collision, not
+  a regression. If raven tests fail, check for a running daemon before reading any
+  further; diagnosing this as a code fault has cost real time more than once.
 - Commits use a conventional prefix; releases include the version and an
   explanatory body plus a model co-author trailer.
 

@@ -168,12 +168,18 @@ class StorageTest(_Archive):
         self.assertGreater(embed.vector_count(self.st, "m"), 1)
 
     def test_the_schema_migrated_without_touching_anything_else(self) -> None:
-        # v2 -> v3 adds a table. The archive's own guarantee is that nothing
-        # else moved.
+        # v2 -> v3 added a table; v3 -> v4 rebuilt chunk_vectors to put
+        # ``window`` in its primary key. The archive's own guarantee is that
+        # nothing else moved.
+        #
+        # The literal is deliberate and is the whole value of the assertion: a
+        # bump has to be a decision someone made and wrote down here, not
+        # something a schema edit carries along silently. Comparing against
+        # ``store.SCHEMA_VERSION`` would pass for any number at all.
         self.add_session("s1", "the only surviving copy")
         version = self.st.conn.execute(
             "SELECT value FROM meta WHERE key = 'schema_version'").fetchone()["value"]
-        self.assertEqual(version, "3")
+        self.assertEqual(version, "4")
         self.assertEqual(self.st.session_text("s1"), "the only surviving copy")
 
 

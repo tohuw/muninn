@@ -121,6 +121,39 @@ most code-heavy ones** — the content the archive exists to find.
 Same shape as pitfall 3 below ([[provenance-classification]]'s 40x error): a
 uniform assumption over a non-uniform corpus measures nothing in particular.
 
+### What windowing costs in rows, which is the cost that persists
+
+Embedding every window instead of the first one costs forward passes once, at
+re-embed time, and **rows forever**. Since 2026-10-18 each window is its own
+row in `chunk_vectors` (schema v4) rather than being averaged into one, so the
+row count is no longer the chunk count.
+
+Predicted from the token distribution above, then measured against the real
+re-embed once it was 10% through:
+
+| chunk | tokens | windows at `w512 s64` |
+|---|---|---|
+| median prose | 540 | 2 |
+| p95 | 617 | 2 |
+| code-heavy | ~1,200 | 3 |
+
+**Predicted ~2.1 vectors per chunk; measured 2.08** — 30,488 vectors across
+14,626 embedded chunks, read straight off `doctor`. The prediction is recorded
+alongside the measurement because this article's own pitfall 5 is a confident
+unmeasured claim about this exact code path that turned out to be wrong; a
+prediction that lands is worth as much as one that does not, and only the
+comparison says which it was.
+
+So the resident matrix roughly doubles: 150k chunks at 384 dims is 230 MB as
+one vector each, ~480 MB as windows. That is the trade the per-window design
+takes knowingly, and it is affordable only because this corpus embeds at 384
+dims — the same change against a 1024-dim model would put the matrix past a
+gigabyte and the decision would deserve re-measuring rather than inheriting.
+
+Query time is unaffected in the way that matters: cosine is one matmul whose
+cost is linear in rows, and 2ms at 60k rows (above) has the headroom. Nothing
+here argues for an index; see the top of this article.
+
 ### One pass sets the footprint for the life of the process
 
 64 rows at the cap, measured as resident / committed after the pass:

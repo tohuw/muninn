@@ -889,11 +889,15 @@ def cmd_embed(args: argparse.Namespace) -> int:
         # store and then called vector_count() on it, so `--dry-run` — the one
         # path whose entire job is to be safe to run — was the only path that
         # raised.
-        present = embed.vector_count(st, space)
+        # Chunks, not rows. A chunk over the model's context window is stored
+        # as several vectors, so a row count here would be larger than the
+        # chunk count it is being read against and would make a finished pass
+        # look like an over-counted one.
+        present = embed.embedded_chunks(st, space)
         st.close()
         print(f"model    {provider.model} (dim {provider.dim})")
         print(f"planned  {len(rows):,} chunk(s) to embed")
-        print(f"present  {present:,} already embedded")
+        print(f"present  {present:,} chunk(s) already embedded")
         return 0
     if not rows:
         print(f"nothing to embed — every chunk already has a {provider.model} vector")
@@ -905,12 +909,7 @@ def cmd_embed(args: argparse.Namespace) -> int:
     batch = args.batch
     try:
         for start in range(0, len(rows), batch):
-            window = rows[start:start + batch]
-            vectors = provider.embed([r["body"] for r in window])
-            for row, vector in zip(window, vectors):
-                written += embed.store_vectors(
-                    st, row["session_id"], space, provider.dim,
-                    [list(vector)], start_ordinal=row["ordinal"])
+            written += embed.embed_and_store(st, provider, rows[start:start + batch])
             st.commit()   # resumable: a killed run keeps everything it paid for
     except embed.EmbeddingUnavailable as exc:
         st.close()
@@ -922,7 +921,11 @@ def cmd_embed(args: argparse.Namespace) -> int:
         return 2
     embed.clear_cache()
     st.close()
-    print(f"wrote {written:,} vector(s)")
+    # More vectors than chunks is the normal case, not a miscount: a chunk
+    # longer than the model's context window is stored as one vector per
+    # window, so both numbers are printed rather than leaving the reader to
+    # wonder which one "wrote 4,812" was counting.
+    print(f"wrote {written:,} vector(s) for {len(rows):,} chunk(s)")
     return 0
 
 
@@ -1490,7 +1493,13 @@ def _print_embeddings_section(st: store.Store) -> None:
     Per *space*, not per model: a provider may embed the same weights by a
     different recipe, and `embed.space_of` is what keeps those apart. The rows
     here are whatever is in ``chunk_vectors.model``, so a windowed provider
-    prints `<model>+w512s64mean` and a plain one prints the bare id.
+    prints `<model>+w512s64win` and a plain one prints the bare id.
+
+    **vectors** counts rows and **coverage** counts chunks, which are no
+    longer the same number: a chunk longer than the model's context window is
+    stored as one vector per window. The two are printed side by side on
+    purpose — their ratio is how dense the corpus is in tokens per chunk, and
+    on this archive it runs near 2.
 
     Two spaces present is the line worth reading. It means a half-finished
     re-embed — search uses one space at a time, so the older set is dead weight
@@ -1513,10 +1522,17 @@ def _print_embeddings_section(st: store.Store) -> None:
     for model, dim, rows in models:
         # float32: dim * 4 bytes per vector, which is what load_matrix holds.
         mb = rows * dim * 4 / (1024 * 1024)
+        # Coverage is chunks-with-a-vector over chunks, never rows over chunks.
+        # A chunk past the model's context window is stored as one vector per
+        # window, so rows exceed chunks and the obvious division printed "137%
+        # of chunks" — which reads as a corrupt archive rather than as a
+        # mis-stated ratio.
+        #
         # Truncated, never rounded: 9,047 of 9,049 chunks is 99.98%, and printing
         # "100% of chunks" next to a non-zero pending count is the report claiming
-        # completion it does not have. 100% is reserved for rows == chunks.
-        coverage = f"{int(rows / chunks * 100)}% of chunks" if chunks else "no chunks"
+        # completion it does not have. 100% is reserved for full coverage.
+        covered = embed.embedded_chunks(st, model)
+        coverage = f"{int(covered / chunks * 100)}% of chunks" if chunks else "no chunks"
         print(f"  {model:44} dim {dim:<5} {rows:>8,} vectors  {mb:6.1f} MB  {coverage}")
         pending = embed.pending_count(st, model)
         if pending:
