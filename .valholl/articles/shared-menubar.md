@@ -6,7 +6,7 @@ tags: ["menubar", "macos", "swift", "extensibility", "huginn"]
 timestamp: "2026-07-30T00:00:00Z"
 category: "extensibility"
 status: "current"
-updated: "2026-08-01"
+updated: "2026-10-18"
 summary: "Nobody wants two ravens in their menubar. A shared RavenMenuBar renders a JSON menu spec fetched from each discovered raven, so Huginn and Muninn coexist in one surface with host election, and either can run standalone. Muninn is present while `muninn serve` runs; the descriptor moved from the indexer to a real daemon without any change to the protocol or the host."
 related: ["what-muninn-is", "lessons-for-huginn", "continuous-ingest-not-periodic"]
 ---
@@ -121,6 +121,30 @@ process writes the file* changed, which is exactly the kind of change a
 self-published-descriptor protocol is supposed to make free — no coordinated
 release with Appistry or Huginn, no version bump on any side. That is worth
 recording as evidence for the design, not just as a fact about this change.
+
+### "Absent" was also the bug, and that is the uncomfortable part
+
+Read the third bullet above again, because on Windows it was load-bearing in a
+way nobody intended. From the named-pipe transport until 2026-10-18, `muninn
+serve` could not bind its listener there at all: `ravenserve`'s Win32 ACL
+helper declared no `ctypes` signatures, so the token's ACL could never be
+proven, and `_listen` did the designed thing — raised, published nothing, and
+cost the raven its menu row. See WINDOWS.md and docs/specs/021.
+
+The design above is what made it invisible. "Muninn is absent from the menubar
+when the daemon is not running" is a legitimate steady state that the host
+renders indistinguishably from a raven that was never installed — so a
+*running* daemon that could not bind rendered exactly like a machine where
+nobody had installed Muninn. Both of this article's stated failure modes were
+working as specified. That is the cost of a protocol whose absence is
+meaningful: **absence cannot also be your error channel.**
+
+What closed it was not a better failure mode; the fail-closed behaviour is
+still right. It was asserting the *open* case — a test that binds, reads the
+resulting DACL back with `icacls`, and fails if the ACL is not exactly one ACE.
+Worth carrying to any future raven: a self-published descriptor protocol gives
+you no feedback when nothing is published, so the publisher has to test that
+publishing works.
 
 ## Design rules
 

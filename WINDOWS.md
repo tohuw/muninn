@@ -63,6 +63,14 @@ local and offline: 133 MB fetched once, then cache-first, so a daemon start
 makes no network call. Measured on Windows 11: **3,395 chunks in 138 s**, and
 `muninn serve` then keeps up automatically.
 
+It also resolves to a **~265 MB** daemon rather than a 2.1 GB one. ONNX
+Runtime's arena allocator keeps the high-water mark of the largest batch it
+ever ran, and 85% of chunks pad to the model's 512-token limit, so a single
+backlog drain used to fix the resident footprint at 2.1 GB for the life of the
+process — visible as a `pythonw.exe` holding over a gigabyte days after it had
+anything to do. The arena is off and the batch is 8; see
+`.valholl/articles/corpus-measurements.md`, "Embedding memory".
+
 The two providers keep **separate model ids on purpose** — bf16 versus fp32 are
 near-identical and not identical, and `chunk_vectors` keys on the model id so the
 spaces are never compared. Moving an archive between platforms re-embeds.
@@ -174,6 +182,33 @@ The Run-key backend is exercised in `tests/test_agent_install.py` against a fake
 `winreg` through corvidae's overridable `registry()` boundary, so it is covered on
 every platform — but, as everywhere in this document, that is coverage of the
 *logic*, not evidence it works on real Windows.
+
+## The raven never bound here, and nobody noticed
+
+Found 2026-10-18, on a daemon that had been running for days: `muninn doctor`
+reported `menu none (the raven did not bind)` and the descriptor on disk was
+stale, naming a dead pid and a *port* — so it predated the named-pipe transport
+entirely. **Muninn had never once appeared in the shared menubar on Windows.**
+
+Three defects, each hidden behind the one before it (docs/specs/021 has the
+full account):
+
+1. `ravenserve`'s Win32 block declared no `ctypes` signatures, so a truncated
+   handle made `OpenProcessToken` fail, the token ACL could not be proven, and
+   `_listen` raised. The fail-safe path then did exactly its job: no
+   descriptor, no menu row, no error anyone would see.
+2. `stop()` could not release the named pipe, because a pending `accept()`
+   holds a handle that `close()` does not close. Stop-then-start in one
+   process — which a daemon restart does — could not rebind.
+3. Two concurrent `serve()` calls, which POSIX tolerates by unlinking the
+   socket out from under the first listener, are simply refused here.
+
+All three are fixed and asserted by `tests/test_raven.py`, whose ACL test reads
+the DACL back with `icacls` rather than through the code that set it. The
+lesson generalises past Windows: **a failure mode designed to be quiet is
+indistinguishable from the feature working, until a test asserts the happy
+path.** Every other raven test passed throughout, because they all errored in
+`setUp` long before reaching a handshake.
 
 ## Untested on Windows generally
 

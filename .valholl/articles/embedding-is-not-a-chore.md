@@ -6,7 +6,7 @@ tags: ["retrieval", "embeddings", "daemon", "signals", "cost"]
 timestamp: "2026-08-12T00:00:00Z"
 category: "ingest"
 status: "current"
-updated: "2026-08-12"
+updated: "2026-10-15"
 summary: "Until spec 014, `muninn embed` was a command a human typed, so semantic search silently covered only the part of the archive someone had last remembered to embed — and the uncovered part was always the most recent. The daemon now owns a background worker, gated on a provider being installed, ordered newest-first, with a stall guard because the failure mode of an automatic loop against a metered provider is a bill rather than an error."
 related: ["continuous-ingest-not-periodic", "corpus-measurements", "model-policy-chokepoint", "derived-calibration"]
 ---
@@ -140,3 +140,21 @@ spends money must not be silent about how much work it has just decided to do.
 - **No embedding inside the import transaction.** That is where FTS5 rows are
   written, and it is exactly where a provider round trip must not be: ingest
   never waits on anything else.
+
+## The cost this decision moved rather than removed
+
+Making the daemon the owner of embedding moved the provider into a process that
+lives for weeks, and that changes which resource matters. A backlog drain is a
+few minutes of CPU either way; what a long-lived host cannot absorb is memory a
+forward pass allocates and does not return.
+
+It did not absorb it. `muninn serve` was later found resting at 1.5 GB three
+days after its backlog emptied, because ONNX Runtime's arena allocator keeps the
+high-water mark of the largest batch it ever ran and 85% of chunks pad to the
+512-token cap. See [[corpus-measurements]], "Embedding memory", for the table
+and the fix.
+
+Worth stating as a standing consequence of this article rather than as a bug
+that has been closed: **anything this daemon is given to own must be judged at
+rest, not at startup, and by its peak rather than its average.** The provider
+loaded at 215 MB and looked healthy every time anyone checked it.

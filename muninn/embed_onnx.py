@@ -23,6 +23,20 @@ platforms re-embeds, and that is the honest cost.
 **No weights are downloaded by ``available()``.** It answers from imports
 alone. The first ``embed()`` call fetches the model — see :mod:`embed_mlx` for
 why a probe that quietly pulls hundreds of megabytes is a hang, not a check.
+
+**Memory is a property of this module, not of the daemon that hosts it.**
+:mod:`embedder` runs inside ``muninn serve``, a process that lives for weeks
+and embeds for a few minutes of that, so anything a forward pass allocates and
+does not return is a cost the user pays continuously for work that finished
+days ago. Two defaults were doing precisely that until measured — ONNX
+Runtime's arena allocator and a batch size of 32 — and together they held
+2.1 GB resident in an idle daemon with an empty backlog. :data:`BATCH` and
+``_ensure_loaded`` each carry the number that justifies the current value;
+.valholl/articles/corpus-measurements.md, "Embedding memory", has the table.
+The general lesson is the one worth carrying to the next provider written
+here: a default tuned for a batch job is the wrong default inside a daemon,
+and peak memory is the metric rather than steady-state memory, because an
+arena makes them the same number.
 """
 from __future__ import annotations
 
@@ -51,14 +65,34 @@ DEFAULT_DIM = 384
 ONNX_FILE = "onnx/model.onnx"
 TOKENIZER_FILE = "tokenizer.json"
 
-#: BERT-family context limit. Chunks are far shorter than this; truncation is
-#: here so a pathological chunk cannot raise instead of embedding.
+#: BERT-family context limit. Truncation is here so a long chunk cannot raise
+#: instead of embedding — but note that for this corpus it is the *ordinary*
+#: path, not a guard against a pathological outlier: ``store.chunk_text``
+#: targets 400 words, which measures at a median of 540 tokens, and 85% of
+#: real chunks reach this cap (.valholl/articles/corpus-measurements.md,
+#: "Embedding memory"). Every full-width chunk loses its tail. That is a
+#: retrieval question, recorded where it can be weighed, and deliberately not
+#: changed here: widening the window is a re-embed of the whole archive.
 MAX_TOKENS = 512
 
-#: Rows per forward pass. Padding is to the longest row *in the batch*, so one
-#: long chunk in a large batch inflates every row in it. This bounds that, and
-#: bounds peak memory, at no measurable throughput cost for chunk-sized text.
-BATCH = 32
+#: Rows per forward pass. Padding is to the longest row *in the batch*, and
+#: because of the measurement above essentially every batch pads to the full
+#: 512 — so this constant alone sets the size of the attention tensors, which
+#: are quadratic in sequence length: ``batch × 12 heads × 512 × 512 × 4 B`` is
+#: 400 MB per score tensor at 32, with several live at once.
+#:
+#: 32 cost 2.1 GB of resident memory for the life of the process; 8 costs
+#: ~230 MB — and ONNX Runtime's arena never returns the peak (see
+#: ``_ensure_loaded``), so in the daemon the peak *is* the footprint. An
+#: earlier comment here claimed 32 "bounds peak memory"; it bounded the
+#: per-row padding cost and nothing else.
+#:
+#: The throughput this gives up is **nothing measurable**. A 64-row
+#: microbenchmark said ~10% and that number is misleading: it is dominated by
+#: the first passes, where the arena's allocation is still being paid for. Rerun
+#: as a corpus pass — 3,395 real chunk bodies through the daemon's own 64-row
+#: call path — it came to 137 s against the 138 s on record for 32-with-arena.
+BATCH = 8
 
 PROVIDER_NAME = "onnx-local"
 
@@ -120,6 +154,23 @@ class ONNXEmbeddingProvider:
         # embedder, where finishing a corpus a little slower is worth far more
         # than making the machine unpleasant to use while it does.
         options.intra_op_num_threads = max(1, (os.cpu_count() or 2) // 2)
+        # The arena is ONNX Runtime's default allocator and it never hands the
+        # peak back to the OS. In a batch process that is free; in the daemon,
+        # which lives for weeks and embeds for minutes of that, it means one
+        # backlog drain sets the resident footprint permanently. Measured on a
+        # 32-core Windows host: a single 64-row pass of cap-length chunks took
+        # the process from 215 MB to 2,110 MB resident and it stayed there
+        # across later passes, including passes of short rows. The arena is not
+        # leaking — it is a high-water mark being honoured — which is exactly
+        # why no amount of waiting or idling brought it back down.
+        #
+        # Turning it off holds the process at ~230 MB, and on a corpus-scale
+        # pass it is not a trade at all: 3,395 real chunks took 137 s with the
+        # arena off at BATCH=8 against the 138 s on record with it on at 32.
+        # A 64-row microbenchmark does suggest ~10%, which is why the number
+        # quoted here is the corpus one — the short run is measuring the
+        # arena's own first allocation, not steady-state inference.
+        options.enable_cpu_mem_arena = False
         session = ort.InferenceSession(
             onnx_path, options, providers=["CPUExecutionProvider"])
 

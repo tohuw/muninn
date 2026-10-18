@@ -520,7 +520,9 @@ machine — no vectors, chunks or queries leave it. On Apple silicon
 preferred where it works. Everywhere else — Windows, Linux, Intel Macs — ONNX
 Runtime runs `BAAI/bge-small-en-v1.5` on the CPU: prebuilt wheels, no compiler,
 no torch, 133 MB fetched once and offline thereafter. Measured on Windows,
-3,395 chunks embed in 138 s.
+3,395 chunks embed in 138 s, and the daemon hosting it rests at **~265 MB** —
+a figure worth quoting because it was 2.1 GB until ONNX Runtime's arena
+allocator was switched off, and an arena never gives a peak back.
 
 Their model ids differ because the vectors do: the MLX build is bf16 and the
 ONNX one fp32. `chunk_vectors` keys on the model id so the two spaces are never

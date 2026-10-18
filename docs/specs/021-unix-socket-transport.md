@@ -207,16 +207,45 @@ the calling process's own SID, via `OpenProcessToken`/`GetTokenInformation`
 (`raven._launch_block`'s docstring on why `corvidae`'s helper is preferred
 over a new dependency makes the same call for a different file).
 
-**This code is unverified on real Windows.** It was written and reviewed
-without access to a Windows machine, and Win32 security-descriptor
-construction is exactly the kind of code that can be subtly wrong in ways a
-review cannot catch without exercising it. `_restrict_to_current_user`
-reports failure honestly rather than assuming success — see `_listen`, which
-turns a `False` there into an `OSError` that costs the raven its menu row
-rather than publishing a token nothing protects — but "fails safe" is not the
-same claim as "works correctly," and this must be exercised by Windows CI, or
-by hand on a Windows box, before anyone treats the Windows transport as
-trusted.
+**This code was unverified on real Windows until 2026-10-18, and it did not
+work.** The paragraph that stood here said it was written and reviewed without
+access to a Windows machine, that Win32 security-descriptor construction is
+exactly the kind of code that can be subtly wrong in ways review cannot catch,
+and that it must be exercised before anyone treats the Windows transport as
+trusted. All three were correct. Exercising it found three defects, in the
+order they unmasked each other:
+
+1. **No `ctypes` signature was declared** — no `argtypes`, no `restype`, on any
+   of the six calls. Pointer-sized values were truncated to 32 bits, so
+   `OpenProcessToken` got half a handle and answered `ERROR_INVALID_HANDLE`,
+   `_restrict_to_current_user` returned `False`, and `_listen` raised. The
+   fail-safe path worked perfectly: **`muninn serve` published no descriptor at
+   all on Windows, and Muninn was simply absent from the menubar.** The
+   `argtypes` are the load-bearing half; see `ravenserve`'s block comment.
+2. **`stop()` did not release the pipe name.** `PipeListener.accept` pops a
+   handle off its queue before blocking in `ConnectNamedPipe`, and `close()`
+   only closes handles still queued, so a pending accept keeps the name alive
+   and the next `FILE_FLAG_FIRST_PIPE_INSTANCE` bind fails with
+   `ERROR_ACCESS_DENIED`. `_Server._unblock_pending_accept` connects a
+   throwaway client to unblock it. Only reachable once (1) was fixed — before
+   that no pipe was ever bound.
+3. **Two concurrent `serve()` calls cannot work on Windows**, where on POSIX
+   they silently appeared to: `_listen` unlinks the socket path before binding,
+   so a second listener steals the address and the first keeps an fd to a path
+   nobody can reach. A held pipe name cannot be stolen. This is the
+   two-publishers hazard the design already warns about, and the platform
+   simply refuses it.
+
+The contract is unchanged by any of this — `_restrict_to_current_user` still
+reports failure honestly rather than assuming success, and `_listen` still
+turns a `False` into an `OSError` that costs the raven its menu row rather than
+publishing a token nothing protects. What changed is that the open case is now
+asserted too, by `tests/test_raven.py::WindowsTokenAclTest`, which reads the
+resulting DACL back with `icacls` rather than through the same declarations
+under test. **"Fails safe" is still not the same claim as "works correctly,"
+and a silent correct-by-design failure is indistinguishable from the feature
+working until something asserts the happy path.** That is the transferable
+lesson here, and it cost months of an absent menu row to learn.
 
 ## Acceptance criteria
 
@@ -275,7 +304,15 @@ trusted.
   other belongs is the kind of substitution that looks fine in review and
   fails only on hostile input.
 - **Do not trust the Windows ACL path without exercising it on real
-  Windows.** See "Windows" above.
+  Windows.** See "Windows" above — it was exercised on 2026-10-18 and was
+  broken in three separate ways. Keep `WindowsTokenAclTest` green, and keep it
+  reading the DACL back with `icacls` rather than through `ravenserve`'s own
+  declarations: an assertion derived from the code under test would have passed
+  throughout the entire period the feature did not work.
+- **Do not bind two listeners in one process.** POSIX tolerates it by
+  unlinking the socket path, which is address theft rather than support;
+  Windows refuses it outright. A test that wants its own provider stops the
+  existing service first.
 
 ## Out of scope
 

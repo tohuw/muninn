@@ -134,12 +134,42 @@ def free_socket_path(directory: Path | None = None) -> Path:
 # a secret. The pipe authkey is, and "best effort" is not an acceptable
 # posture for the one file whose disclosure hands out the whole credential.
 #
-# UNVERIFIED ON REAL WINDOWS. This is raw ctypes over advapi32/kernel32,
-# written and reviewed without access to a Windows machine. It must be
-# exercised by Windows CI — or by hand, on Windows — before the token file it
-# protects is trusted. Failure is deliberately made to look like any other
-# publish failure (see _listen): if this cannot prove the ACL was set, no
-# descriptor advertising a token_path is published at all.
+# VERIFIED ON REAL WINDOWS as of 2026-10-18, and it did not work before that.
+# This block was written and reviewed without access to a Windows machine, and
+# the comment here used to say so and ask for exactly this check. What the
+# check found, recorded because it is the whole reason the declarations below
+# exist: **not one of these functions declared ``argtypes`` or ``restype``.**
+#
+# Undeclared, ctypes assumes a C ``int`` return and converts arguments by
+# value, so every pointer-sized quantity was truncated to 32 bits on a 64-bit
+# process. ``GetCurrentProcess`` returned the pseudo-handle ``(HANDLE)-1`` as
+# a C ``int``, ``OpenProcessToken`` was handed 32 bits of a 64-bit handle and
+# answered ``ERROR_INVALID_HANDLE`` (6), ``_current_user_sid`` returned None,
+# the ACL could not be proven, and ``_listen`` raised — so **`muninn serve`
+# published no descriptor at all on Windows and Muninn was simply absent from
+# the menubar.** Failure looking like any other publish failure worked exactly
+# as designed; it was so quiet that the daemon ran for months this way.
+#
+# The **argtypes are the load-bearing half**, and that is worth stating because
+# it is not the intuitive reading. Restoring only
+# ``GetCurrentProcess.restype`` leaves the bug; restoring only
+# ``OpenProcessToken.argtypes`` fixes it, because ctypes then converts the
+# Python ``-1`` into a full-width ``HANDLE`` on the way in no matter how it
+# was returned. Verified by mutation in both directions. The restypes below
+# are declared anyway — they are true, and the next reader should not have to
+# re-derive which of them happen not to matter today.
+#
+# Fixing only the handle also moves the fault one call down to
+# ``GetLengthSid``, which takes a ``PSID``: the error is the whole block, not
+# one signature, which is why they are declared together below and
+# immediately after loading the libraries rather than beside their call sites.
+#
+# Failure is still deliberately made to look like any other publish failure
+# (see _listen): if this cannot prove the ACL was set, no descriptor
+# advertising a token_path is published at all. That remains right — but note
+# what this incident proves about it. A silent, correct-by-design failure mode
+# is indistinguishable from the feature working until something asserts the
+# happy path, which is what ``test_raven``'s ACL tests now do.
 
 if sys.platform == "win32":
     import ctypes
@@ -147,6 +177,40 @@ if sys.platform == "win32":
 
     _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    # Every signature this module calls, declared. ctypes' defaults are wrong
+    # for all of them on 64-bit Windows; see the block comment above.
+    # ``c_void_p`` stands in for PSID, PACL and LPVOID — they are opaque
+    # pointers here and nothing below dereferences one from Python.
+    _kernel32.GetCurrentProcess.argtypes = []
+    _kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+
+    _advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    _advapi32.OpenProcessToken.restype = wintypes.BOOL
+    _advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD)]
+    _advapi32.GetTokenInformation.restype = wintypes.BOOL
+    _advapi32.GetLengthSid.argtypes = [ctypes.c_void_p]
+    _advapi32.GetLengthSid.restype = wintypes.DWORD
+    _advapi32.CopySid.argtypes = [
+        wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p]
+    _advapi32.CopySid.restype = wintypes.BOOL
+    _advapi32.InitializeAcl.argtypes = [
+        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD]
+    _advapi32.InitializeAcl.restype = wintypes.BOOL
+    _advapi32.AddAccessAllowedAce.argtypes = [
+        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+    _advapi32.AddAccessAllowedAce.restype = wintypes.BOOL
+    # Returns a Win32 error code directly rather than setting last-error, so
+    # the caller compares against ERROR_SUCCESS instead of testing a BOOL.
+    _advapi32.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR, ctypes.c_int, wintypes.DWORD,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    _advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
 
     _TOKEN_QUERY = 0x0008
     _TOKEN_USER = 1
@@ -298,6 +362,10 @@ class _Server:
         self.menu_provider = menu_provider
         self.action_handler = action_handler
         self._thread: threading.Thread | None = None
+        # Set by shutdown() before it unblocks the pending accept, so the loop
+        # can tell "the listener went away because we are stopping" from a
+        # genuine failure. See _unblock_pending_accept.
+        self._stopping = threading.Event()
 
     def start(self) -> "_Server":
         self._thread = threading.Thread(
@@ -315,6 +383,20 @@ class _Server:
                 # way, so this thread is a daemon thread precisely so a
                 # platform where it does not unblock cannot outlive the
                 # process either.
+                return
+            except Exception:
+                # Only reachable while stopping. shutdown()'s throwaway client
+                # never completes the authkey handshake, and depending on how
+                # quickly it goes away ``deliver_challenge`` surfaces that as
+                # ``EOFError`` or ``AuthenticationError`` — neither an
+                # ``OSError``. Quiet on the way out, loud otherwise: an
+                # unexplained exception here is the accept loop dying under a
+                # live daemon, which must not be swallowed.
+                if self._stopping.is_set():
+                    return
+                raise
+            if self._stopping.is_set():
+                conn.close()
                 return
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
 
@@ -373,7 +455,44 @@ class _Server:
         reply, followup = self.action_handler(action_id)
         return _encode(reply), followup
 
+    def _unblock_pending_accept(self) -> None:
+        """Make a Windows ``accept()`` return so its handle can be closed.
+
+        The leak this exists for is in ``multiprocessing.connection``, not
+        here. ``PipeListener.accept`` pops a handle off its queue *before*
+        blocking in ``ConnectNamedPipe``, and ``close()``'s finalizer only
+        closes the handles still in that queue — so the one the blocked
+        thread is holding stays open. A named pipe's first instance is
+        created with ``FILE_FLAG_FIRST_PIPE_INSTANCE``, which fails with
+        ``ERROR_ACCESS_DENIED`` while any handle to the name survives, so
+        **the pipe name is not released by stop() and the next bind fails.**
+        Measured: close with no accept pending rebinds fine; close with one
+        pending does not.
+
+        POSIX needs none of this — closing the socket unblocks its accept and
+        ``stop()`` unlinks the path — which is exactly why this went unseen.
+        Until the ACL above was fixed, Windows never got as far as binding a
+        pipe, so no accept was ever pending to leak.
+
+        A throwaway client is the unblock. It never completes the handshake
+        and does not need to: ``ConnectNamedPipe`` returns the moment a client
+        attaches, which is all that is required. Every failure here is
+        ignored — the pipe may already be gone, and this runs on a teardown
+        path that must finish (see ``shutdown``'s comment on orphaning the
+        single-instance lock).
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            from multiprocessing.connection import Client
+
+            Client(self._listener.address, family="AF_PIPE").close()
+        except Exception:       # noqa: BLE001 - teardown must not raise
+            pass
+
     def shutdown(self) -> None:
+        self._stopping.set()
+        self._unblock_pending_accept()
         try:
             self._listener.close()
         except OSError:

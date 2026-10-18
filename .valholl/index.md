@@ -2,7 +2,7 @@
 okf_version: "0.1"
 title: "Muninn knowledge base"
 description: "Architecture, durability, ingest, calibration, and governance knowledge for Muninn."
-updated: "2026-08-24"
+updated: "2026-10-18"
 ---
 
 # Muninn knowledge base
@@ -45,11 +45,13 @@ the code does.
 ## Calibration
 
 - [Derived calibration, not hard-coded thresholds](articles/derived-calibration.md) — survey the corpus, do not guess
-- [Corpus measurements and performance breakpoints](articles/corpus-measurements.md) — measured FTS5 and vector numbers
+- [Corpus measurements and performance breakpoints](articles/corpus-measurements.md) — measured FTS5, vector and
+  embedding-memory numbers; the 2.1 GB an idle daemon held because an arena allocator keeps its high-water mark
 
 ## Extensibility
 
-- [The shared menubar (menu-as-data)](articles/shared-menubar.md) — one raven, two minds; published by `muninn serve` since spec 010
+- [The shared menubar (menu-as-data)](articles/shared-menubar.md) — one raven, two minds; published by `muninn serve` since spec 010,
+  and why a protocol whose absence is meaningful cannot also use absence as its error channel
 - [Lessons for Huginn](articles/lessons-for-huginn.md) — improvements to contribute upstream; #5 became the shared `corvidae` login-agent seam
 
 ## Process

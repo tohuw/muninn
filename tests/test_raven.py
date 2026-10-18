@@ -46,11 +46,13 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
 from multiprocessing.connection import Client
 from pathlib import Path
+from unittest.mock import patch
 
 from muninn import raven, ravenserve
 
@@ -211,8 +213,27 @@ def _family_for(transport: str) -> str:
 
 
 def _connect(service: "ravenserve.RavenService"):
-    """Open one client connection to ``service``, matching its own transport."""
-    return Client(service.address, family=_family_for(service.transport))
+    """Open one client connection to ``service``, matching its own transport.
+
+    On Windows the listener holds an authkey, so an unauthenticated client is
+    rejected during ``accept()`` before the request is ever read. This helper
+    therefore makes the same hop Roost's ``bird_client`` makes — read the
+    descriptor, take the ``token_path`` it advertises, read the key out of
+    that file — rather than reaching into ``service._token_path``. Going
+    through the published descriptor is the point: it exercises the credential
+    handoff the protocol actually specifies, so these tests fail if the token
+    stops being advertised, not merely if the key stops matching.
+
+    This went unwritten until 2026-10-18 for an honest reason: the Windows
+    ACL was broken, so ``serve()`` never returned a listener on Windows and
+    every test here errored in ``setUp`` instead of reaching a handshake.
+    """
+    authkey = None
+    if service.transport == raven.TRANSPORT_PIPE:
+        payload = json.loads(service.descriptor.read_text(encoding="utf-8"))
+        authkey = Path(payload["token_path"]).read_bytes()
+    return Client(service.address, family=_family_for(service.transport),
+                  authkey=authkey)
 
 
 def _ask(service: "ravenserve.RavenService", payload: dict) -> dict:
@@ -1036,6 +1057,16 @@ class TransportGuardTest(RavenTestCase):
         def boom() -> dict:
             raise RuntimeError("archive on fire")
 
+        # This test wants a server with its own provider, so the one setUp
+        # bound has to go first. It reads like a nicety and is not: a second
+        # concurrent serve() only ever "worked" because _listen unlinks the
+        # socket path before binding, so on POSIX the newcomer silently steals
+        # the address and the first listener keeps an fd to a path nobody can
+        # reach. Windows cannot be stolen from — a held pipe name rejects the
+        # next FILE_FLAG_FIRST_PIPE_INSTANCE with ERROR_ACCESS_DENIED — so the
+        # platform refuses what POSIX quietly allowed. stop() is idempotent,
+        # which is why the addCleanup in setUp is still correct.
+        self.service.stop()
         with ravenserve.serve(boom) as svc:
             reply = _ask(svc, {"op": raven.MENU_OP})
         self.assertFalse(reply["ok"])
@@ -1051,6 +1082,9 @@ class TransportGuardTest(RavenTestCase):
             calls.append(1)
             return raven.build_menu(recent=[], sessions=len(calls), chunks=0)
 
+        # Its own provider, so setUp's server stands down first — see the
+        # comment in test_a_failing_provider_answers_ok_false_rather_than_dropping.
+        self.service.stop()
         with ravenserve.serve(provide) as svc:
             for _ in range(3):
                 _ask(svc, {"op": raven.MENU_OP})
@@ -1416,6 +1450,94 @@ class AppistryParityTest(unittest.TestCase):
     def test_the_declared_range_overlaps_what_the_host_speaks(self) -> None:
         host_min, host_max = 1, 1
         self.assertTrue(raven.MIN_API <= host_max and raven.MAX_API >= host_min)
+
+
+@unittest.skipUnless(sys.platform == "win32",
+                     "the named-pipe authkey and its ACL are Windows-only")
+class WindowsTokenAclTest(RavenTestCase):
+    """The authkey file's ACL — the one guarantee that had never been checked.
+
+    `ravenserve`'s Windows block was written without access to a Windows
+    machine and its own comment asked for this. Nothing asserted the happy
+    path, so for months the real behaviour was: every ctypes signature
+    undeclared, pointer-sized values truncated to 32 bits,
+    `_current_user_sid` returning None, and `muninn serve` publishing **no
+    descriptor at all** — Muninn silently absent from the menubar on its
+    author's own platform.
+
+    The lesson these tests encode, beyond the signatures: a fail-closed path
+    with nothing asserting the open case is indistinguishable from a working
+    one. Every other test in this file went red the moment the bug was fixed
+    and `serve()` started reaching a real listener, which is the inverse of
+    what coverage is supposed to feel like.
+    """
+
+    def _dacl_trustees(self, path: Path) -> list[str]:
+        """Read the DACL back with ``icacls``, deliberately not with ctypes.
+
+        The point is to check the ACL against something that is not the code
+        that set it. Asserting via `_current_user_sid` would re-derive the
+        answer from the same declarations under test and pass even if both
+        were wrong together.
+        """
+        out = subprocess.run(["icacls", str(path)], capture_output=True,
+                             text=True, check=True).stdout
+        trustees = []
+        for line in out.splitlines():
+            # "C:\path\file DOMAIN\user:(F)" on the first line, then
+            # "                             DOMAIN\other:(R)" for each extra.
+            body = line[len(str(path)):] if line.startswith(str(path)) else line
+            body = body.strip()
+            if not body or body.startswith("Successfully"):
+                continue
+            trustees.append(body.split(":")[0].strip())
+        return trustees
+
+    def test_the_acl_is_set_and_names_only_the_current_user(self) -> None:
+        """One ACE, for us. Not "we called SetNamedSecurityInfoW and it was 0".
+
+        `PROTECTED_DACL_SECURITY_INFORMATION` is what makes this an
+        assertion worth writing: without it the file would inherit SYSTEM and
+        Administrators from its parent and the returned code would still be
+        ERROR_SUCCESS. So the count matters, not just the presence of our own
+        name.
+        """
+        token = self.tmp / "token.bin"
+        token.write_bytes(b"x" * 32)
+
+        self.assertTrue(ravenserve._restrict_to_current_user(token),
+                        "the ACL could not be proven; "
+                        "every ctypes signature in ravenserve is suspect")
+
+        trustees = self._dacl_trustees(token)
+        self.assertEqual(len(trustees), 1,
+                         f"expected exactly one trustee, got {trustees}")
+        self.assertTrue(trustees[0].endswith(os.environ["USERNAME"]),
+                        f"{trustees[0]} is not the current user")
+
+    def test_a_sid_is_actually_obtainable(self) -> None:
+        """The first thing that broke, pinned on its own.
+
+        Separated from the test above so the failure says *which half* went
+        wrong. A None here is a handle or token-query signature; a False
+        there with a SID in hand is the ACL construction.
+        """
+        self.assertIsNotNone(ravenserve._current_user_sid())
+
+    def test_no_token_is_left_behind_when_the_acl_cannot_be_proven(self) -> None:
+        """Fail closed, and leave no credential on disk when you do.
+
+        This is the designed behaviour from spec 009 and it is the half that
+        *was* working — asserted now because the fix above is what makes it
+        reachable, and a later refactor that made an ACL failure non-fatal
+        would otherwise publish a token nothing protects.
+        """
+        with patch.object(ravenserve, "_restrict_to_current_user",
+                          return_value=False):
+            with self.assertRaises(OSError):
+                ravenserve._listen(self.tmp)
+        self.assertFalse(raven.token_path(self.tmp).exists(),
+                         "a token file survived a failed ACL")
 
 
 if __name__ == "__main__":
