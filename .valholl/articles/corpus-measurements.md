@@ -137,16 +137,23 @@ re-embed once it was 10% through:
 | p95 | 617 | 2 |
 | code-heavy | ~1,200 | 3 |
 
-**Predicted ~2.1 vectors per chunk; measured 2.08** — 30,488 vectors across
-14,626 embedded chunks, read straight off `doctor`. The prediction is recorded
-alongside the measurement because this article's own pitfall 5 is a confident
-unmeasured claim about this exact code path that turned out to be wrong; a
-prediction that lands is worth as much as one that does not, and only the
-comparison says which it was.
+**Predicted ~2.1 vectors per chunk; measured 1.95** — 301,663 vectors across
+155,053 chunks, over the completed re-embed (2026-10-20). The prediction is
+recorded alongside the measurement because this article's own pitfall 5 is a
+confident unmeasured claim about this exact code path that turned out to be
+wrong; a prediction that lands is worth as much as one that does not, and only
+the comparison says which it was.
 
-So the resident matrix roughly doubles: 150k chunks at 384 dims is 230 MB as
-one vector each, ~480 MB as windows. That is the trade the per-window design
-takes knowingly, and it is affordable only because this corpus embeds at 384
+Read at 10% through, the same ratio was **2.08** (30,488 over 14,626), and the
+gap is worth one line because it is a sampling artefact and not drift: the
+background worker embeds **newest-first** by design, so a partial pass is never
+a random sample of the corpus. A ratio taken mid-drain is a measurement of the
+recent archive, which is the same pitfall as 1 and 3 in a third costume.
+
+So the resident matrix roughly doubles: 151k chunks at 384 dims was 221 MB as
+one vector each, and the finished per-window set measures **441.9 MB** against
+a ~480 MB estimate. That is the trade the per-window design takes knowingly,
+and it is affordable only because this corpus embeds at 384
 dims — the same change against a 1024-dim model would put the matrix past a
 gigabyte and the decision would deserve re-measuring rather than inheriting.
 

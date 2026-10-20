@@ -107,7 +107,7 @@ rerank, correlation of similar sessions.
 | `muninn/fuse.py` | **new** — reciprocal-rank fusion |
 | `muninn/rerank.py` | **new** — `--deep` LLM rerank |
 | `muninn/store.py` | `chunk_vectors` table + migration |
-| `muninn/cli.py` | `embed` subcommand; `--deep`, `--semantic` on `search`; `correlate` |
+| `muninn/cli.py` | `embed` and `spaces` subcommands; `--deep`, `--semantic` on `search`; `correlate` |
 | `tests/test_embed.py`, `tests/test_fuse.py` | **new** |
 
 ## Storage
@@ -244,6 +244,39 @@ Nearest neighbours of a session's mean vector, excluding itself. This is the
 "conversations like this one" feature, and it is why embeddings are worth having
 beyond query-time recall.
 
+## `muninn spaces`
+
+```
+muninn spaces [--drop SPACE] [--force] [--dry-run]
+```
+
+Added 2026-10-20, to close a gap this spec created. Keying on the space is what
+makes a recipe change safe, and the cost of that safety is that the superseded
+set stays in the table — correctly, because only an operator can tell a finished
+re-embed from a stalled one. But `doctor` had been *advising* the deletion since
+the column was added, and every delete path in the archive was keyed by session,
+so the advice named no command. On the author's archive that was 151,010 rows.
+
+Lists each space with its rows, chunks covered, resident cost, and whether it is
+the one the resolving provider produces. `--drop` deletes one, with two refusals
+that `--force` overrides:
+
+- **the active space** — deleting it leaves semantic search answering nothing
+  until the archive re-embeds;
+- **any space, when no provider resolves** — a checkout without the `[semantic]`
+  extra cannot tell a stale space from the live one, and "unknown" must not be
+  treated as "stale".
+
+The name must match **exactly**. No prefixes: the spaces in a half-finished
+re-embed differ by a suffix, so the stale name is a prefix of the live one and
+loose matching would make the worst typo the convenient one.
+
+Deleting vectors is permitted where deleting prose never is, and the reason is
+the whole justification rather than a convenience: vectors are derived from text
+that is still in the archive, so nothing is *lost* — the cost of being wrong is
+CPU hours. `embed.drop_space` is the only delete path in `embed.py` and takes a
+space, never a session; half a space is not a thing anyone wants.
+
 ## Build order
 
 1. `chunk_vectors` table + migration.
@@ -254,6 +287,7 @@ beyond query-time recall.
 6. `muninn/embed_mlx.py` behind the extra.
 7. `--deep` rerank and `correlate`.
 8. Tests.
+9. *(2026-10-20)* `muninn spaces`, after schema v4 made stale spaces ordinary.
 
 ## Acceptance criteria
 

@@ -375,6 +375,31 @@ def models_present(st: Store) -> list[tuple[str, int, int]]:
         "ORDER BY model")]
 
 
+def drop_space(st: Store, model: str) -> int:
+    """Delete every vector stored under one space key. Returns rows removed.
+
+    **The only delete path in this module, and the only one that should ever
+    exist here.** AGENTS.md's first hard rule is that session prose is never
+    deleted, because the archive is the last copy of it. Vectors are the
+    opposite kind of data: a derived artefact, reproducible from prose that is
+    still present, at a cost measured in CPU hours rather than in lost history.
+    That asymmetry is the whole justification — it is not that deleting is
+    cheap, it is that nothing is *lost*.
+
+    Deleting by space and not by session is also deliberate. A space goes stale
+    as a unit: `space_of` exists so that two incompatible sets of numbers cannot
+    share a key, and the corollary is that half a space is not a thing anyone
+    wants. A caller that wants some sessions re-embedded should delete none of
+    this and let :func:`pending_chunks` find them.
+
+    Does not commit. The caller owns the transaction, as every other write here
+    does, so a wrapper that also needs to record something can do both or
+    neither.
+    """
+    cursor = st.conn.execute("DELETE FROM chunk_vectors WHERE model = ?", (model,))
+    return int(cursor.rowcount or 0)
+
+
 # ── The matrix ────────────────────────────────────────────────────────────────
 
 @dataclass

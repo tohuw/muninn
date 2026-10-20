@@ -6,7 +6,7 @@ tags: ["retrieval", "embeddings", "chunking", "measurement"]
 timestamp: "2026-10-18T00:00:00Z"
 category: "retrieval"
 status: "current"
-updated: "2026-10-18"
+updated: "2026-10-20"
 summary: "A chunk longer than the embedding model's 512-token window had its tail discarded. The chunker's 80-word overlap hid this for prose but not for code, which tokenises three times denser, so 7.9% of all prose was unreachable to semantic search and the worst-covered chunks were the most code-heavy ones. Chunks are now embedded as overlapping windows, each stored as its own vector so the existing max-over-chunks ranking picks the window that matches. The first version averaged the windows instead, as a deliberate compromise to avoid rebuilding the table; it lasted one day, and the article keeps both halves because the ordering — fix the guaranteed miss first, record the ranking risk, then go back for it — is the transferable part."
 related: ["embedding-is-not-a-chore", "corpus-measurements", "derived-calibration"]
 ---
@@ -161,9 +161,9 @@ both spaces while it runs and says the older one is dead weight, which is the
 behaviour its "half-finished re-embed" line was already written for. The `mean`
 space is the exception — it is deleted by the v4 migration rather than carried
 forward, because no build carrying that migration can produce or read that name,
-so the rows are unreadable *by construction* and nothing in the tool could ever
-remove them. A space that merely went stale would be left alone for the operator
-to judge.
+so the rows are unreadable *by construction*. A space that merely went stale is
+left alone for the operator to judge — and two days later the operator was given
+something to judge *with*, which is the last section of this article.
 
 ### MLX was left alone
 
@@ -173,6 +173,45 @@ it cannot be *measured* here, and this article exists because the last
 confident unmeasured claim about this code path was wrong. The two providers
 already keep separate model ids, so no mixing can occur in the meantime —
 a machine that switches platforms re-embeds either way.
+
+## The advice that named no command
+
+The paragraph above is accurate and it left a hole open for two releases.
+`doctor` closed its embeddings section with *"the others are dead weight —
+finish the re-embed or delete them"*, and **nothing in Muninn could delete
+them.** Every delete path in the archive was keyed by session, because the
+archive's first rule is that prose is never deleted and the shape of the code
+followed from it. On this archive the un-actionable advice stood over 151,010
+rows and 221 MB.
+
+`muninn spaces` (2026-10-20) lists the spaces and drops one by exact name. Four
+things about it are decisions rather than details:
+
+- **A report that recommends an action the tool cannot take is a defect in the
+  report.** Either the action exists or the line should not ask for it. This one
+  survived two releases because it read as good advice, which is exactly why it
+  is worth naming: the warning was correct, actionable-sounding, and inert.
+- **"Unknown" is not "stale".** `--drop` refuses on a machine where no provider
+  resolves, because a checkout whose `[semantic]` extra is not synced is
+  indistinguishable from one whose space is genuinely superseded, and only one of
+  those is safe to act on. The conservative direction is a refusal that names
+  `--force`.
+- **The name matches exactly, never by prefix.** The two spaces in a re-embed
+  differ by a suffix — `BAAI/bge-small-en-v1.5` against
+  `BAAI/bge-small-en-v1.5+w512s64win` — so the stale name *is* a prefix of the
+  live one. Any convenience matching makes deleting the live space the
+  convenient outcome, which a test mutation-checks by asking for the prefix and
+  requiring an exit code 1.
+- **Deleting derived data is a different act from deleting the archive.** Vectors
+  are reproducible from prose that is still present, so nothing is lost and the
+  price of a mistake is CPU hours. That asymmetry is the entire justification,
+  and it is why `drop_space` takes a space and never a session: a space goes
+  stale as a unit, and half of one is not a thing anyone wants.
+
+The file does not shrink. SQLite returns the pages to its own freelist and
+reuses them, so the command says "free for reuse" and names `VACUUM` rather than
+claiming megabytes back that `ls` would contradict — and a 33 GB `VACUUM` is its
+own decision, not something that rides along with a delete.
 
 ## What this says about the tests that passed
 

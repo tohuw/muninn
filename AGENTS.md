@@ -96,6 +96,7 @@ uv run muninn stop
 uv run muninn install-agent
 uv run muninn doctor
 uv run muninn search "query"
+uv run muninn spaces
 uv run python tools/corpus-survey.py --self-test
 ```
 

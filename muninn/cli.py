@@ -929,6 +929,200 @@ def cmd_embed(args: argparse.Namespace) -> int:
     return 0
 
 
+def _vector_mb(rows: int, dim: int) -> float:
+    """Megabytes a space occupies in the resident matrix.
+
+    float32, so ``dim * 4`` bytes per vector — which is exactly what
+    `embed.load_matrix` holds and roughly what the table costs on disk. One
+    helper rather than the arithmetic twice, because the two callers printing
+    different numbers for the same space would be read as two different
+    measurements.
+    """
+    return rows * dim * 4 / (1024 * 1024)
+
+
+def _shell_arg(value: str) -> str:
+    """A space name as it must be typed, quoted only if it needs it.
+
+    These names are printed inside a command the reader is meant to run, so
+    the quoting is part of whether the output is correct rather than cosmetic.
+    A model id is ``BAAI/bge-small-en-v1.5+w512s64win`` and needs no quotes in
+    any shell; a plugin is free to declare one with a space in it.
+    """
+    safe = all(ch.isalnum() or ch in "_@%+=:,./-" for ch in value)
+    return value if value and safe else f"'{value}'"
+
+
+def _active_space() -> tuple[str | None, str]:
+    """``(space, note)`` for the provider semantic search would use right now.
+
+    ``space`` is ``None`` when no provider resolves, and the note then carries
+    the refusal's own explanation. Separating the two matters for ``spaces
+    --drop``: "this is not the active space" and "there is no way to tell which
+    space is active" are different facts, and only the first makes a deletion
+    safe.
+
+    Cheap by contract. ``available()`` is forbidden from doing I/O and ``space``
+    is derived from the provider's constants, so this loads no weights — which
+    is what makes it acceptable inside `doctor`.
+    """
+    try:
+        provider = embed.resolve_provider()
+    except embed.EmbeddingUnavailable as exc:
+        return None, str(exc)
+    return (embed.space_of(provider),
+            f"{provider.name} ({provider.model}, dim {provider.dim})")
+
+
+def cmd_spaces(args: argparse.Namespace) -> int:
+    """List embedding spaces, and delete a superseded one (spec 006).
+
+    This exists because `doctor` has been telling people to do something the
+    tool could not do. Changing the windowing recipe changes the identity of the
+    vectors, so `embed.space_of` gives the new numbers a new key and the old
+    ones stay — correctly, since mixing two spaces returns confident nonsense —
+    and the embeddings section says in as many words that the older set is dead
+    weight that should be deleted. Nothing could delete it. On this archive that
+    was 151,010 rows and 221 MB of advice with no command behind it.
+
+    The v4 migration is not the general answer and was never meant to be. It
+    drops exactly one space, the one-day-old ``+w512s64mean``, and only because
+    no build carrying that migration can produce or read that name: those rows
+    are unreadable *by construction*. A space that merely went stale is a
+    judgement about whether a re-embed has finished, which is the operator's to
+    make and not a migration's.
+    """
+    st = store.open_store(args.db)
+    try:
+        active, note = _active_space()
+        spaces = embed.models_present(st)
+        if args.drop is not None:
+            return _drop_one_space(st, args, spaces, active, note)
+        _list_spaces(st, spaces, active, note)
+        return 0
+    finally:
+        st.close()
+
+
+def _list_spaces(st: store.Store, spaces: list[tuple[str, int, int]],
+                 active: str | None, note: str) -> None:
+    """The report, whose job is to make the next command obvious.
+
+    Prints the exact ``--drop`` line for each superseded space rather than
+    describing it. The names differ by a suffix (`+w512s64win` against the bare
+    model id), which is precisely the shape a person retypes wrongly, and the
+    one typo that matters here deletes the live space.
+    """
+    if active is not None:
+        print(f"provider  {note}")
+        print(f"active    {active}")
+    else:
+        print(f"provider  none — {note}")
+        print("active    unknown — without a provider nothing can say which space "
+              "search would use")
+    if not spaces:
+        print("\nno embedding spaces — nothing has been embedded yet "
+              "(`muninn serve` embeds automatically; `muninn embed` does it now)")
+        return
+
+    print()
+    superseded: list[tuple[str, int, int]] = []
+    for model, dim, rows in spaces:
+        if active is None:
+            state = "unknown"
+        elif model == active:
+            state = "active"
+        else:
+            state = "superseded"
+            superseded.append((model, dim, rows))
+        covered = embed.embedded_chunks(st, model)
+        print(f"  {model:44} dim {dim:<5} {rows:>9,} vectors  "
+              f"{_vector_mb(rows, dim):7.1f} MB  {covered:>8,} chunk(s)  {state}")
+
+    if not superseded:
+        return
+    held = sum(_vector_mb(rows, dim) for _model, dim, rows in superseded)
+    print(f"\n{len(superseded)} superseded space(s) holding {held:.1f} MB. Search "
+          "uses one space at a time, so these are dead weight:")
+    for model, _dim, _rows in superseded:
+        print(f"  muninn spaces --drop {_shell_arg(model)}")
+
+
+def _drop_one_space(st: store.Store, args: argparse.Namespace,
+                    spaces: list[tuple[str, int, int]],
+                    active: str | None, note: str) -> int:
+    """Delete one named space, or refuse in a way that names the fix.
+
+    Two refusals, and both are the same mistake caught from different sides:
+    deleting the space search is actually using. One is the direct case; the
+    other is a machine where no provider resolves and the question cannot be
+    answered at all — a checkout whose ``[semantic]`` extra is not synced looks
+    identical to one where the space is genuinely stale. Refusing the *unknown*
+    case is the conservative direction, and ``--force`` is how an operator who
+    knows better says so.
+    """
+    target = args.drop
+    present = {model: (dim, rows) for model, dim, rows in spaces}
+    if target not in present:
+        # Exact match only — no prefix, no glob. The two spaces in a
+        # half-finished re-embed differ by a suffix, so the stale name is a
+        # prefix of the live one, and prefix matching would make the single
+        # most destructive typo the convenient one.
+        print(f"muninn: no vectors are stored under {target!r}", file=sys.stderr)
+        if present:
+            print("        spaces present:", file=sys.stderr)
+            for model in present:
+                print(f"          {model}", file=sys.stderr)
+        else:
+            print("        this archive has no embedding spaces at all",
+                  file=sys.stderr)
+        return 1
+
+    dim, rows = present[target]
+    covered = embed.embedded_chunks(st, target)
+    if not args.force:
+        if active is None:
+            print(f"muninn: the active space is unknown, so {target!r} cannot be "
+                  f"shown to be superseded — {note}", file=sys.stderr)
+            print("        Install a provider so the comparison can be made, or "
+                  "pass --force to delete it regardless.", file=sys.stderr)
+            return 2
+        if target == active:
+            print(f"muninn: {target!r} is the space search is using right now "
+                  f"({covered:,} chunk(s) covered).", file=sys.stderr)
+            print("        Deleting it leaves no semantic search until the whole "
+                  "archive re-embeds, which costs hours. Pass --force if that is "
+                  "what you mean.", file=sys.stderr)
+            return 2
+
+    held = _vector_mb(rows, dim)
+    if args.dry_run:
+        print(f"would drop {rows:,} vector(s) covering {covered:,} chunk(s) "
+              f"from {target} ({held:.1f} MB)")
+        return 0
+
+    removed = embed.drop_space(st, target)
+    st.commit()
+    # The cached matrix is keyed per space and stamped on the archive's
+    # data_version, which does not move for a write by this same connection — so
+    # a long-lived process that dropped a space and then searched it would serve
+    # the deleted vectors out of memory. Cheap to prevent, invisible to debug.
+    embed.clear_cache()
+    print(f"dropped {removed:,} vector(s) covering {covered:,} chunk(s) "
+          f"from {target}")
+    # Said every time, because the operator's next move is to look at the file
+    # size and conclude nothing happened. SQLite frees the pages to its own
+    # freelist and reuses them; it does not return them to the filesystem
+    # without a VACUUM, which on an archive this size deserves its own decision
+    # rather than riding along with a delete.
+    print(f"        {held:.1f} MB of pages are free for reuse; the file does not "
+          "shrink until `VACUUM`")
+    if target == active:
+        print("        this was the active space — semantic search is unavailable "
+              "until it re-embeds (`muninn serve` does that on its own)")
+    return 0
+
+
 def cmd_correlate(args: argparse.Namespace) -> int:
     """Sessions like this one, by mean vector (spec 006).
 
@@ -1520,8 +1714,7 @@ def _print_embeddings_section(st: store.Store) -> None:
         return
     chunks = st.count_chunks()
     for model, dim, rows in models:
-        # float32: dim * 4 bytes per vector, which is what load_matrix holds.
-        mb = rows * dim * 4 / (1024 * 1024)
+        mb = _vector_mb(rows, dim)
         # Coverage is chunks-with-a-vector over chunks, never rows over chunks.
         # A chunk past the model's context window is stored as one vector per
         # window, so rows exceed chunks and the obvious division printed "137%
@@ -1538,8 +1731,12 @@ def _print_embeddings_section(st: store.Store) -> None:
         if pending:
             print(f"  {'':44} {pending:>14,} chunk(s) pending")
     if len(models) > 1:
+        # Names the command, because for two releases this line asked for
+        # something no command could do: it said the older space should be
+        # deleted while every delete path in the tool was keyed by session.
         print("  WARNING: more than one embedding space is present. Search uses one at "
-              "a time, so the others are dead weight — finish the re-embed or delete them")
+              "a time, so the others are dead weight — `muninn spaces` says which "
+              "one is live, and `muninn spaces --drop <space>` removes the rest")
 
 
 def _print_enrichment_section(st: store.Store, db: str) -> None:
@@ -2078,6 +2275,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_embed.add_argument("--dry-run", action="store_true",
                          help="report what would be embedded; generate nothing")
     p_embed.set_defaults(func=cmd_embed)
+
+    p_spaces = sub.add_parser(
+        "spaces", help="list embedding spaces, and delete a superseded one",
+        description="Every embedding space in the archive, which one search is "
+                    "using, and how much the rest cost. Changing the embedding "
+                    "recipe gives the new vectors a new key and leaves the old "
+                    "ones in place — deliberately, because two spaces compared "
+                    "together return confident nonsense — so a finished "
+                    "re-embed leaves its predecessor behind as dead weight. "
+                    "--drop deletes one by exact name. Vectors are the one "
+                    "thing in this archive that is safe to delete: they are "
+                    "derived from prose that is still here, so the cost of "
+                    "being wrong is CPU time and not lost history. See "
+                    "docs/specs/006.")
+    p_spaces.add_argument("--drop", metavar="SPACE",
+                          help="delete every vector in this space (exact name, "
+                               "as listed; no prefixes)")
+    p_spaces.add_argument("--force", action="store_true",
+                          help="drop it even if it is the active space, or if no "
+                               "provider is available to say which one is")
+    p_spaces.add_argument("--dry-run", action="store_true",
+                          help="report what --drop would remove; delete nothing")
+    p_spaces.set_defaults(func=cmd_spaces)
 
     p_correlate = sub.add_parser(
         "correlate", help='"conversations like this one", by mean vector',

@@ -534,14 +534,24 @@ a figure worth quoting because it was 2.1 GB until ONNX Runtime's arena
 allocator was switched off, and an arena never gives a peak back.
 
 Their model ids differ because the vectors do: the MLX build is bf16 and the
-ONNX one fp32. `chunk_vectors` keys on the model id so the two spaces are never
-compared, which means moving an archive between platforms re-embeds rather than
-silently mixing them.
+ONNX one fp32. `chunk_vectors` keys on the *space* rather than on the weights —
+the model id plus the recipe that read the text, because one provider reading a
+chunk's first 512 tokens and another reading every window of it produce numbers
+that must never be compared. So moving an archive between platforms, or changing
+the windowing, re-embeds rather than silently mixing two sets.
+
+The superseded set stays behind until someone says otherwise, since only an
+operator can tell a finished re-embed from a stalled one. **`muninn spaces`**
+lists every space, which one search is using, and what the rest cost;
+`muninn spaces --drop <space>` deletes one by exact name. Vectors are the one
+thing here that is safe to delete — they are derived from prose that is still
+present, so the price of being wrong is CPU time rather than lost history.
 
 ```sh
 uv sync --extra semantic        # both local providers, plus numpy
 uv run muninn serve             # embeds in the background from here on
 uv run muninn embed --dry-run   # or do the backlog in the foreground, deliberately
+uv run muninn spaces            # which spaces exist, and what a stale one costs
 uv run muninn search "that time SSE kept dropping" --semantic
 uv run muninn correlate a7efca23
 ```
@@ -619,6 +629,7 @@ nonsense rather than an error.
 - [x] Conversation names surfaced alongside derived topics in every command and `--json` payload
 - [x] Hybrid retrieval: `muninn embed`, `search --semantic/--deep`, `muninn correlate`
 - [x] Automatic background embedding, owned by the daemon and gated on a provider
+- [x] `muninn spaces` — the embedding spaces present, and deleting a superseded one
 - [ ] `muninn brief` — a synthesis across matching sessions, carrying provenance per claim
 - [x] Shared-menubar raven: descriptor and `/api/menu`, rendered by [Roost](https://github.com/tohuw/roost)
 - [ ] Console
